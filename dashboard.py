@@ -18,7 +18,7 @@ API：
 import os
 import logging
 
-from flask import Flask, render_template, jsonify, request
+from flask import Flask, render_template, jsonify, request, send_from_directory
 
 from monitor_store import (
     init, list_conversations, get_messages, add_message, clear_unread,
@@ -30,11 +30,22 @@ log = logging.getLogger("dashboard")
 init()
 BASE = os.path.dirname(os.path.abspath(__file__))
 app = Flask(__name__, template_folder=os.path.join(BASE, "templates"))
+MEDIA_DIR = os.path.join(BASE, "wechat_media")
+os.makedirs(MEDIA_DIR, exist_ok=True)
 
 
 @app.route("/")
 def index():
     return render_template("index.html")
+
+
+@app.route("/media/<path:rel>")
+def media_file(rel):
+    """提供看板媒体文件（图片/视频/文件/卡片封面），防目录穿越。"""
+    safe = os.path.normpath(rel).replace("\\", "/")
+    if safe.startswith("..") or os.path.isabs(safe):
+        return jsonify({"error": "bad path"}), 400
+    return send_from_directory(MEDIA_DIR, safe)
 
 
 @app.route("/api/conversations")

@@ -41,30 +41,54 @@ def init(path=None):
             text    TEXT,
             ts      INTEGER,
             raw     TEXT,
-            msg_hash TEXT
+            msg_hash TEXT,
+            media   TEXT,           -- 媒体文件相对路径（wechat_media/ 下，图片/视频/文件）
+            card    TEXT            -- 链接/文件卡片 JSON（title/descr/url/thumb/kind）
         );
         CREATE TABLE IF NOT EXISTS sent_log (
             conv_id TEXT,
             text    TEXT,
             ts      INTEGER
         );
+        CREATE TABLE IF NOT EXISTS poll_cursor (
+            conv_id   TEXT PRIMARY KEY,
+            last_time INTEGER DEFAULT 0,
+            max_seq   INTEGER DEFAULT 0
+        );
         CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages(conv_id, ts);
         """
     )
-    # 老库可能没有 msg_hash 列，补齐（ALTER 不支持 IF NOT EXISTS，用异常吞掉已存在）
-    try:
-        conn.execute("ALTER TABLE messages ADD COLUMN msg_hash TEXT")
-    except sqlite3.OperationalError:
-        pass
+    # 老库可能没有 msg_hash / media / card 列，补齐（ALTER 不支持 IF NOT EXISTS，用异常吞掉已存在）
+    for col in ("msg_hash", "media", "card"):
+        try:
+            conn.execute("ALTER TABLE messages ADD COLUMN %s TEXT" % col)
+        except sqlite3.OperationalError:
+            pass
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_hash ON messages(msg_hash)"
     )
+    # 一次性迁移：清理 2026-10-13 消息映射错误时期产生的坏占位记录
+    # （text 形如 [消息类型XXX]，content 被错误覆盖）。
+    # msg_hash 不变会被去重挡住正确文本，故删掉让新逻辑重新入库。幂等。
+    cur = conn.execute("DELETE FROM messages WHERE text LIKE '[消息类型%]'")
+    if cur.rowcount and cur.rowcount > 0:
+        print("[monitor_store] 已清理 %d 条坏占位记录，将按正确文本重新入库" % cur.rowcount)
     conn.commit()
     return conn
 
 
-def add_message(conv_id, role, text, ts=None, raw=None, name=None, msg_key=None):
+def stats():
+    """库存消息按角色统计，如 {'me': 12, 'them': 340}。"""
+    conn = _conn()
+    rows = conn.execute("SELECT role, COUNT(*) AS c FROM messages GROUP BY role").fetchall()
+    conn.close()
+    return {r["role"]: r["c"] for r in rows}
+
+
+def add_message(conv_id, role, text, ts=None, raw=None, name=None, msg_key=None,
+                media=None, card=None):
     """写入一条消息。msg_key 用于去重（如微信 MsgSvrID）；缺省则用 会话+角色+时间+内容 推算。
+    media=媒体文件相对路径（wechat_media/ 下）；card=链接/文件卡片 JSON。
     返回是否真正新增（被去重跳过则返回 False）。"""
     ts = ts or int(time.time())
     if msg_key is None:
@@ -79,9 +103,9 @@ def add_message(conv_id, role, text, ts=None, raw=None, name=None, msg_key=None)
         )
         cur.execute("UPDATE conversations SET name=? WHERE conv_id=?", (name, conv_id))
     cur.execute(
-        "INSERT OR IGNORE INTO messages(conv_id, role, text, ts, raw, msg_hash) "
-        "VALUES(?, ?, ?, ?, ?, ?)",
-        (conv_id, role, text, ts, raw, h),
+        "INSERT OR IGNORE INTO messages(conv_id, role, text, ts, raw, msg_hash, media, card) "
+        "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+        (conv_id, role, text, ts, raw, h, media, card),
     )
     inserted = cur.rowcount > 0
     if inserted:
@@ -130,6 +154,56 @@ def was_sent(conv_id, text, within_seconds=120):
     return row is not None
 
 
+def get_cursor(conv_id):
+    """取某会话的轮询水印（last_time/max_seq）；没有返回 None。"""
+    conn = _conn()
+    row = conn.execute(
+        "SELECT last_time, max_seq FROM poll_cursor WHERE conv_id=?", (conv_id,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {"last_time": row["last_time"], "max_seq": row["max_seq"]}
+
+
+def update_media(conv_id, msg_key, media=None, card=None, text=None):
+    """按 msg_key 补更一条已存消息的媒体/卡片/文本（用于历史占位消息的媒体回填）。
+    返回受影响行数（0=没这条记录或无需更新）。"""
+    h = hashlib.sha256(msg_key.encode("utf-8")).hexdigest()
+    sets, params = [], []
+    if media is not None:
+        sets.append("media=?")
+        params.append(media)
+    if card is not None:
+        sets.append("card=?")
+        params.append(card)
+    if text is not None:
+        sets.append("text=?")
+        params.append(text)
+    if not sets:
+        return 0
+    params.extend([conv_id, h])
+    conn = init()
+    cur = conn.execute(
+        "UPDATE messages SET %s WHERE conv_id=? AND msg_hash=?" % ",".join(sets), params)
+    n = cur.rowcount
+    conn.commit()
+    conn.close()
+    return n
+
+
+def set_cursor(conv_id, last_time, max_seq):
+    """更新某会话的轮询水印。"""
+    conn = init()
+    conn.execute(
+        "INSERT INTO poll_cursor(conv_id, last_time, max_seq) VALUES(?, ?, ?) "
+        "ON CONFLICT(conv_id) DO UPDATE SET last_time=excluded.last_time, max_seq=excluded.max_seq",
+        (conv_id, int(last_time or 0), int(max_seq or 0)),
+    )
+    conn.commit()
+    conn.close()
+
+
 def clear_unread(conv_id):
     conn = init()
     conn.execute("UPDATE conversations SET unread=0 WHERE conv_id=?", (conv_id,))
@@ -149,7 +223,7 @@ def list_conversations():
 def get_messages(conv_id, limit=300):
     conn = _conn()
     rows = [dict(r) for r in conn.execute(
-        "SELECT role, text, ts FROM messages WHERE conv_id=? ORDER BY ts ASC LIMIT ?",
+        "SELECT role, text, ts, media, card FROM messages WHERE conv_id=? ORDER BY ts ASC LIMIT ?",
         (conv_id, limit),
     ).fetchall()]
     conn.close()

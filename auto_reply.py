@@ -131,6 +131,11 @@ class AutoReplier:
 
     # ---------- 主循环 ----------
     def run(self):
+        # 行缓冲：避免管道/部分终端环境下 print 被块缓冲憋到进程退出才输出
+        try:
+            sys.stdout.reconfigure(line_buffering=True)
+        except Exception:
+            pass
         try:
             self.db = WeChatDB()
             me = self.db.get_self_info()
@@ -138,14 +143,19 @@ class AutoReplier:
         except Exception as e:
             print("[!] WeChatDB 初始化失败（微信需已登录并跑过 wechatauto 体检）: %s" % e)
             sys.exit(1)
+        print("[auto] 库存统计: %s" % monitor_store.stats())
         if not self.enabled:
             print("[auto] 自动回复未启用（config.auto_reply.enabled=false）：仅收消息监控上屏，不回复任何人")
         print("[auto] 自动回复启动 dry_run=%s 间隔=%ds（Ctrl+C 停止）"
               % (self.dry_run, self.interval))
+        print("[auto] 首轮要全量解密全部数据库，可能数分钟；之后每轮秒级。进度见 [scan] 行")
         while True:
             try:
-                for item in poll_new(self.db):
+                items = poll_new(self.db, progress=True)
+                for item in items:
                     self.handle(item)
+                if items:
+                    print("[auto] 本轮扫描完成，新增 %d 条" % len(items))
             except KeyboardInterrupt:
                 print("[auto] 已停止")
                 break
