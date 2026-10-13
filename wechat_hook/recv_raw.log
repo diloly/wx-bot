@@ -1,0 +1,2 @@
+[+] hookdll 已加载 (SQLite 收消息捕获模式)
+[!] 未解析到 sqlite3_step/prepare, 见上方 [export] 行决定下一步

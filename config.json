@@ -1,0 +1,62 @@
+{
+  "dry_run": true,
+  "send_delay_seconds": 5,
+  "contacts": [
+    { "name": "11时59分[Sun]", "tags": ["new"] },
+    { "name": "黄文业", "tags": ["old", "vip"] }
+  ],
+  "templates": {
+    "welcome": "您好 {name}，我是小助手，后续有疑问随时找我～",
+    "followup": "Hi {name}，上周说的方案您看过了吗？需要我补充资料不？"
+  },
+  "ai": {
+    "provider": "ollama",
+    "base_url": "http://localhost:11434/v1",
+    "api_key": "",
+    "model": "gemma",
+    "temperature": 0.7,
+    "max_tokens": 200,
+    "system_prompt": "你是一个专业、自然、不油腻的客户关系维护助手。根据客户信息和本次沟通意图，写一条发给该客户的微信消息。要求：口语化、像真人、不堆砌营销话术、不超过3句话；只输出消息正文本身，不要引号、不要解释、不要'好的，这是…'之类的开场白。"
+  },
+  "tasks": [
+    {
+      "id": "daily_followup",
+      "template": "followup",
+      "tag": "old",
+      "cron": "0 10 * * *",
+      "enabled": false
+    },
+    {
+      "id": "ai_weekend_vip",
+      "ai": true,
+      "intent": "给VIP老客户做个轻松的周末问候，顺带问问最近用得怎么样",
+      "tag": "vip",
+      "cron": "30 18 * * 5",
+      "enabled": false
+    }
+  ],
+  "auto_reply": {
+    "enabled": false,
+    "dry_run": true,
+    "interval_seconds": 10,
+    "intent": "你正在以客户维护助手的身份回复客户发来的微信消息。语气自然、简洁、口语化，像真人聊天；不确定的问题坦诚说需要确认，不编造。只输出回复正文，不要解释。",
+    "contacts": [],
+    "allow_groups": false,
+    "cooldown_seconds": 30,
+    "max_replies_per_hour": 20,
+    "context_turns": 6,
+    "reply_types": ["文本"]
+  },
+  "dashboard": {
+    "port": 5000,
+    "db_path": "wechat_monitor.db"
+  },
+  "sync": {
+    "enabled": true,
+    "wechat_dir": "C:/Users/你的用户名/Documents/WeChat Files",
+    "out_dir": "E:/WorkBuddyData/WechatBot/decrypted",
+    "key_cmd": "",
+    "decrypt_cmd": "wxdump decrypt -i \"{wechat_dir}\" -o \"{out_dir}\"",
+    "interval_seconds": 60
+  }
+}
