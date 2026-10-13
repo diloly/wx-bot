@@ -1,0 +1,18 @@
+# ===== 客户聊天数据：消息库与媒体（含隐私内容，禁止入库）=====
+wechat_media/
+wechat_monitor.db
+wechat_monitor.db-journal
+
+# ===== Agent 工作记忆（内部笔记，非项目代码）=====
+.workbuddy/
+
+# ===== 运行时产物 =====
+__pycache__/
+*.pyc
+*.log
+ui_dump.txt
+recv_raw.log
+
+# ===== 编译产物 =====
+wechat_hook/*.dll
+wechat_hook/*.exe

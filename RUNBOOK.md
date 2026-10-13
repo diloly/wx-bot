@@ -63,6 +63,29 @@ python E:\WorkBuddyData\WechatBot\wechat_ui.py --send --ai --intent "周末问�
 python E:\WorkBuddyData\WechatBot\wechat_ui.py --schedule --no-dry
 ```
 
+> **首次运行注意**：首轮要全量解密全部数据库 + 为每个新会话建基线（分钟级、一次性，之后每轮秒级）。
+> 终端长时间没输出不是卡死——看 `[scan] n/总数 名字` 进度行在走；
+> 也可 `python -u xxx.py` 强制无缓冲输出。想快速验证单轮：`wx_recv_bridge.py --once`（跑完即退）。
+>
+> **增量水印（ scalability ）**：基线建好后，每轮只查「sort_seq > 水印」的新消息，
+> 空闲会话 0 行返回（亚毫秒级）——成千上万联系人也不会每轮全量遍历。
+> `[poll]` 行显示每轮「基线/增量」会话数与耗时，可自证。
+
+## 媒体真实渲染（图片/表情/视频/文件/链接卡片）
+
+- 新消息遇媒体类型**自动下载解密**落地到 `wechat_media/`，看板气泡直接渲染
+  `<img>` / `<video>` / 文件 chip / 链接卡片（标题+描述+封面图）。
+- 图片密钥链：cfgDword 派生 → 本地缓存（体检时已拿到）→ 内存扫描，**离线可用**。
+- 历史消息补渲染（一次性，幂等可重跑；先存了占位的旧记录也补上）：
+  ```
+  python E:\WorkBuddyData\WechatBot\wx_recv_bridge.py --media-backfill --depth 50
+  ```
+- **卡片仿微信四段式**：标题（2 行截断）+ 大小/描述 + 右侧类型图标
+  （PDF 红 / W 蓝 / X 绿；app 分享用首字母占位）+ 底栏来源（微信电脑版 / 千问APP / 腾讯会议）；
+  文件卡点击即下载，链接卡新窗口打开。旧卡片记录重跑一次 `--media-backfill` 即升级为新版式。
+- 已知限制：语音（SILK）浏览器不能播，仍显示占位；`.wxgf` 动画表情容器
+  不能直接渲染（下载成功也显示占位）；卡片封面/app 图标走 CDN 下载，失败则用类型图标/首字母占位。
+
 ## 四、自动回复安全闸门（config.auto_reply）
 
 | 闸门 | 默认 | 作用 |
