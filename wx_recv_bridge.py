@@ -72,6 +72,44 @@ VIDEO_EXTS = (".mp4", ".mov", ".webm")
 
 _md = None  # MediaDownloader 懒初始化（首次遇到媒体消息时才建）
 
+# 群成员表缓存：chatroom -> (拉取时间, {wxid: 显示名})。备注优先于昵称
+# （「马总」比「马彬」更可能是客户对他的称呼）。TTL 5 分钟：群成员变动不频繁，
+# 不值得每条消息都全量拉一次。
+_GROUP_MEMBERS_TTL = 300
+_group_members_cache = {}
+
+
+def _group_member_name(db, chatroom, sender_wxid):
+    """群消息发送者的显示名：优先微信群备注，退回昵称，再退回 wxid。"""
+    if not sender_wxid:
+        return ""
+    now = time.time()
+    hit = _group_members_cache.get(chatroom)
+    if hit and now - hit[0] < _GROUP_MEMBERS_TTL:
+        name = hit[1].get(sender_wxid)
+        if name:
+            return name
+    else:
+        try:
+            members = db.get_group_members(chatroom) or []
+        except Exception:
+            members = []
+        table = {}
+        for m in members:
+            wxid = m.get("username") or ""
+            disp = m.get("remark") or m.get("nick_name") or ""
+            if wxid and disp:
+                table[wxid] = disp
+        _group_members_cache[chatroom] = (now, table)
+        name = table.get(sender_wxid)
+        if name:
+            return name
+    # 缓存未命中（新成员/刚换备注）：单条反查兜底
+    try:
+        return db.get_nickname(sender_wxid) or sender_wxid
+    except Exception:
+        return sender_wxid
+
 
 def _get_md(db):
     global _md
@@ -102,15 +140,52 @@ def _guess_ext(data):
     return ".bin"
 
 
-def download_media(db, user, m):
+def _land_media_path(p):
+    """把库返回的文件路径落到媒体目录内，返回相对 MEDIA_DIR 的路径。
+    已在媒体目录内则原样相对化；否则复制进 files/。
+    注意不能用 os.path.commonpath：源文件在 C: 盘（微信缓存）而项目在 E: 盘时
+    它会抛 "Paths don't have the same drive"，跨盘必须走复制分支。"""
+    try:
+        ap = os.path.abspath(p)
+        base = os.path.abspath(MEDIA_DIR)
+        if ap.startswith(base + os.sep):
+            rel = os.path.relpath(ap, base)              # 已在媒体目录内
+        else:
+            dst_dir = os.path.join(MEDIA_DIR, "files")
+            os.makedirs(dst_dir, exist_ok=True)
+            dst = os.path.join(dst_dir, os.path.basename(p))
+            if os.path.abspath(dst) != ap:
+                shutil.copyfile(p, dst)
+            rel = os.path.relpath(dst, base)
+        return rel.replace("\\", "/")
+    except Exception as e:
+        print("[media] 落地失败 %s: %s" % (p, e))
+        return None
+
+
+def download_media(db, user, m, original=False, scroll=True, chat_name=None):
     """下载一条媒体消息。返回 (相对路径 or None, 扩展名 or None)。
-    download_media 可能返回路径（已落 save_dir）或字节，两种都兼容。"""
+    download_media 可能返回路径（已落 save_dir）或字节，两种都兼容。
+
+    original=True：图片强制走 download_image_original（要 _h.dat 真原件，
+    本机没有会**驱动微信界面**点开气泡下载，可能滚动消息列表）——只允许
+    在用户主动触发的 --media-backfill --original 里用，轮询路径绝不调用。"""
     md = _get_md(db)
     if not md:
         return None, None
     local_id = m.get("local_id")
     if not local_id:
         return None, None
+    if original and m.get("type") == "图片":
+        # 原图优先：先拿本地最高档，再驱动界面要 _h.dat 原件
+        try:
+            p = md.download_image_original(
+                user, local_id, chat_name=chat_name, scroll=scroll)
+            if p:
+                return _land_media_path(p), os.path.splitext(str(p))[1].lower()
+            print("[media] 原图未拿到 %s/%s，回退普通下载" % (user, local_id))
+        except Exception as e:
+            print("[media] 原图下载异常 %s/%s: %s（回退普通下载）" % (user, local_id, e))
     try:
         result = md.download_media(user, local_id)
     except Exception as e:
@@ -121,20 +196,7 @@ def download_media(db, user, m):
     # 形态一：文件路径
     p = str(result)
     if os.path.isfile(p):
-        try:
-            ap, base = os.path.abspath(p), os.path.abspath(MEDIA_DIR)
-            if os.path.commonpath([ap, base]) == base:
-                rel = os.path.relpath(ap, base)          # 已在媒体目录内
-            else:
-                dst_dir = os.path.join(MEDIA_DIR, "files")
-                os.makedirs(dst_dir, exist_ok=True)
-                dst = os.path.join(dst_dir, os.path.basename(p))
-                shutil.copyfile(p, dst)
-                rel = os.path.relpath(dst, base)
-            return rel.replace("\\", "/"), os.path.splitext(p)[1].lower()
-        except Exception as e:
-            print("[media] 落地失败 %s: %s" % (p, e))
-            return None, None
+        return _land_media_path(p), os.path.splitext(p)[1].lower()
     # 形态二：字节
     if isinstance(result, (bytes, bytearray)):
         data = bytes(result)
@@ -501,7 +563,7 @@ def poll_new(db, progress=False):
             sender = m.get("sender_username") or ""
             if sender and not self_msg and user.endswith(GROUP_SUFFIX):
                 try:
-                    sender_name = db.get_nickname(sender) or sender
+                    sender_name = _group_member_name(db, user, sender)
                 except Exception:
                     sender_name = sender
             raw = str({k: m.get(k) for k in
@@ -571,12 +633,16 @@ def poll_once(db, progress=False):
     return len(poll_new(db, progress=progress))
 
 
-def media_backfill(db, per_session=50):
+def media_backfill(db, per_session=50, original=False, scroll=True):
     """历史媒体回填：对每会话最近 N 条里的媒体消息下载落地，并补更到已存记录
-    （解决「先存了占位、后来才开媒体渲染」的历史消息）。幂等，可重复跑。"""
+    （解决「先存了占位、后来才开媒体渲染」的历史消息）。幂等，可重复跑。
+
+    original=True：图片强制要 _h.dat 真原件——会驱动微信界面（点气泡/滚动列表），
+    仅限用户主动运行时开启，且运行时不能操作电脑。"""
     sessions = db.get_sessions(limit=SESSION_LIMIT)
     total = len(sessions)
     updated = 0
+    n_original = 0
     for idx, s in enumerate(sessions, 1):
         user = s.get("username")
         if not user:
@@ -595,7 +661,11 @@ def media_backfill(db, per_session=50):
             local_id = m.get("local_id")
             if not local_id:
                 continue
-            media_rel, _ext = download_media(db, user, m)
+            media_rel, _ext = download_media(
+                db, user, m, original=original, scroll=scroll,
+                chat_name=db.get_nickname(user) or user)
+            if original and mtype == "图片":
+                n_original += 1
             card_json, text = None, None
             if mtype == "文件/链接/卡片":
                 card = parse_card(db, user, m)
@@ -604,8 +674,7 @@ def media_backfill(db, per_session=50):
                     # 群聊卡片补真实发送者（与 poll_new 一致）
                     if is_group and m.get("sender_username") and not is_self(m):
                         try:
-                            sn = (db.get_nickname(m["sender_username"])
-                                  or m["sender_username"])
+                            sn = _group_member_name(db, user, m["sender_username"])
                         except Exception:
                             sn = m["sender_username"]
                         card["sender"] = sn
@@ -627,6 +696,8 @@ def media_backfill(db, per_session=50):
                 updated += n
                 if n:
                     print("[backfill] + %s %s -> %s" % (user, mtype, media_rel or "card"))
+    if original:
+        print("[backfill] 原图模式：处理图片 %d 张（会驱动微信界面，请勿操作电脑）" % n_original)
     print("[backfill] 完成，补更 %d 条历史消息" % updated)
 
 
@@ -642,6 +713,12 @@ def main():
     ap.add_argument("--media-backfill", action="store_true",
                     help="历史媒体回填：给已入库的占位消息补下载图片/视频/文件/卡片后退出")
     ap.add_argument("--depth", type=int, default=50, help="回填深度：每会话最近 N 条")
+    ap.add_argument("--original", action="store_true",
+                    help="（仅配合 --media-backfill）图片强制下载 _h.dat 真原件："
+                         "会驱动微信界面点开气泡、滚动消息列表，运行时请勿操作电脑")
+    ap.add_argument("--no-scroll-original", action="store_true",
+                    help="配合 --original：只在当前屏幕可见区找原图，不滚动消息列表"
+                         "（找不到就跳过，绝不打扰界面）")
     args = ap.parse_args()
 
     monitor_store.init()
@@ -656,7 +733,9 @@ def main():
 
     if args.media_backfill:
         print("[*] 历史媒体回填模式（每会话最近 %d 条）..." % args.depth)
-        media_backfill(db, per_session=args.depth)
+        media_backfill(db, per_session=args.depth,
+                       original=args.original,
+                       scroll=not args.no_scroll_original)
         return
 
     print("[*] 收消息桥启动，每 %ds 轮询一次（Ctrl+C 停止）" % args.interval)

@@ -72,11 +72,32 @@ pyautogui.PAUSE = 0.05
 
 # ---------- 窗口定位（ctypes，不依赖 UIA / 控件树）----------
 _user32 = ctypes.windll.user32
+_kernel32 = ctypes.windll.kernel32
+
+# 浏览器/系统容器类名：标题含「微信」的网页（如看板页面「微信客户维护·看板」）
+# 也曾被误判成微信主窗口，导致快捷键全发进浏览器。见到这些类名一律排除。
+_BROWSER_CLASSES = ("Chrome_WidgetWin", "MozillaWindowClass",
+                    "ApplicationFrame", "Windows.UI.Core", "EE_Window")
+# 微信主窗口的 Qt 类名（实测 Qt51514QWindowIcon；微信升级可能变，仅作优先信号，不当硬条件）
+_WECHAT_CLASS_HINT = "Qt515"
+VK_MENU = 0x12           # Alt 键，用于解除 Windows 前台锁
+KEYEVENTF_KEYUP = 0x0002
+SW_RESTORE = 9
+
+
+def _class_of(hwnd):
+    buf = ctypes.create_unicode_buffer(256)
+    _user32.GetClassNameW(hwnd, buf, 256)
+    return buf.value
 
 
 def find_wechat_windows():
-    """返回 [(hwnd, title), ...]，只认个人「微信」窗口：
-    标题含「微信」但排除「企业微信」「微信开发者工具」等。"""
+    """返回 [(hwnd, title), ...]，只认个人微信主窗口。
+    双保险防误判（历史事故：标题含「微信」的看板浏览器窗口被当成微信，
+    快捷键 Ctrl+F/粘贴/Enter 全发进浏览器）：
+    ① 类名含 Qt515（微信 Qt 主窗口）——优先信号；
+    ② 或标题精确等于「微信」（主窗口标题就是它；「微信客户维护·看板」这类一律排除）；
+    类名是浏览器/系统容器的一律先排除。多个命中时 Qt 类窗口排前。"""
     found = []
 
     def _enum(hwnd, _lparam):
@@ -88,38 +109,86 @@ def find_wechat_windows():
         buf = ctypes.create_unicode_buffer(length + 1)
         _user32.GetWindowTextW(hwnd, buf, length + 1)
         title = buf.value
-        if ("微信" in title) and ("企业" not in title) and ("开发者" not in title):
+        if ("微信" not in title) or ("企业" in title) or ("开发者" in title):
+            return
+        cls = _class_of(hwnd)
+        if any(b in cls for b in _BROWSER_CLASSES):
+            return                      # 看板/网页窗口，不是微信
+        if (_WECHAT_CLASS_HINT in cls) or title == "微信":
             found.append((hwnd, title))
 
     ENUMPROC = ctypes.WINFUNCTYPE(None, wintypes.HWND, wintypes.LPARAM)
     _user32.EnumWindows(ENUMPROC(_enum), 0)
+    # 微信 Qt 主窗口优先（多窗口命中时）
+    found.sort(key=lambda t: 0 if _WECHAT_CLASS_HINT in _class_of(t[0]) else 1)
     return found
 
 
+def _activate(hwnd):
+    """把指定窗口强制激活到真正前台。Windows 前台锁下裸 SetForegroundWindow
+    会静默失败（只闪任务栏），所以用组合技：最小化先还原 → Alt tap 解除前台限制 →
+    AttachThreadInput 附到前台线程 → SetForegroundWindow → 轮询确认（最多 3s）。"""
+    if _user32.IsIconic(hwnd):
+        _user32.ShowWindow(hwnd, SW_RESTORE)
+        time.sleep(0.2)
+    if _user32.GetForegroundWindow() == hwnd:
+        return True
+    # Alt tap：让系统认为本进程刚收到用户输入，解除「只有前台进程能设置前台」的限制
+    _user32.keybd_event(VK_MENU, 0, 0, 0)
+    _user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+    # 附加到当前前台线程的输入队列，联合设置前台
+    fg = _user32.GetForegroundWindow()
+    fore_tid = _user32.GetWindowThreadProcessId(fg, None)
+    my_tid = _kernel32.GetCurrentThreadId()
+    if fore_tid and fore_tid != my_tid:
+        _user32.AttachThreadInput(my_tid, fore_tid, True)
+    try:
+        _user32.SetForegroundWindow(hwnd)
+        _user32.BringWindowToTop(hwnd)
+    finally:
+        if fore_tid and fore_tid != my_tid:
+            _user32.AttachThreadInput(my_tid, fore_tid, False)
+    for _ in range(30):
+        if _user32.GetForegroundWindow() == hwnd:
+            time.sleep(0.15)   # 等窗口完成绘制、焦点落稳再发键
+            return True
+        time.sleep(0.1)
+    return False
+
+
 def focus_wechat():
-    """把个人微信窗口提到前台并返回 (hwnd, title)。找不到则抛错。"""
+    """把个人微信主窗口激活到前台并返回 (hwnd, title)。找不到/激活失败则抛错。"""
     wins = find_wechat_windows()
     if not wins:
         raise RuntimeError(
-            "找不到个人微信窗口（已自动排除企业微信）。"
-            "请确认个人微信已登录并打开；若只开了企业微信，本脚本不会动它。"
+            "找不到个人微信窗口（已自动排除企业微信/浏览器页面）。"
+            "请确认个人微信已登录并打开；可用 --inspect 查看当前识别到的窗口。"
         )
     hwnd, title = wins[0]
-    if _user32.IsIconic(hwnd):
-        _user32.ShowWindow(hwnd, 9)  # 仅当最小化时才还原
-        time.sleep(0.2)
-    _user32.SetForegroundWindow(hwnd)
-    time.sleep(0.3)
+    if not _activate(hwnd):
+        fg = _user32.GetForegroundWindow()
+        n = _user32.GetWindowTextLengthW(fg)
+        buf = ctypes.create_unicode_buffer(n + 1)
+        _user32.GetWindowTextW(fg, buf, n + 1)
+        raise RuntimeError(
+            "无法把微信窗口激活到前台（当前前台是 %r）。"
+            "可能原因：微信刚启动未就绪 / 系统前台限制。"
+            "请手动点一下微信窗口再重试。" % buf.value
+        )
     return hwnd, title
 
 
 def _require_foreground(hwnd):
     """非 dry-run 时，确认前台确实是我們聚焦的微信窗口；否则中止本次发送，
-    避免按键发到别的窗口（这正是之前误关窗口的根因）。"""
+    避免按键发到别的窗口（历史上出过两类事故：误关窗口、快捷键发进看板浏览器）。"""
     if _user32.GetForegroundWindow() != hwnd:
+        fg = _user32.GetForegroundWindow()
+        n = _user32.GetWindowTextLengthW(fg)
+        buf = ctypes.create_unicode_buffer(n + 1)
+        _user32.GetWindowTextW(fg, buf, n + 1)
         raise RuntimeError(
-            "微信未成为前台窗口，已中止本次发送以防按键发错窗口。"
-            "请先手动点一下微信窗口，再重跑脚本。"
+            "微信未成为前台窗口（当前前台是 %r），已中止本次发送以防按键发错窗口。"
+            "请先手动点一下微信窗口，再重跑脚本。" % buf.value
         )
 
 
@@ -162,7 +231,16 @@ class WeChatPCBot:
             pyautogui.press("enter")
         else:
             pyautogui.hotkey(*_SEND_KEY)
-        time.sleep(self.delay)
+        self._rhythm_nap()
+
+    def _rhythm_nap(self):
+        """发送后等待：rhythm.nap 只让等待变长（×1.0~1.45 随机），不会比固定
+        delay 更快——拿稳定性换抖动不划算。库不可用时回退固定 sleep。"""
+        try:
+            from wechatauto import rhythm
+            rhythm.nap(self.delay)
+        except Exception:
+            time.sleep(self.delay)
 
     # ---------- 业务动作 ----------
     def send_to_contact(self, name, message, conv_id=None):
@@ -256,11 +334,12 @@ class WeChatPCBot:
         """列出当前被识别为个人微信的窗口（用 ctypes，不需要控件树）。"""
         wins = find_wechat_windows()
         if not wins:
-            log.info("未找到个人微信窗口（已自动排除企业微信）。请确认个人微信已打开并登录。")
+            log.info("未找到个人微信主窗口（已排除企业微信和浏览器页面）。"
+                     "请确认个人微信已打开并登录。")
             return
         log.info("找到 %d 个个人微信窗口：", len(wins))
         for hwnd, title in wins:
-            log.info("  hwnd=%s title=%r", hwnd, title)
+            log.info("  hwnd=%s title=%r class=%r", hwnd, title, _class_of(hwnd))
         log.info("键盘驱动不需要控件树，--inspect 仅用于确认窗口可被定位（只认个人微信）。")
 
     def run_schedule(self):

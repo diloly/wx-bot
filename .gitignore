@@ -2,6 +2,7 @@
 wechat_media/
 wechat_monitor.db
 wechat_monitor.db-journal
+backups/
 
 # ===== Agent 工作记忆（内部笔记，非项目代码）=====
 .workbuddy/
@@ -15,6 +16,7 @@ __pycache__/
 *.log
 ui_dump.txt
 recv_raw.log
+.moment_actions.json     # 朋友圈每日动作计数
 
 # ===== 编译产物 =====
 wechat_hook/*.dll
