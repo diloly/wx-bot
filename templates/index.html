@@ -53,6 +53,9 @@
   .msg.me .bubble { background: #95ec69; }
   .msg .time { font-size: 11px; color: #b0b0b0; align-self: flex-end; margin: 0 8px; }
 
+  /* 群聊卡片的真实发送者（普通文本消息靠「昵称: 」前缀，卡片会丢，故单独渲染） */
+  .bubble .msg-sender { font-size: 11px; color: #9a9a9a; margin: -2px 0 6px; }
+
   /* 媒体消息（图片/视频） */
   .msg .bubble.media-bubble { padding: 6px; background: #fff; }
   .msg.me .bubble.media-bubble { background: #95ec69; }
@@ -89,6 +92,42 @@
     border-top: 1px solid #f2f2f2; font-size: 11px; color: #9a9a9a;
   }
   .card-foot .card-foot-icon { font-size: 13px; line-height: 1; }
+
+  /* 引用回复（type 57）：引用块 + 回复正文 */
+  .quote-card { width: 300px; }
+  .quote-ref {
+    background: #f2f2f2; border-radius: 6px; padding: 8px 10px; margin-bottom: 8px;
+    border-left: 3px solid #d2d2d2;
+  }
+  .msg.me .quote-ref { background: #e0f3d0; border-left-color: #bfe0a8; }
+  .quote-ref .q-name { font-size: 12px; color: #576b95; margin-bottom: 3px; }
+  .msg.me .quote-ref .q-name { color: #3a7a2a; }
+  .quote-ref .q-text {
+    font-size: 13px; color: #888; line-height: 1.4; max-height: 3.2em; overflow: hidden;
+  }
+  .quote-reply {
+    font-size: 14px; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+  }
+
+  /* 视频号分享（type 51） */
+  .finder-card { display: block; width: 300px; text-decoration: none; }
+  .finder-cover {
+    position: relative; width: 100%; height: 190px;
+    background: #000 center/cover no-repeat; border-radius: 6px 6px 0 0;
+  }
+  .finder-cover .play-btn {
+    position: absolute; left: 50%; top: 50%; transform: translate(-50%,-50%);
+    width: 52px; height: 52px; border-radius: 50%; background: rgba(0,0,0,0.45);
+    color: #fff; font-size: 22px; display: flex; align-items: center; justify-content: center;
+  }
+  .finder-foot {
+    display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: #fff;
+    border: 1px solid #e6e6e6; border-top: none; border-radius: 0 0 8px 8px;
+  }
+  .msg.me .finder-foot { background: #e7f9d9; border-color: #d8f0c0; }
+  .finder-foot .favatar { width: 26px; height: 26px; border-radius: 50%; object-fit: cover; }
+  .finder-foot .fname { font-size: 13px; color: #333; }
+  .finder-foot .fauth { color: #07c160; font-size: 12px; }
 
   /* 文件 chip（无卡片信息时的裸文件） */
   .file-chip {
@@ -129,6 +168,7 @@ const POLL = 2000;
 let activeConv = null;
 let lastMsgCount = 0;
 let forceBottom = false;   // 刚切换会话时强制滚底一次
+let renderedSigs = [];     // 当前会话已渲染消息的签名（增量渲染比对用）
 
 async function loadConversations() {
   const res = await fetch('/api/conversations');
@@ -156,6 +196,7 @@ async function openConv(convId, name) {
   activeConv = convId;
   lastMsgCount = 0;
   forceBottom = true;   // 切换会话：首次加载滚到最新
+  renderedSigs = [];    // 重置增量渲染状态（换会话走全量重建）
   await fetch('/api/open', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({conv: convId})
@@ -212,6 +253,41 @@ function cardHtml(m) {
   const title = esc(c.title || '');
   const sub = esc(c.size || c.descr || '');
   const src = esc(c.source || '');
+
+  // 引用回复（type 57）：引用块 + 回复正文
+  if (c.kind === 'quote') {
+    const q = c.quote || {};
+    const reply = esc(c.title || m.text || '');
+    const nameHtml = q.name ? `<div class="q-name">${esc(q.name)}</div>` : '';
+    const qText = esc(q.text || '');
+    return `<div class="quote-card">
+      <div class="quote-ref">
+        ${nameHtml}
+        <div class="q-text">${qText || '<i style="color:#bbb">（无引用内容）</i>'}</div>
+      </div>
+      <div class="quote-reply">${reply}</div>
+    </div>`;
+  }
+
+  // 视频号分享（type 51）：封面 + 居中播放键 + 底栏频道信息
+  if (c.kind === 'finder') {
+    const f = c.finder || {};
+    const coverLocal = (f.cover && !f.cover.startsWith('http')) ? f.cover : '';
+    const avatarLocal = (f.avatar && !f.avatar.startsWith('http')) ? f.avatar : '';
+    const coverStyle = coverLocal ? `style="background-image:url('/media/${encodeURI(coverLocal)}')"` : '';
+    const auth = f.auth_icon ? `<span class="fauth">✓</span>` : '';
+    return `<a class="finder-card" href="${esc(f.video || c.url || '')}" target="_blank" rel="noopener">
+      <div class="finder-cover" ${coverStyle}>
+        <div class="play-btn">▶</div>
+      </div>
+      <div class="finder-foot">
+        ${avatarLocal ? `<img class="favatar" src="/media/${encodeURI(avatarLocal)}" alt="">` : ''}
+        <span class="fname">${esc(f.nickname || '视频号')}</span>
+        ${auth}
+      </div>
+    </a>`;
+  }
+
   const isFile = c.kind === 'file';
   const icon = c.thumb
     ? `<img class="card-thumb" src="/media/${encodeURI(c.thumb)}" alt="">`
@@ -270,28 +346,63 @@ function bubbleContent(m) {
   return esc(m.text);
 }
 
+// 消息签名：内容/媒体/卡片任一变化都能被增量渲染感知
+function sigOf(m) {
+  return [m.role, m.ts, m.text || '', m.media || '', m.card || ''].join('\u0001');
+}
+
+// 群聊卡片的真实发送者（card.sender；普通文本消息用「昵称: 」前缀，不适用本函数）
+function cardSender(m) {
+  if (!m.card) return '';
+  try {
+    const c = JSON.parse(m.card);
+    return c.sender ? `<div class="msg-sender">${esc(c.sender)}</div>` : '';
+  } catch (e) { return ''; }
+}
+
+function buildMsgEl(m) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + (m.role === 'me' ? 'me' : 'them');
+  const t = fmtTime(m.ts);
+  const isMedia = m.media && !m.card;
+  div.innerHTML = `<div class="bubble${isMedia ? ' media-bubble' : ''}">${cardSender(m)}${bubbleContent(m)}</div><div class="time">${t}</div>`;
+  return div;
+}
+
 async function loadMessages() {
   if (!activeConv) return;
   const res = await fetch('/api/messages?conv=' + encodeURIComponent(activeConv));
   const msgs = await res.json();
   const box = document.getElementById('messages');
   if (!box) return;
-  // 智能滚底：仅当用户本就贴底（或刚切换会话）才滚到最新；
-  // 用户往上翻看历史时，保留其滚动位置，不被轮询刷新弹回底部。
+  const sigs = msgs.map(sigOf);
+
+  // ① 内容没变（绝大多数轮次）-> 一个节点都不动，用户的选择/滚动完全不受影响
+  if (sigs.length === renderedSigs.length && sigs.every((s, i) => s === renderedSigs[i])) {
+    return;
+  }
+
   const stickBottom = forceBottom
     || (box.scrollHeight - box.scrollTop - box.clientHeight < 80);
   forceBottom = false;
-  const prevScrollTop = box.scrollTop;
-  box.innerHTML = '';
-  for (const m of msgs) {
-    const div = document.createElement('div');
-    div.className = 'msg ' + (m.role === 'me' ? 'me' : 'them');
-    const t = fmtTime(m.ts);
-    const isMedia = m.media && !m.card;
-    div.innerHTML = `<div class="bubble${isMedia ? ' media-bubble' : ''}">${bubbleContent(m)}</div><div class="time">${t}</div>`;
-    box.appendChild(div);
+
+  // ② 前缀一致、只是变长 -> 只追加新消息，旧节点原样保留（复制选中的文字不会被清掉）
+  let i = 0;
+  while (i < renderedSigs.length && i < sigs.length && renderedSigs[i] === sigs[i]) i++;
+  if (i > 0 && i === renderedSigs.length) {
+    for (; i < sigs.length; i++) {
+      box.appendChild(buildMsgEl(msgs[i]));
+    }
+  } else {
+    // ③ 内容有变/变少（如媒体回填改了旧记录）-> 全量重建，尽量保留滚动位置
+    const prevScrollTop = box.scrollTop;
+    box.innerHTML = '';
+    for (const m of msgs) box.appendChild(buildMsgEl(m));
+    if (!stickBottom) box.scrollTop = prevScrollTop;
   }
-  box.scrollTop = stickBottom ? box.scrollHeight : prevScrollTop;
+
+  renderedSigs = sigs;
+  if (stickBottom) box.scrollTop = box.scrollHeight;
 }
 
 async function sendMessage() {

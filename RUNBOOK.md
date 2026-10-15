@@ -34,6 +34,7 @@
    - `ai.model` = `gemma`（须与 `ollama list` 输出一致）
    - `auto_reply` 块：白名单 `contacts`、频率闸 `cooldown_seconds` / `max_replies_per_hour`
    - `contacts` 可加 `"wxid"` 字段做精确匹配（可选）
+   - 接自定义/云端大模型时：`ai.provider` 设 `custom`，**保密项 `base_url` / `api_key` 填 `ai_secrets.json`**（该文件含密钥，不要外发；已加入 .gitignore）
 4. 确认 Ollama 在跑：`ollama serve` + `ollama list` 里有 gemma
 
 ## 三、日常运行（三个终端）
@@ -109,12 +110,11 @@ python <项目根目录>\wechat_ui.py --schedule --no-dry
 6. `--no-dry` 真发成功，看板出现「我」的气泡
 7. 连发多条 → 日志出现「冷却中/已达上限」跳过，闸门生效
 
-## 六、已作废组件（勿再投入）
+## 六、走过的弯路（结论备忘，防回头）
 
-- `wechat_hook/` — DLL hook 路线（按老架构设计，本机无本地消息库，架构性错误）
-- `xlog_decode.py` — xlog 解密（TEA 密钥推导错，115 块全失败，兔子洞）
-- `ingest.py` / `auto_sync.py` / `config.sync` — PyWxDump 路线（wxdump info 报 WeChat No Run）
-- `ui_dump*.py` / `wxauto_test.py` — UIA 探测遗留（结论：Qt 自绘层不暴露控件，除非热激活）
+- DLL 注入/hook：按老架构设计，本机新版微信无本地消息库，架构性错误，勿再投入。
+- xlog 解密：TEA 密钥推导错，115 块全失败；PyWxDump 路线：`wxdump info` 报 WeChat No Run。
+- UIA 读屏：Qt 自绘层不暴露控件（除非热激活）；读消息最终走 wechatauto-replica 解密本地库。
 
 ## 七、风控与合规（始终有效）
 
