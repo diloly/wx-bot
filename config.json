@@ -9,15 +9,6 @@
     "welcome": "您好 {name}，我是小助手，后续有疑问随时找我～",
     "followup": "Hi {name}，上周说的方案您看过了吗？需要我补充资料不？"
   },
-  "ai": {
-    "provider": "ollama",
-    "base_url": "http://localhost:11434/v1",
-    "api_key": "",
-    "model": "gemma",
-    "temperature": 0.7,
-    "max_tokens": 200,
-    "system_prompt": "你是一个专业、自然、不油腻的客户关系维护助手。根据客户信息和本次沟通意图，写一条发给该客户的微信消息。要求：口语化、像真人、不堆砌营销话术、不超过3句话；只输出消息正文本身，不要引号、不要解释、不要'好的，这是…'之类的开场白。"
-  },
   "tasks": [
     {
       "id": "daily_followup",
@@ -36,16 +27,31 @@
     }
   ],
   "auto_reply": {
-    "enabled": false,
+    "enabled": true,
     "dry_run": true,
     "interval_seconds": 10,
-    "intent": "你正在以客户维护助手的身份回复客户发来的微信消息。语气自然、简洁、口语化，像真人聊天；不确定的问题坦诚说需要确认，不编造。只输出回复正文，不要解释。",
+    "intent": "你正在微信上回复客户发来的消息，目的是激活客户（让沉默的客户愿意重新聊、在用的愿意续费扩购）。语气自然、简洁、口语化，像真人一对一聊天；客户问的产品细节只引用系统提示词里给的资料，资料没有的说'我确认一下再回复你'，不编造。只输出回复正文，不要解释。",
     "contacts": [],
     "allow_groups": false,
     "cooldown_seconds": 30,
+    "context_turns": 3,
+    "context_hours": 6,
+    "rhythm": "natural",
     "max_replies_per_hour": 20,
-    "context_turns": 6,
     "reply_types": ["文本"]
+  },
+  "ai": {
+    "persona": "小光",
+    "product": "空间设计 SaaS 平台"
+  },
+  "moment": {
+    "watch": [],
+    "max_actions_per_day": 10,
+    "ai_comment": true
+  },
+  "knowledge": {
+    "dir": "knowledge",
+    "top_k": 3
   },
   "dashboard": {
     "port": 5000,

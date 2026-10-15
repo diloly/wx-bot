@@ -55,6 +55,38 @@ def init(path=None):
             last_time INTEGER DEFAULT 0,
             max_seq   INTEGER DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS conv_switch (
+            conv_id    TEXT PRIMARY KEY,
+            enabled    INTEGER NOT NULL DEFAULT 0,   -- 1=该会话开AI自动回复，0/无记录=关
+            updated_at INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS moments (
+            tid         TEXT PRIMARY KEY,             -- SnsTimeLine.tid（微信内自增）
+            username    TEXT,                        -- 发布者 wxid
+            nickname    TEXT,
+            text        TEXT,
+            create_time INTEGER,
+            media       TEXT,                        -- JSON: images/videos（含 md5/宽高）
+            likes       TEXT,                        -- JSON: 点赞用户列表
+            comments    TEXT,                        -- JSON: 评论列表
+            followed    INTEGER DEFAULT 0,           -- 1=关注客户的新圈
+            seen_ts     INTEGER DEFAULT 0            -- 落库时间
+        );
+        CREATE TABLE IF NOT EXISTS moment_inter (
+            local_id     INTEGER PRIMARY KEY,         -- SnsMessage_tmp3.local_id
+            type         INTEGER,                     -- 1=赞 2=评论
+            from_username TEXT,
+            from_nickname TEXT,
+            content      TEXT,
+            feed_id      TEXT,
+            create_time  INTEGER,
+            unread       INTEGER DEFAULT 1,
+            seen_ts      INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS moment_cursor (
+            id       INTEGER PRIMARY KEY CHECK (id = 1),
+            last_tid TEXT DEFAULT '0'                  -- 朋友圈轮询水印（微信tid是20位大数，超int64，必须TEXT）
+        );
         CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages(conv_id, ts);
         """
     )
@@ -67,6 +99,21 @@ def init(path=None):
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_hash ON messages(msg_hash)"
     )
+    # 一次性迁移：moment_cursor.last_tid 早先按 INTEGER 建（微信 tid 是 20 位
+    # 大数、超 int64，INTEGER 列存不下），改为 TEXT。水位丢了最多多拉一轮，
+    # add_moment 按 tid 去重，无副作用。幂等。
+    try:
+        col = conn.execute("PRAGMA table_info(moment_cursor)").fetchall()
+        types = {r[1]: (r[2] or "").upper() for r in col}
+        if types.get("last_tid", "TEXT") != "TEXT":
+            conn.execute("DROP TABLE moment_cursor")
+            conn.execute(
+                "CREATE TABLE moment_cursor ("
+                "id INTEGER PRIMARY KEY CHECK (id = 1), last_tid TEXT DEFAULT '0')")
+            conn.commit()
+            print("[monitor_store] moment_cursor.last_tid 已迁移为 TEXT（tid 超 int64）")
+    except sqlite3.OperationalError:
+        pass
     # 一次性迁移：清理 2026-10-13 消息映射错误时期产生的坏占位记录
     # （text 形如 [消息类型XXX]，content 被错误覆盖）。
     # msg_hash 不变会被去重挡住正确文本，故删掉让新逻辑重新入库。幂等。
@@ -222,20 +269,195 @@ def clear_unread(conv_id):
     conn.close()
 
 
+def set_switch(conv_id, enabled):
+    """设置某会话的 AI 自动回复开关（看板每个会话一个，默认关）。
+    upsert：不存在则插入，存在则更新。"""
+    conn = init()
+    conn.execute(
+        "INSERT INTO conv_switch(conv_id, enabled, updated_at) VALUES(?, ?, ?) "
+        "ON CONFLICT(conv_id) DO UPDATE SET enabled=excluded.enabled, updated_at=excluded.updated_at",
+        (conv_id, 1 if enabled else 0, int(time.time())),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_switches():
+    """全部会话的自动回复开关：{conv_id: bool}。没有记录的会话即关闭（安全默认）。"""
+    conn = _conn()
+    rows = conn.execute("SELECT conv_id, enabled FROM conv_switch").fetchall()
+    conn.close()
+    return {r["conv_id"]: bool(r["enabled"]) for r in rows}
+
+
 def list_conversations():
+    """会话列表（按最近活跃倒序），每项带 auto_reply=该会话AI自动回复开关（0/1）。"""
     conn = _conn()
     rows = [dict(r) for r in conn.execute(
-        "SELECT * FROM conversations ORDER BY last_ts DESC"
+        "SELECT c.*, COALESCE(s.enabled, 0) AS auto_reply "
+        "FROM conversations c "
+        "LEFT JOIN conv_switch s ON s.conv_id = c.conv_id "
+        "ORDER BY c.last_ts DESC"
     ).fetchall()]
     conn.close()
     return rows
 
 
-def get_messages(conv_id, limit=300):
+def get_messages(conv_id, limit=300, since_ts=None):
+    """取某会话的消息，按时间正序返回。
+    - limit 限制的是**最近**多少条（子查询先 DESC 截取再 ASC 排回来）——
+      早年写成 ORDER BY ts ASC LIMIT n 取到的是最早的 n 条，是 bug。
+    - since_ts：只取该 Unix 时间戳之后的消息（auto_reply 用它做上下文时间窗）。
+    """
     conn = _conn()
-    rows = [dict(r) for r in conn.execute(
-        "SELECT role, text, ts, media, card FROM messages WHERE conv_id=? ORDER BY ts ASC LIMIT ?",
-        (conv_id, limit),
-    ).fetchall()]
+    sql = ("SELECT * FROM ("
+           "SELECT role, text, ts, media, card FROM messages WHERE conv_id=?")
+    params = [conv_id]
+    if since_ts:
+        sql += " AND ts>=?"
+        params.append(int(since_ts))
+    sql += " ORDER BY ts DESC LIMIT ?) ORDER BY ts ASC"
+    params.append(limit)
+    rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
     conn.close()
     return rows
+
+
+# ==================== 朋友圈（moment_ops 的数据落地） ====================
+
+def add_moment(feed, followed=0):
+    """落库一条朋友圈动态（按 tid 去重）。返回 1=新增，0=已存在。"""
+    conn = _conn()
+    try:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO moments "
+            "(tid, username, nickname, text, create_time, media, likes, comments, followed, seen_ts) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (str(feed.get("id")), feed.get("username") or "",
+             feed.get("nickname") or "", feed.get("text") or "",
+             int(feed.get("create_time") or 0),
+             _jdump({"images": feed.get("images"), "videos": feed.get("videos")}),
+             _jdump(feed.get("likes")), _jdump(feed.get("comments")),
+             1 if followed else 0, int(time.time())),
+        )
+        conn.commit()
+        return cur.rowcount or 0
+    finally:
+        conn.close()
+
+
+def get_moments(limit=50, only_followed=False, since_ts=None):
+    """最近的朋友圈动态（按 create_time 倒序）。"""
+    conn = _conn()
+    sql = "SELECT * FROM moments"
+    params = []
+    where = []
+    if only_followed:
+        where.append("followed=1")
+    if since_ts:
+        where.append("create_time>=?")
+        params.append(int(since_ts))
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY create_time DESC LIMIT ?"
+    params.append(limit)
+    rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+    conn.close()
+    for r in rows:
+        r["media_json"] = _jload(r.pop("media", None))
+        r["likes_json"] = _jload(r.pop("likes", None))
+        r["comments_json"] = _jload(r.pop("comments", None))
+    return rows
+
+
+def add_interaction(it):
+    """落库一条「别人赞/评论我」的通知（按 local_id 去重）。返回 1=新增。"""
+    conn = _conn()
+    try:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO moment_inter "
+            "(local_id, type, from_username, from_nickname, content, feed_id, create_time, unread, seen_ts) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (it.get("local_id"), it.get("type") or 0,
+             it.get("from_username") or "", it.get("from_nickname") or "",
+             it.get("content") or "", str(it.get("feed_id") or ""),
+             int(it.get("create_time") or 0), 1, int(time.time())),
+        )
+        conn.commit()
+        return cur.rowcount or 0
+    finally:
+        conn.close()
+
+
+def get_interactions(limit=50, only_unread=False):
+    """互动通知（赞/评论），按 local_id 倒序。"""
+    conn = _conn()
+    sql = "SELECT * FROM moment_inter"
+    if only_unread:
+        sql += " WHERE unread=1"
+    sql += " ORDER BY local_id DESC LIMIT ?"
+    rows = [dict(r) for r in conn.execute(sql, (limit,)).fetchall()]
+    conn.close()
+    return rows
+
+
+def mark_interactions_read():
+    """把所有未读互动标为已读，返回变更条数。"""
+    conn = _conn()
+    try:
+        cur = conn.execute("UPDATE moment_inter SET unread=0 WHERE unread=1")
+        conn.commit()
+        return cur.rowcount or 0
+    finally:
+        conn.close()
+
+
+def moment_unread_count():
+    conn = _conn()
+    try:
+        return conn.execute(
+            "SELECT count(*) FROM moment_inter WHERE unread=1").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def get_moment_cursor():
+    """朋友圈轮询水印（字符串：微信 tid 是 20 位大数，超 int64）。"""
+    conn = _conn()
+    try:
+        r = conn.execute("SELECT last_tid FROM moment_cursor WHERE id=1").fetchone()
+        return str(r[0]) if r and r[0] is not None else "0"
+    finally:
+        conn.close()
+
+
+def set_moment_cursor(last_tid):
+    conn = _conn()
+    try:
+        conn.execute(
+            "INSERT INTO moment_cursor (id, last_tid) VALUES (1, ?) "
+            "ON CONFLICT(id) DO UPDATE SET last_tid=excluded.last_tid",
+            (str(last_tid),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _jdump(obj):
+    import json
+    if obj is None:
+        return None
+    try:
+        return json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        return None
+
+
+def _jload(s):
+    import json
+    if not s:
+        return None
+    try:
+        return json.loads(s)
+    except Exception:
+        return None

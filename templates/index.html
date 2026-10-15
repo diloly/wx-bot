@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>微信客户维护 · 看板</title>
+<title>客户维护看板</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { height: 100%; font-family: -apple-system, "Microsoft YaHei", sans-serif; }
@@ -34,6 +34,27 @@
   .conv .badge {
     background: #fa5151; color: #fff; border-radius: 10px; font-size: 11px;
     padding: 1px 6px; margin-left: 8px; min-width: 18px; text-align: center;
+  }
+
+  /* 每会话AI自动回复开关（右侧小toggle，默认关） */
+  .conv .sw { flex-shrink: 0; margin-left: 8px; cursor: pointer; }
+  .conv .sw input { display: none; }
+  .conv .sw .track {
+    display: block; width: 34px; height: 20px; border-radius: 10px;
+    background: #555; position: relative; transition: background .15s;
+  }
+  .conv .sw .track::after {
+    content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+    border-radius: 50%; background: #fff; transition: left .15s;
+  }
+  .conv .sw input:checked + .track { background: #07c160; }
+  .conv .sw input:checked + .track::after { left: 16px; }
+  .conv .sw input:disabled + .track { opacity: .35; }
+
+  /* 自动回复全局状态提示条（总开关未开时提醒，解释会话开关为何不生效） */
+  .ar-banner {
+    display: none; background: #4a3b1a; color: #ffd161; font-size: 12px;
+    line-height: 1.5; padding: 8px 14px; border-bottom: 1px solid #383838;
   }
 
   /* 右侧聊天 */
@@ -92,6 +113,102 @@
     border-top: 1px solid #f2f2f2; font-size: 11px; color: #9a9a9a;
   }
   .card-foot .card-foot-icon { font-size: 13px; line-height: 1; }
+
+  /* ===== 朋友圈轻互动面板 ===== */
+  /* 左栏顶部 tab（消息 / 朋友圈） */
+  .side-tabs { display: flex; border-bottom: 1px solid #383838; }
+  .side-tabs .tab {
+    flex: 1; text-align: center; padding: 11px 0 9px; font-size: 13px; color: #9a9a9a;
+    cursor: pointer; position: relative; user-select: none;
+  }
+  .side-tabs .tab.active { color: #fff; font-weight: 500; }
+  .side-tabs .tab.active::after {
+    content: ''; position: absolute; left: 50%; transform: translateX(-50%);
+    bottom: 0; width: 28px; height: 2px; background: #07c160; border-radius: 1px;
+  }
+  .side-tabs .tab .tbadge {
+    display: inline-block; min-width: 16px; padding: 0 4px; margin-left: 5px;
+    background: #fa5151; color: #fff; border-radius: 8px; font-size: 10px;
+    line-height: 16px; text-align: center; vertical-align: 1px;
+  }
+  /* 左栏：新圈列表项 */
+  .moment-item { display: flex; padding: 12px 14px; cursor: pointer; border-bottom: 1px solid #383838; }
+  .moment-item:hover { background: #3a3a3a; }
+  .moment-item.active { background: #4c4c4c; }
+  .moment-item .m-avatar {
+    width: 38px; height: 38px; border-radius: 5px; background: #fa9d3b; color: #fff;
+    display: flex; align-items: center; justify-content: center; font-size: 15px;
+    margin-right: 11px; flex-shrink: 0;
+  }
+  .moment-item .m-meta { flex: 1; min-width: 0; }
+  .moment-item .m-name { font-size: 13px; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .moment-item .m-time { font-size: 11px; color: #777; margin-left: 6px; }
+  .moment-item .m-text {
+    font-size: 12px; color: #9a9a9a; margin-top: 3px;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .moment-empty { padding: 40px 20px; text-align: center; color: #777; font-size: 13px; line-height: 1.8; }
+
+  /* 右栏：圈详情 */
+  .moment-detail { max-width: 620px; margin: 0 auto; padding: 20px; }
+  .md-card { background: #fff; border-radius: 10px; padding: 18px 20px; }
+  .md-head { display: flex; align-items: center; margin-bottom: 12px; }
+  .md-head .md-avatar {
+    width: 44px; height: 44px; border-radius: 6px; background: #fa9d3b; color: #fff;
+    display: flex; align-items: center; justify-content: center; font-size: 17px; margin-right: 12px;
+  }
+  .md-head .md-name { font-size: 15px; font-weight: 600; color: #576b95; }
+  .md-head .md-time { font-size: 11px; color: #b0b0b0; margin-top: 2px; }
+  .md-text { font-size: 14px; line-height: 1.7; white-space: pre-wrap; word-break: break-word; }
+  .md-images { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-top: 12px; }
+  .md-images.one { grid-template-columns: minmax(0, 260px); }
+  .md-images img {
+    width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 6px;
+    cursor: zoom-in; background: #f0f0f0;
+  }
+  /* 已有评论 */
+  .md-comments { margin-top: 14px; border-top: 1px solid #f2f2f2; padding-top: 10px; }
+  .md-comments .mc-row { font-size: 13px; line-height: 1.6; margin-bottom: 4px; color: #333; }
+  .md-comments .mc-row b { color: #576b95; font-weight: 500; }
+  /* 动作按钮行 */
+  .md-actions { display: flex; gap: 10px; margin-top: 16px; }
+  .md-btn {
+    padding: 7px 16px; border: none; border-radius: 6px; font-size: 13px; cursor: pointer;
+    background: #07c160; color: #fff;
+  }
+  .md-btn.ghost { background: #f2f2f2; color: #333; }
+  .md-btn:disabled { opacity: .5; cursor: default; }
+  /* 评论输入 */
+  .md-compose { margin-top: 12px; display: none; }
+  .md-compose.open { display: block; }
+  .md-compose textarea {
+    width: 100%; height: 68px; padding: 9px 11px; border: 1px solid #e0e0e0; border-radius: 8px;
+    font-size: 13px; font-family: inherit; resize: vertical; outline: none;
+  }
+  .md-compose textarea:focus { border-color: #07c160; }
+  .md-compose .compose-row { display: flex; gap: 8px; margin-top: 8px; align-items: center; }
+  .md-compose .compose-row .spacer { flex: 1; }
+  /* 结果 toast */
+  .md-toast {
+    display: none; margin-top: 12px; padding: 9px 13px; border-radius: 8px;
+    font-size: 12px; line-height: 1.6;
+  }
+  .md-toast.ok { display: block; background: #e8f9ee; color: #0a7a3d; }
+  .md-toast.err { display: block; background: #fdecec; color: #c0392b; }
+  .md-toast.dry { display: block; background: #fff7e0; color: #8a6d1a; }
+  /* 互动通知卡 */
+  .inter-card { background: #fff; border-radius: 10px; padding: 14px 20px; margin-bottom: 14px; }
+  .inter-card .ic-head { display: flex; align-items: center; margin-bottom: 8px; }
+  .inter-card .ic-title { font-size: 14px; font-weight: 600; flex: 1; }
+  .inter-card .ic-row { font-size: 13px; color: #333; line-height: 1.7; }
+  .inter-card .ic-row b { color: #576b95; font-weight: 500; }
+  .inter-card .ic-row .ic-time { color: #b0b0b0; font-size: 11px; margin-left: 6px; }
+  /* dry-run 提示条 */
+  .md-drybar {
+    background: #fff7e0; color: #8a6d1a; font-size: 12px; line-height: 1.6;
+    padding: 9px 14px; border-radius: 8px; margin-bottom: 14px;
+  }
+  .md-drybar b { cursor: pointer; text-decoration: underline; }
 
   /* 引用回复（type 57）：引用块 + 回复正文 */
   .quote-card { width: 300px; }
@@ -155,12 +272,19 @@
 <body>
 <div class="app">
   <div class="sidebar">
-    <div class="search"><input id="search" placeholder="搜索会话" /></div>
+    <div class="ar-banner" id="arBanner"></div>
+    <div class="side-tabs">
+      <div class="tab active" id="tabChat" onclick="switchTab('chat')">消息</div>
+      <div class="tab" id="tabMoment" onclick="switchTab('moment')">朋友圈<span class="tbadge" id="momentBadge" style="display:none"></span></div>
+    </div>
+    <div id="searchWrap"><div class="search"><input id="search" placeholder="搜索会话" /></div></div>
     <div class="conv-list" id="convList"></div>
+    <div class="conv-list" id="momentList" style="display:none"></div>
   </div>
   <div class="chat" id="chatPane">
     <div class="empty" id="emptyTip">从左侧选择一个会话</div>
   </div>
+  <div class="chat" id="momentPane" style="display:none"></div>
 </div>
 
 <script>
@@ -172,7 +296,16 @@ let renderedSigs = [];     // 当前会话已渲染消息的签名（增量渲�
 
 async function loadConversations() {
   const res = await fetch('/api/conversations');
-  const list = await res.json();
+  const data = await res.json();
+  const list = data.conversations || [];
+  // 全局提示：自动回复总开关未开时，说明会话开关暂不生效
+  const banner = document.getElementById('arBanner');
+  if (data.auto_reply_enabled) {
+    banner.style.display = 'none';
+  } else {
+    banner.style.display = 'block';
+    banner.textContent = '自动回复总开关未开（config.json → auto_reply.enabled=false）：下面的会话开关暂不生效';
+  }
   const kw = document.getElementById('search').value.trim();
   const filtered = kw ? list.filter(c => (c.name||'').includes(kw)) : list;
   const box = document.getElementById('convList');
@@ -187,8 +320,36 @@ async function loadConversations() {
         <div class="name">${esc(c.name||c.conv_id)} ${badge}</div>
         <div class="preview">${esc(c.last_msg||'')}</div>
       </div>`;
+    // 每会话AI自动回复开关：默认关，只有打开才会触发ai自动回复
+    const sw = document.createElement('label');
+    sw.className = 'sw';
+    const isGroup = String(c.conv_id).endsWith('@chatroom');
+    sw.title = 'AI自动回复：' + (c.auto_reply ? '已开' : '关');
+    sw.innerHTML = `<input type="checkbox" ${c.auto_reply ? 'checked' : ''}><span class="track"></span>`;
+    const swInput = sw.querySelector('input');
+    if (isGroup && !data.allow_groups) {
+      sw.title = '群聊自动回复需先在 config.json 开 auto_reply.allow_groups';
+      swInput.disabled = true;
+    }
+    // 拦住点击冒泡：开/关开关不算「选中会话」
+    sw.onclick = (e) => e.stopPropagation();
+    swInput.onchange = (e) => { e.stopPropagation(); toggleSwitch(c.conv_id, e.target.checked, sw); };
+    div.appendChild(sw);
     div.onclick = () => openConv(c.conv_id, c.name);
     box.appendChild(div);
+  }
+}
+
+async function toggleSwitch(convId, on, swEl) {
+  try {
+    await fetch('/api/switch', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({conv: convId, enabled: on})
+    });
+    swEl.title = 'AI自动回复：' + (on ? '已开' : '关');
+  } catch (err) {
+    const input = swEl.querySelector('input');
+    if (input) input.checked = !on;   // 失败回滚视觉状态
   }
 }
 
@@ -437,8 +598,253 @@ function fmtTime(ts){
   return `${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-setInterval(() => { loadConversations(); if (activeConv) loadMessages(); }, POLL);
+/* ==================== 朋友圈轻互动 ==================== */
+let activeTab = 'chat';        // 'chat' | 'moment'
+let momentData = null;         // /api/moments 最近一次响应
+let activeMoment = null;       // 当前打开的圈 tid
+let momentSigs = '';           // 增量渲染签名（与消息区同理，免打扰复制/滚动）
+
+function switchTab(tab) {
+  activeTab = tab;
+  document.getElementById('tabChat').classList.toggle('active', tab === 'chat');
+  document.getElementById('tabMoment').classList.toggle('active', tab === 'moment');
+  document.getElementById('convList').style.display = tab === 'chat' ? '' : 'none';
+  document.getElementById('momentList').style.display = tab === 'moment' ? '' : 'none';
+  document.getElementById('searchWrap').style.display = tab === 'chat' ? '' : 'none';
+  document.getElementById('chatPane').style.display = tab === 'chat' ? '' : 'none';
+  document.getElementById('momentPane').style.display = tab === 'moment' ? '' : 'none';
+  if (tab === 'moment') {
+    document.getElementById('emptyTip').style.display = 'none';
+    loadMoments();
+  } else {
+    document.getElementById('emptyTip').style.display = activeConv ? 'none' : 'flex';
+  }
+}
+
+async function loadMoments() {
+  if (activeTab !== 'moment') {
+    // 非朋友圈 tab 也刷一次（为了红点角标），但不渲染面板
+  }
+  const res = await fetch('/api/moments');
+  const data = await res.json();
+  const sig = JSON.stringify([data.moments, data.interactions, data.unread_inter, data.dry_run]);
+  // 红点角标：两个 tab 都要更新
+  const badge = document.getElementById('momentBadge');
+  if (data.unread_inter > 0) {
+    badge.style.display = '';
+    badge.textContent = data.unread_inter > 99 ? '99+' : data.unread_inter;
+  } else {
+    badge.style.display = 'none';
+  }
+  if (activeTab !== 'moment') { momentData = data; return; }
+  if (sig === momentSigs) return;          // 没变不动 DOM（不打断选择/滚动）
+  momentSigs = sig;
+  momentData = data;
+
+  const box = document.getElementById('momentList');
+  const ms = data.moments || [];
+  if (!ms.length) {
+    box.innerHTML = `<div class="moment-empty">还没有关注客户的新圈。<br>
+      在 config.json 的 <b>moment.watch</b> 里填客户 wxid（空=只监控不互动）；<br>
+      新圈由 auto_reply.py 每约 60 秒拉取一次。</div>`;
+    return;
+  }
+  box.innerHTML = '';
+  for (const m of ms) {
+    const div = document.createElement('div');
+    div.className = 'moment-item' + (String(m.tid) === String(activeMoment) ? ' active' : '');
+    div.innerHTML = `
+      <div class="m-avatar">${esc((m.nickname || '?').slice(0, 1))}</div>
+      <div class="m-meta">
+        <div class="m-name">${esc(m.nickname || m.username)}<span class="m-time">${fmtTime(m.create_time)}</span></div>
+        <div class="m-text">${esc(m.text || '')}</div>
+      </div>`;
+    div.onclick = () => openMoment(m.tid);
+    box.appendChild(div);
+  }
+  // 若打开的圈已被选中/失效，刷新右栏
+  if (activeMoment) {
+    const cur = ms.find(m => String(m.tid) === String(activeMoment));
+    if (cur) renderMomentPane(data, cur);
+  }
+}
+
+function openMoment(tid) {
+  activeMoment = tid;
+  const ms = (momentData && momentData.moments) || [];
+  const cur = ms.find(m => String(m.tid) === String(tid));
+  if (cur && momentData) renderMomentPane(momentData, cur);
+  // 左栏高亮
+  for (const el of document.querySelectorAll('.moment-item')) el.classList.remove('active');
+  loadMoments();
+}
+
+function renderMomentPane(data, m) {
+  const pane = document.getElementById('momentPane');
+  const imgs = (m.media_json && m.media_json.images) || [];
+  const localImgs = imgs.filter(i => i.local);
+  const imgHtml = localImgs.length
+    ? `<div class="md-images${localImgs.length === 1 ? ' one' : ''}">${
+        localImgs.map(i => `<img src="/media/${encodeURI(i.local)}" loading="lazy" onclick="window.open(this.src,'_blank')">`).join('')}
+      </div>`
+    : (imgs.length ? `<div class="md-text" style="color:#999;font-size:12px;margin-top:8px">（含 ${imgs.length} 张图片，本地未解密成功）</div>` : '');
+
+  // 已有评论
+  const comments = (m.comments_json) || [];
+  const commentsHtml = comments.length
+    ? `<div class="md-comments">${comments.map(c =>
+        `<div class="mc-row"><b>${esc(c.nickname || c.username || '')}</b>：${esc(c.content || '')}</div>`).join('')}</div>`
+    : '';
+
+  // 互动通知卡（有人赞/评论我）
+  const inters = (data.interactions || []).filter(it => it.unread);
+  const interHtml = inters.length
+    ? `<div class="inter-card">
+        <div class="ic-head"><span class="ic-title">互动通知（${inters.length} 条未读）</span>
+          <button class="md-btn ghost" style="padding:4px 12px;font-size:12px" onclick="readInteractions()">全部已读</button>
+        </div>
+        ${inters.slice(0, 8).map(it =>
+          `<div class="ic-row"><b>${esc(it.from_nickname || it.from_username)}</b>${
+            it.type === 1 ? ' 赞了你的朋友圈' : ' 评论：' + esc(it.content || '')}
+            <span class="ic-time">${fmtTime(it.create_time)}</span></div>`).join('')}
+      </div>`
+    : '';
+
+  // dry-run 提示条 + 切换真跑入口
+  const dryHtml = data.dry_run
+    ? `<div class="md-drybar">当前是 <b>模拟模式（dry-run）</b>：点赞/评论只验证「能定位到目标圈」，不会真的点。
+       确认无误后点这里 <b onclick="setMomentDry(false)">切换到真跑</b>（仍受白名单+每日 ${data.max_actions} 次上限保护）。</div>`
+    : `<div class="md-drybar" style="background:#e8f9ee;color:#0a7a3d">当前是 <b>真跑模式</b>：点赞/评论会真实执行（每日上限 ${data.max_actions} 次）。
+       只想演练的话点 <b onclick="setMomentDry(true)">切回模拟</b>。</div>`;
+
+  const watchHtml = !data.watch_count
+    ? `<div class="md-drybar" style="background:#eef3ff;color:#3a5a9a">config.json 的 moment.watch 为空：现在只能对<b>自己的</b>朋友圈练习点赞/评论，客户的新圈只看不动。填上客户 wxid 后才能互动。</div>`
+    : '';
+
+  pane.innerHTML = `
+    <div class="moment-detail">
+      ${dryHtml}
+      ${watchHtml}
+      ${interHtml}
+      <div class="md-card">
+        <div class="md-head">
+          <div class="md-avatar">${esc((m.nickname || '?').slice(0, 1))}</div>
+          <div><div class="md-name">${esc(m.nickname || m.username)}</div>
+            <div class="md-time">${fmtTime(m.create_time)}</div></div>
+        </div>
+        <div class="md-text">${esc(m.text || '')}</div>
+        ${imgHtml}
+        ${commentsHtml}
+        <div class="md-actions">
+          <button class="md-btn" id="btnLike" onclick="momentAction('like')">👍 点赞</button>
+          <button class="md-btn ghost" id="btnUnlike" onclick="momentAction('unlike')">取消</button>
+          <button class="md-btn ghost" id="btnComment" onclick="toggleCompose()">💬 评论</button>
+        </div>
+        <div class="md-compose" id="composeBox">
+          <textarea id="commentText" placeholder="评论内容（1-2句，真诚自然）"></textarea>
+          <div class="compose-row">
+            <button class="md-btn ghost" onclick="aiComment()">✨ AI 代写</button>
+            <span class="spacer"></span>
+            <button class="md-btn" id="btnSendComment" onclick="momentAction('comment')">发送评论</button>
+          </div>
+        </div>
+        <div class="md-toast" id="mdToast"></div>
+      </div>
+    </div>`;
+}
+
+function showToast(kind, msg) {
+  const t = document.getElementById('mdToast');
+  if (!t) return;
+  t.className = 'md-toast ' + kind;
+  t.textContent = msg;
+}
+
+function toggleCompose() {
+  const box = document.getElementById('composeBox');
+  if (box) box.classList.toggle('open');
+}
+
+async function setMomentDry(dry) {
+  // 复用 conv_switch 表存 dry 状态（key='__moment_dry__'），moment_ops 每轮读取
+  await fetch('/api/switch', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ conv: '__moment_dry__', enabled: dry })
+  });
+  momentSigs = '';      // 强制刷新面板（dry 提示条要变）
+  loadMoments();
+}
+
+async function momentAction(action) {
+  if (!activeMoment) return;
+  const text = action === 'comment'
+    ? (document.getElementById('commentText') || {}).value || '' : '';
+  if (action === 'comment' && !text.trim()) {
+    showToast('err', '评论内容不能为空（可点「AI 代写」生成）');
+    return;
+  }
+  const btns = document.querySelectorAll('.md-actions .md-btn, .md-compose .md-btn');
+  btns.forEach(b => b.disabled = true);
+  try {
+    const res = await fetch('/api/moment/action', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tid: String(activeMoment), action, text })
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      showToast('err', data.reason || data.error || '操作失败');
+    } else if (data.dry) {
+      showToast('dry', data.detail || data.reason);
+    } else {
+      showToast('ok', data.reason || '完成');
+    }
+  } catch (e) {
+    showToast('err', '请求失败：' + e);
+  } finally {
+    btns.forEach(b => b.disabled = false);
+  }
+}
+
+async function aiComment() {
+  const btn = event.target;
+  btn.disabled = true;
+  btn.textContent = '生成中...';
+  try {
+    const res = await fetch('/api/moment/ai-comment', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tid: String(activeMoment) })
+    });
+    const data = await res.json();
+    if (data.ok && data.text) {
+      document.getElementById('commentText').value = data.text;
+      showToast('ok', 'AI 文案已填入，确认后点「发送评论」');
+    } else {
+      showToast('err', data.reason || data.error || 'AI 生成失败');
+    }
+  } catch (e) {
+    showToast('err', '请求失败：' + e);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '✨ AI 代写';
+  }
+}
+
+async function readInteractions() {
+  await fetch('/api/moment/inter-read', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: '{}'
+  });
+  momentSigs = '';
+  loadMoments();
+}
+
+setInterval(() => {
+  loadConversations();
+  if (activeConv) loadMessages();
+  loadMoments();
+}, POLL);
 loadConversations();
+loadMoments();
 </script>
 </body>
 </html>

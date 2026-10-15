@@ -11,7 +11,7 @@
 pip install wechatauto-replica
 wechatauto 体检
 ollama serve                  :: 确认本地大模型在跑
-ollama list                   :: 确认列表里有 gemma（须与 config.json 的 ai.model 一致）
+ollama list                   :: 确认列表里有 gemma（须与 ai_secrets.json 的 model 一致）
 ```
 
 ---
@@ -52,8 +52,25 @@ python <项目根目录>\wechat_ui.py --schedule --no-dry                       
 ```
 :: 历史消息补渲染（一次性，幂等可重跑；旧卡片记录升级也靠它）
 python <项目根目录>\wx_recv_bridge.py --media-backfill --depth 50
+
+:: 原图模式：图片强制下载 _h.dat 真原件（清晰，但会驱动微信界面点开气泡/滚动列表）
+:: ⚠️ 运行时请勿操作电脑；不想滚界面就加 --no-scroll-original
+python <项目根目录>\wx_recv_bridge.py --media-backfill --depth 50 --original
 ```
-新收到的媒体消息由 bridge/auto_reply 自动下载渲染，无需手动。
+新收到的媒体消息由 bridge/auto_reply 自动下载渲染（普通档，不碰界面），无需手动。
+
+---
+
+## 2.5 聊天记录备份（export_history.py）
+
+```
+:: 全量导出 JSON 到 backups/history_时间戳.json
+python <项目根目录>\export_history.py
+
+python <项目根目录>\export_history.py --user wxid_xxx        :: 只导指定会话（可重复 --user）
+python <项目根目录>\export_history.py --limit 500            :: 每会话最多 500 条
+```
+导出文件含客户聊天内容，属敏感数据：`backups/` 已在 .gitignore，不要外发/截图/传公网。
 
 ---
 
@@ -79,7 +96,9 @@ python -u <项目根目录>\wx_recv_bridge.py            :: 无缓冲输出（�
 |---|---|
 | 终端像卡住没输出 | 不是卡死：首轮要全量解密全部数据库（分钟级、一次性）。看 `[scan] n/总数 名字` / `[poll]` 进度行；或加 `python -u` |
 | 看板没有消息 | ① dashboard 是否在跑；② bridge 终端有没有 `[store] +` 行；③ 启动时的库存统计 `{'me': x, 'them': y}` |
-| AI 不回复 | ① `config.json` → `auto_reply.enabled` 是否 `true`；② `ollama list` 有 gemma；③ 群消息默认不回（`allow_groups=false`） |
+| AI 不回复 | ① `config.json` → `auto_reply.enabled` 是否 `true`；② 看板会话列表**每行右侧开关**是否打开（默认全关）；③ `ai_secrets.json` 的 base_url/api_key；④ 群消息默认不回（`allow_groups=false`） |
+| 发送慢/日志有「拟人节流等待」 | 正常：wechatauto rhythm 拟人节流（两次发送最小间隔 + 连发 6 条强制冷却 30–75s）。想调小就改 `config.json` → `auto_reply.rhythm`（natural/calm/fast/off，默认 natural） |
+| 群里显示的是昵称不是备注 | 群成员表 5 分钟缓存；刚改的备注下一轮生效 |
 | 发送失败 | 微信在前台且未最小化；先跑 `wechat_ui.py --inspect` 能列出窗口 |
 | 图片/卡片不显示 | 跑一次 `--media-backfill`；看终端 `[media] 下载失败` 行 |
 | 只看到自己的消息 | 首轮没跑完就被 Ctrl+C 了（自测会话排最前）；重跑等 `[poll]` 汇总行出现 |
