@@ -5,8 +5,11 @@ AI 外发内容生成（OpenAI 兼容接口，支持本地 Ollama / DeepSeek / O
 ==================================================================================
 - 只负责"生成一条发给客户的微信文案"，不碰发送；发送由 wechat_ui.py 的键盘流程负责。
 - 通过 config.ai.provider 切换；本地 Ollama 默认 base_url=http://localhost:11434/v1。
+- **保密项（base_url / api_key）放同目录 ai_secrets.json**（不要外发/截图/提交 git），
+  优先级高于 config.json 与环境变量；config.json 只放非保密项（provider/model/prompt）。
 - 所有主流服务都兼容 OpenAI 的 /v1/chat/completions，所以一套代码走天下。
 """
+import json
 import logging
 import os
 
@@ -21,26 +24,70 @@ DEFAULT_SYSTEM = (
     "只输出消息正文本身，不要引号、不要解释、不要'好的，这是…'之类的开场白。"
 )
 
-# provider -> 默认 base_url / api_key。可在 config.ai 里用 base_url / api_key 显式覆盖。
+# provider -> 默认 base_url / api_key。非保密覆盖项写 config.ai；保密项（base_url/api_key）
+# 写 ai_secrets.json，优先级最高。"custom" 用于自建/中转端点：base_url 必须在 secrets 里给。
 _PRESETS = {
     "ollama":   {"base_url": "http://localhost:11434/v1", "api_key": ""},
     "deepseek": {"base_url": "https://api.deepseek.com/v1", "api_key": ""},
     "openai":   {"base_url": "https://api.openai.com/v1",  "api_key": ""},
     "qwen":     {"base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "api_key": ""},
+    "custom":   {"base_url": "", "api_key": ""},
 }
+
+# 保密配置文件：与 ai_client.py 同目录，按 __file__ 定位（不受运行时的 cwd 影响）。
+_SECRETS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai_secrets.json")
+
+
+def _load_secrets():
+    """读取 ai_secrets.json 里的 base_url / api_key（下划线开头的说明字段忽略）。
+    文件不存在 = 返回 {}，由上层按 config.json / 环境变量 / provider 预设继续兜底。
+    任何日志/报错都不得打印文件内容——只报"哪个键有问题"。"""
+    try:
+        with open(_SECRETS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        raise RuntimeError(
+            "ai_secrets.json 不是合法 JSON：%s。请检查逗号/引号；该文件含密钥，不要外发。" % e)
+    if not isinstance(data, dict):
+        raise RuntimeError("ai_secrets.json 顶层必须是 JSON 对象（{...}）")
+    out = {}
+    for k, v in data.items():
+        if k.startswith("_"):
+            continue
+        if not isinstance(v, str):
+            raise RuntimeError(
+                "ai_secrets.json 的 %r 必须是字符串（当前是 %s）" % (k, type(v).__name__))
+        out[k] = v
+    return out
 
 
 def _resolve(cfg):
     ai = cfg.get("ai", {})
     provider = (ai.get("provider") or "ollama").lower()
     preset = _PRESETS.get(provider, {})
-    base_url = ai.get("base_url") or preset.get("base_url") or "http://localhost:11434/v1"
+    secrets = _load_secrets()
+    # 优先级：ai_secrets.json > 环境变量 > config.json > provider 预设
+    base_url = (
+        secrets.get("base_url")
+        or os.environ.get("WECHAT_AI_BASE_URL")
+        or ai.get("base_url")
+        or preset.get("base_url")
+        or ""
+    )
     api_key = (
-        ai.get("api_key")
+        secrets.get("api_key")
         or os.environ.get("WECHAT_AI_API_KEY")
+        or ai.get("api_key")
         or preset.get("api_key")
         or ""
     )
+    if not base_url:
+        raise RuntimeError(
+            "未解析到 base_url：provider=%r 没有内置默认地址。"
+            "请把 base_url（和 api_key）填进同目录的 ai_secrets.json，"
+            "或把 provider 改成 ollama/deepseek/openai/qwen 之一。" % provider)
     # Ollama 默认用 provider 名当模型（ollama 的 model 即本地已 pull 的标签）；
     # 云端默认给一个通用占位，建议在 config 里写明确模型名。
     default_model = provider if provider == "ollama" else "gpt-4o-mini"
@@ -48,7 +95,7 @@ def _resolve(cfg):
     system_prompt = ai.get("system_prompt") or DEFAULT_SYSTEM
     temperature = ai.get("temperature", 0.7)
     max_tokens = ai.get("max_tokens", 300)
-    return base_url, api_key, model, system_prompt, temperature, max_tokens
+    return base_url, api_key, model, system_prompt, temperature, max_tokens, provider
 
 
 def build_user_prompt(contact, intent):
@@ -78,7 +125,7 @@ def _clean(text):
 
 def generate(cfg, contact, intent, timeout=60):
     """调用大模型生成一条发给该客户的微信文案，返回清洗后的纯文本。"""
-    base_url, api_key, model, system_prompt, temperature, max_tokens = _resolve(cfg)
+    base_url, api_key, model, system_prompt, temperature, max_tokens, provider = _resolve(cfg)
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": build_user_prompt(contact, intent)},
@@ -103,6 +150,13 @@ def generate(cfg, contact, intent, timeout=60):
                 err = resp.json().get("error", body)
             except Exception:
                 pass
+            # provider 写着 ollama 但 secrets 把 base_url 指向了云端时，也按通用提示走
+            if provider != "ollama" or "11434" not in base_url:
+                raise RuntimeError(
+                    f"{base_url} 返回 404。请检查 ai_secrets.json 的 base_url 是否书写正确"
+                    f"（是否需要带 /v1 之类的路径后缀），以及 config.json 的 ai.model"
+                    f"「{model}」是否为该服务实际支持的模型名。"
+                )
             if "does not exist" in err or "not found" in err.lower() or "model" in err.lower():
                 raise RuntimeError(
                     f"Ollama 找不到模型「{model}」（返回 404）。\n"

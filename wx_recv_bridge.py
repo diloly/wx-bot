@@ -40,6 +40,7 @@ wx_recv_bridge.py —— 收消息桥：wechatauto-replica 数据库解密路线
 看板：python dashboard.py 后访问 http://localhost:5000
 """
 import argparse
+import glob
 import hashlib
 import json
 import os
@@ -167,33 +168,102 @@ APPMSG_KIND = {"5": "link", "6": "file", "33": "app", "36": "app",
                "51": "app", "53": "app", "63": "app"}
 
 
-def parse_card(db, user, m):
-    """解析「文件/链接/卡片」消息的原始 XML（get_message_row 的 content 字段）。
-    返回 {title, descr, url, thumb, ext, size, source, kind} 或 None。"""
-    local_id = m.get("local_id")
-    if not local_id:
-        return None
+def _xml_text(raw):
+    """XML 取值后处理：剥 CDATA 包裹 + 反转义实体（&amp;/&lt; 等）。
+    微信 appmsg 大量字段写成 <title><![CDATA[xx]]></title>，
+    正则直接抓会把 CDATA 符号一起带进来；url 里的 &amp; 不反转义链接会坏。"""
+    if not raw:
+        return ""
+    t = raw.strip()
+    m = re.fullmatch(r"<!\[CDATA\[(.*?)\]\]>", t, re.S)
+    if m:
+        t = m.group(1).strip()
+    for a, b in (("&lt;", "<"), ("&gt;", ">"), ("&quot;", '"'),
+                 ("&apos;", "'"), ("&amp;", "&")):   # amp 放最后，防双重解
+        t = t.replace(a, b)
+    return t.strip()
+
+
+def _decode_content(data, mtype=None):
+    """把原始 message_content blob 解成 XML 文本。
+
+    事实（2026-10-14 实测 wechatauto-replica 1.2.6.1）：
+    - get_messages() 的 content 已过 _friendly_content，是干净的 XML 字符串 —— **首选**；
+    - get_message_row() 的 content 是**未解密/未解压**的原始列（zstd 容器头
+      0x28 0xb5 0x2f 0xfd），文档明说「媒体下载用」，不能直接当文本解析。
+    只有真的拿到 bytes 时才走这里自己解。"""
     try:
-        row = db.get_message_row(user, local_id)
-    except Exception:
+        text = data.decode("utf-8")
+        if text.strip():
+            return text
+    except UnicodeDecodeError:
+        pass
+    if data[:4] == b"\x28\xb5\x2f\xfd":
+        try:
+            import zstandard as _zstd
+            text = _zstd.ZstdDecompressor().decompress(data).decode("utf-8", "ignore")
+            if text.strip():
+                return text
+        except Exception:
+            pass
+    return None
+
+
+# refermsg 里的被引用消息类型码 -> 看板摘要标签（1=文本走原文，49=文件/链接取标题）
+QUOTE_TYPE_LABEL = {"3": "[图片]", "34": "[语音]", "43": "[视频]",
+                    "47": "[动画表情]", "48": "[位置]", "50": "[音视频通话]"}
+
+
+def _clean_quote_text(raw, qtype=""):
+    """refermsg 的 content -> 引用块里显示的摘要。
+    type 1(文本) 的 content 是纯文本，直接显示；其余类型 content 是转义后的 XML，
+    有类型码时按类型码归一（比猜 XML 稳）；文件/链接类尽量把标题取出来，
+    比干巴巴的 [消息] 有用得多。"""
+    if not raw:
+        return ""
+    t = _xml_text(raw)
+    if qtype in QUOTE_TYPE_LABEL:
+        return QUOTE_TYPE_LABEL[qtype]
+    if t.startswith("<?xml") or t.startswith("<msg"):
+        if "<img " in t or "<img>" in t:
+            return "[图片]"
+        if "<videomsg" in t:
+            return "[视频]"
+        if "<voicemsg" in t:
+            return "[语音]"
+        if "<emoji" in t:
+            return "[动画表情]"
+        m = re.search(r"<title>(.*?)</title>", t, re.S)
+        if m:
+            title = _xml_text(m.group(1))
+            if title:
+                return "[文件/链接] " + title[:60]
+        return "[消息]"
+    return t[:120]
+
+
+def parse_card(db, user, m):
+    """解析「文件/链接/卡片」消息的 XML。
+    主路径用 get_messages 已友好化的 content（str，干净 appmsg XML）；
+    仅当拿到原始 blob(bytes) 时才自己解 zstd。db/user 保留作兜底扩展。
+    返回 {title, descr, url, thumb, ext, size, source, kind, ...} 或 None。
+    kind: file / link / app / quote(引用回复) / finder(视频号)。"""
+    content = m.get("content")
+    if isinstance(content, (bytes, bytearray)):
+        content = _decode_content(bytes(content), m.get("type"))
+    if not content or not isinstance(content, str):
         return None
-    if not row:
-        return None
-    content = row.get("content")
-    if not content:
-        return None
-    if isinstance(content, bytes):
-        content = content.decode("utf-8", "ignore")
     if "<appmsg" not in content and "<msg>" not in content:
         return None
 
     def _g(pat, flags=0):
         mm = re.search(pat, content, flags)
-        return mm.group(1).strip() if mm else ""
+        return _xml_text(mm.group(1)) if mm else ""
 
     card = {
         "title": _g(r"<title>(.*?)</title>", re.S),
-        "descr": _g(r"<descr>(.*?)</descr>", re.S),
+        # 微信 appmsg 副标题两种写法都有：<des>（4.x 常见）/ <descr>（老格式）
+        "descr": _g(r"<descr>(.*?)</descr>", re.S) or _g(r"<des>(.*?)</des>", re.S),
         "url": _g(r"<url>(.*?)</url>"),
         "thumb": _g(r'cdnmidimg="([^"]+)"') or _g(r"<thumburl>(.*?)</thumburl>"),
         "ext": _g(r"<fileext>([^<]*)</fileext>"),
@@ -205,29 +275,102 @@ def parse_card(db, user, m):
     }
     if not card["descr"] and card["size"]:
         card["descr"] = card["size"]   # 文件消息副标题用大小（微信即如此）
+
+    # 视频号分享（finderFeed）：封面/播放/头像/认证图标/频道名/视频地址
+    if "<finderFeed>" in content:
+        ff = {
+            "nickname": _g(r"<nickname><!\[CDATA\[(.*?)\]\]></nickname>", re.S),
+            "desc": _g(r"<desc><!\[CDATA\[(.*?)\]\]></desc>", re.S),
+            "avatar": _g(r"<avatar><!\[CDATA\[(.*?)\]\]></avatar>"),
+            "auth_icon": _g(r"<authIconUrl><!\[CDATA\[(.*?)\]\]></authIconUrl>"),
+            "cover": (_g(r"<thumbUrl><!\[CDATA\[(.*?)\]\]></thumbUrl>")
+                      or _g(r"<coverUrl><!\[CDATA\[(.*?)\]\]></coverUrl>")),
+            "video": _g(r"<url><!\[CDATA\[(.*?)\]\]></url>"),
+        }
+        card["kind"] = "finder"
+        card["finder"] = ff
+        if not card["descr"] and ff["desc"]:
+            card["descr"] = ff["desc"]
+        return card
+
+    # 引用回复（refermsg, appmsg type 57）：引用块 + 回复正文
+    if "<refermsg>" in content:
+        rm = re.search(r"<refermsg>.*?</refermsg>", content, re.S)
+        rm_xml = rm.group(0) if rm else content
+        # refermsg 内的 <type> 排在 <msgsource> 之后，取最后一个最稳
+        # （msgsource 是转义 XML，理论上可能含干扰标签）
+        types = re.findall(r"<type>(\d+)</type>", rm_xml)
+        qtype = types[-1] if types else ""
+        qname = _g(r"<displayname>(.*?)</displayname>", re.S)
+        fromusr = _g(r"<fromusr>(.*?)</fromusr>")
+        if not qname and fromusr:
+            # displayname 偶尔为空（自己引自己/早期消息），用 wxid 反查昵称兜底
+            try:
+                qname = db.get_nickname(fromusr) or fromusr
+            except Exception:
+                qname = fromusr
+        card["kind"] = "quote"
+        card["quote"] = {
+            "name": qname,
+            "text": _clean_quote_text(
+                _g(r"<refermsg>.*?<content>(.*?)</content>", re.S), qtype),
+        }
+        return card
+
     if not any([card["title"], card["descr"], card["url"]]):
         return None
     return card
 
 
+def finalize_card(card, media_rel):
+    """卡片后处理：文件 kind 覆写 + 视频号资源（封面/头像/认证图标）下载。
+    下载失败时保留原值，不用 None 覆盖——否则断网重跑回填会把已下载的封面冲掉。"""
+    if not card:
+        return None
+    if media_rel:
+        card["kind"] = "file"
+        return card
+    f = card.get("finder")
+    if f:
+        for k in ("cover", "avatar", "auth_icon"):
+            if f.get(k):
+                got = download_url(f[k], "finder")
+                if got:
+                    f[k] = got
+    elif card.get("thumb"):
+        got = download_thumb(card.get("thumb"))
+        if got:
+            card["thumb"] = got
+    return card
+
+
 def download_thumb(thumb):
     """下载链接卡片的封面图（CDN URL，best-effort，失败返回 None）。"""
-    if not thumb:
+    return download_url(thumb, "thumbs")
+
+
+def download_url(url, subdir="misc"):
+    """通用 URL 下载（卡片封面/视频号头像/封面/认证图标），落地 MEDIA_DIR/<subdir>/。
+    先查本地缓存（按 url 的 md5 命名），命中直接返回，不发网络请求——
+    这样断网时重跑回填也不会把已下载好的封面路径冲成 None。"""
+    if not url or not url.startswith("http"):
         return None
-    url = thumb
-    if not url.startswith("http"):
-        url = "https://mmsns.qpic.cn" + (url if url.startswith("/") else "/" + url)
+    d = os.path.join(MEDIA_DIR, subdir)
+    os.makedirs(d, exist_ok=True)
+    prefix = hashlib.md5(url.encode("utf-8")).hexdigest()
+    for hit in sorted(glob.glob(os.path.join(d, prefix + ".*"))):
+        if os.path.isfile(hit):
+            return os.path.relpath(hit, MEDIA_DIR).replace("\\", "/")
     try:
         import requests
-        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code == 200 and len(r.content) > 100:
             data = r.content
             ext = _guess_ext(data)
-            sub = os.path.join(MEDIA_DIR, "thumbs")
-            os.makedirs(sub, exist_ok=True)
-            fn = os.path.join(sub, hashlib.md5(url.encode("utf-8")).hexdigest() + ext)
-            with open(fn, "wb") as f:
-                f.write(data)
+            fn = os.path.join(d, prefix + ext)
+            if not os.path.exists(fn):
+                with open(fn, "wb") as f:
+                    f.write(data)
             return os.path.relpath(fn, MEDIA_DIR).replace("\\", "/")
     except Exception:
         pass
@@ -249,7 +392,8 @@ def _xml_placeholder(xml):
         return "[位置]"
     if "<appmsg" in xml or "<appmessage" in xml:
         title = re.search(r"<title>(.*?)</title>", xml, re.S)
-        return "[链接/卡片%s]" % (" %s" % title.group(1).strip() if title else "")
+        t = _xml_text(title.group(1)) if title else ""
+        return "[链接/卡片%s]" % (" %s" % t if t else "")
     if "<sysmsg" in xml or "<revoke" in xml:
         return "[系统消息]"
     return "[特殊消息]"
@@ -351,13 +495,15 @@ def poll_new(db, progress=False):
             #   用户在 PC 微信手动发的 —— 不在 sent_log，正常补录，看板也要能看到
             if self_msg and monitor_store.was_sent(user, text):
                 continue
+            # 群聊发送者：文本消息拼进 text 前缀；但卡片消息的 text 会被 card 覆盖，
+            # 前缀必然丢失，故卡片改存 card["sender"]，由前端在卡片上方渲染名字
+            sender_name = ""
             sender = m.get("sender_username") or ""
             if sender and not self_msg and user.endswith(GROUP_SUFFIX):
                 try:
                     sender_name = db.get_nickname(sender) or sender
                 except Exception:
                     sender_name = sender
-                text = "%s: %s" % (sender_name, text)
             raw = str({k: m.get(k) for k in
                        ("type", "sender_id", "sender_username", "local_id")})
             # 媒体真实渲染：图片/表情/视频/文件 下载落地；链接卡片解析 XML
@@ -368,10 +514,15 @@ def poll_new(db, progress=False):
                 if mtype == "文件/链接/卡片":
                     card = parse_card(db, user, m)
                     if card:
-                        if media_rel:
-                            card["kind"] = "file"      # 真文件（已下载）
-                        elif card.get("thumb"):
-                            card["thumb"] = download_thumb(card.get("thumb"))
+                        card = finalize_card(card, media_rel)
+                        if sender_name:
+                            card["sender"] = sender_name   # 群聊卡片的真实发送者
+                        # 引用回复(type57)/视频号(type51) 给会话列表一个干净的预览文本
+                        if card.get("kind") == "finder":
+                            f = card.get("finder") or {}
+                            text = "[视频号] " + (f.get("nickname") or "视频分享")
+                        elif card.get("kind") == "quote":
+                            text = card.get("title") or text
                         card_json = json.dumps(card, ensure_ascii=False)
                     elif media_rel:
                         text = os.path.basename(media_rel)   # XML 没解析出标题，用文件名兜底
@@ -383,6 +534,9 @@ def poll_new(db, progress=False):
                     elif mtype == "视频":
                         text = "[视频]"
                     print("[media] + %s %s -> %s" % (name, mtype, media_rel))
+            # 群聊消息补发送者前缀（卡片已由 card.sender 承载，不重复拼）
+            if sender_name and not card_json:
+                text = "%s: %s" % (sender_name, text)
             try:
                 if monitor_store.add_message(
                     conv_id=user, role=role, text=text, ts=ts,
@@ -428,6 +582,7 @@ def media_backfill(db, per_session=50):
         if not user:
             continue
         print("[backfill] %d/%d %s" % (idx, total, user))
+        is_group = user.endswith(GROUP_SUFFIX)
         try:
             msgs = db.get_messages(user, limit=per_session)
         except Exception as e:
@@ -445,10 +600,20 @@ def media_backfill(db, per_session=50):
             if mtype == "文件/链接/卡片":
                 card = parse_card(db, user, m)
                 if card:
-                    if media_rel:
-                        card["kind"] = "file"
-                    elif card.get("thumb"):
-                        card["thumb"] = download_thumb(card.get("thumb"))
+                    card = finalize_card(card, media_rel)
+                    # 群聊卡片补真实发送者（与 poll_new 一致）
+                    if is_group and m.get("sender_username") and not is_self(m):
+                        try:
+                            sn = (db.get_nickname(m["sender_username"])
+                                  or m["sender_username"])
+                        except Exception:
+                            sn = m["sender_username"]
+                        card["sender"] = sn
+                    if card.get("kind") == "finder":
+                        f = card.get("finder") or {}
+                        text = "[视频号] " + (f.get("nickname") or "视频分享")
+                    elif card.get("kind") == "quote":
+                        text = card.get("title") or text
                     card_json = json.dumps(card, ensure_ascii=False)
                 elif media_rel:
                     text = os.path.basename(media_rel)

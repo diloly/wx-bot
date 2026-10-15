@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 微信客户维护 —— 网页看板（仿微信：左会话列表 + 右会话详情）。
-数据来自统一消息库 wechat_monitor.db（ingest 导入收件 + wechat_ui 写入发件）。
+数据来自统一消息库 wechat_monitor.db（wx_recv_bridge 写入收件 + wechat_ui 写入发件）。
 
 运行（在你本机，和微信同一台 Windows）：
     pip install -r requirements.txt

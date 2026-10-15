@@ -6,6 +6,9 @@ wechat_monitor.db-journal
 # ===== Agent 工作记忆（内部笔记，非项目代码）=====
 .workbuddy/
 
+# ===== 保密配置：AI base_url / api_key，不要提交 =====
+ai_secrets.json
+
 # ===== 运行时产物 =====
 __pycache__/
 *.pyc

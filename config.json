@@ -50,13 +50,5 @@
   "dashboard": {
     "port": 5000,
     "db_path": "wechat_monitor.db"
-  },
-  "sync": {
-    "enabled": true,
-    "wechat_dir": "C:/Users/你的用户名/Documents/WeChat Files",
-    "out_dir": "E:/WorkBuddyData/WechatBot/decrypted",
-    "key_cmd": "",
-    "decrypt_cmd": "wxdump decrypt -i \"{wechat_dir}\" -o \"{out_dir}\"",
-    "interval_seconds": 60
   }
 }

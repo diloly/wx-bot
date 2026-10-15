@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 统一消息库（看板的数据底座）。
-- 收：由 ingest.py 从 PyWxDump 解密后的微信 DB 批量导入。
+- 收：由 wx_recv_bridge.py 轮询 wechatauto 解密库，水印增量写入。
 - 发：由 wechat_ui.py 键盘发送成功后即时写入（零延迟上屏）。
 - 看板 dashboard.py 只从这个库读，不关心数据从哪来。
 
@@ -168,22 +168,33 @@ def get_cursor(conv_id):
 
 def update_media(conv_id, msg_key, media=None, card=None, text=None):
     """按 msg_key 补更一条已存消息的媒体/卡片/文本（用于历史占位消息的媒体回填）。
-    返回受影响行数（0=没这条记录或无需更新）。"""
+    返回**真正发生变更**的行数（0=没这条记录或值本来就没变）。
+
+    注意：sqlite3 的 cursor.rowcount 对 UPDATE 返回的是「匹配行数」而非「变更行数」，
+    值完全一样也照样返回 1，会让幂等回填每次都报同样的补更条数、掩盖真实信号。
+    故这里先读旧值比对，只有真有差异才执行 UPDATE。"""
     h = hashlib.sha256(msg_key.encode("utf-8")).hexdigest()
+    conn = init()
+    row = conn.execute(
+        "SELECT media, card, text FROM messages WHERE conv_id=? AND msg_hash=?",
+        (conv_id, h)).fetchone()
+    if not row:
+        conn.close()
+        return 0
     sets, params = [], []
-    if media is not None:
+    if media is not None and row["media"] != media:
         sets.append("media=?")
         params.append(media)
-    if card is not None:
+    if card is not None and row["card"] != card:
         sets.append("card=?")
         params.append(card)
-    if text is not None:
+    if text is not None and row["text"] != text:
         sets.append("text=?")
         params.append(text)
     if not sets:
+        conn.close()
         return 0
     params.extend([conv_id, h])
-    conn = init()
     cur = conn.execute(
         "UPDATE messages SET %s WHERE conv_id=? AND msg_hash=?" % ",".join(sets), params)
     n = cur.rowcount
