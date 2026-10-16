@@ -16,9 +16,10 @@ API：
     POST /api/send  {conv,text}   触发键盘发送（需微信在前台；会写回发送记录）
     POST /api/switch {conv,enabled}  设置某会话的AI自动回复开关（看板每会话一个，默认关）
     朋友圈轻互动（moment_ops）：
-    GET  /api/moments             关注客户的新圈 + 未读互动统计
-    POST /api/moment/action       点赞/取消/评论 {tid, action, text}（dry-run 保护+白名单+上限）
+    GET  /api/moments             最近的新圈 + 未读互动统计 + 各客户自动互动开关
+    POST /api/moment/action       点赞/取消/评论 {tid, action, text}（dry-run 保护+上限）
     POST /api/moment/ai-comment   AI 生成评论文案 {tid}
+    POST /api/moment/switch       设置某客户自动点赞/评论开关 {username, nickname, field, enabled}（默认关）
     POST /api/moment/inter-read   互动通知全部标为已读
 """
 import os
@@ -29,6 +30,7 @@ from flask import Flask, render_template, jsonify, request, send_from_directory
 from monitor_store import (
     init, list_conversations, get_messages, add_message, clear_unread, set_switch,
     get_moments, get_interactions, mark_interactions_read, moment_unread_count,
+    get_moment_switches, set_moment_switch,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -129,15 +131,15 @@ def _moment_ops(dry_run=None):
 
 @app.route("/api/moments")
 def api_moments():
-    """关注客户的新圈（最近 50 条）+ 未读互动通知。"""
+    """最近的新圈（50 条）+ 未读互动通知 + 各客户自动互动开关。"""
     ops = _moment_ops()
     return jsonify({
-        "moments": get_moments(limit=50, only_followed=True),
+        "moments": get_moments(limit=50),
         "interactions": get_interactions(limit=50),
         "unread_inter": moment_unread_count(),
         "dry_run": bool(ops.dry_run) if ops else True,
-        "watch_count": len(ops.watch) if ops else 0,
         "max_actions": ops.max_actions if ops else 0,
+        "switches": get_moment_switches(),
     })
 
 
@@ -145,8 +147,8 @@ def api_moments():
 def api_moment_action():
     """点赞/取消/评论。body: {tid, action: like|unlike|comment, text}。
 
-    四道安全闸在 moment_ops 内部：dry-run（默认模拟）→ 白名单（只碰关注
-    客户/本人）→ 每日上限 → 库内置 rhythm 节流。
+    三道安全闸在 moment_ops 内部：dry-run（默认模拟）→ 每日上限 →
+    库内置 rhythm 节流。放行标准 = 人工显式确认（这次点击本身）。
     """
     data = request.get_json(force=True, silent=True) or {}
     tid = str(data.get("tid") or "").strip()
@@ -186,6 +188,28 @@ def api_moment_ai_comment():
         return jsonify(ops.ai_comment_text(tid))
     except Exception as e:  # noqa: BLE001
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/moment/switch", methods=["POST"])
+def api_moment_switch():
+    """设置某客户的朋友圈自动互动开关。body: {username, field: like|comment, enabled}。
+
+    与 /api/switch（会话自动回复）同款语义：默认全关；开开关只对之后
+    新到的圈生效，不回溯历史圈。评论不可逆，故独立开关、默认关。
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    username = (data.get("username") or "").strip()
+    field = (data.get("field") or "").strip()
+    nickname = (data.get("nickname") or "").strip()
+    if not username or field not in ("like", "comment"):
+        return jsonify({"ok": False,
+                        "error": "username 不能为空，且 field 须为 like/comment"}), 400
+    enabled = bool(data.get("enabled"))
+    if field == "like":
+        st = set_moment_switch(username, auto_like=enabled, nickname=nickname)
+    else:
+        st = set_moment_switch(username, auto_comment=enabled, nickname=nickname)
+    return jsonify({"ok": True, "switch": st})
 
 
 @app.route("/api/moment/inter-read", methods=["POST"])

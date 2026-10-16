@@ -10,20 +10,53 @@
 """
 import os
 import sqlite3
+import threading
 import time
 import hashlib
 
 DEFAULT_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wechat_monitor.db")
 
+# SQLite 写锁等待秒数。python sqlite3 默认 5s；单线程时够用，但 2026-10-16 起
+# auto_reply 有「收消息轮询 / AI 生成 / 发送」多个线程并发读写本库，撞锁概率
+# 上升，放宽到 15s（再超就是真卡住，早报错反而好排查）。
+_BUSY_TIMEOUT = 15
+
 
 def _conn(path=None):
     path = path or os.environ.get("WECHAT_MONITOR_DB", DEFAULT_DB)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=_BUSY_TIMEOUT)
     conn.row_factory = sqlite3.Row
     return conn
 
 
+# 默认库是否已跑过建表/迁移（init 的快速路径，见 init 的 docstring）
+_init_done = False
+_init_lock = threading.Lock()
+
+
 def init(path=None):
+    """建表 + 一次性迁移，返回连接。
+
+    2026-10-16：默认库加**只跑一次**的快速路径。写函数（add_message 等）每次
+    都会调 init()，而 init() 含 10 条 CREATE TABLE IF NOT EXISTS + 一条**全表
+    扫描**的 DELETE（清理坏占位记录）+ 若干 ALTER —— 单线程时只是浪费，引入
+    AI 生成 / 发送线程后，每次写都全表扫一遍会明显拉长写锁占用、放大撞锁。
+    建表与迁移都是幂等的，跑过一次即可。显式传 path（测试/多库场景）时不走
+    快速路径，保持原语义。
+    """
+    global _init_done
+    if path is None and _init_done:
+        return _conn(path)
+    with _init_lock:
+        if path is None and _init_done:
+            return _conn(path)
+        conn = _init_schema(path)
+        if path is None:
+            _init_done = True
+        return conn
+
+
+def _init_schema(path=None):
     conn = _conn(path)
     conn.executescript(
         """
@@ -87,6 +120,13 @@ def init(path=None):
             id       INTEGER PRIMARY KEY CHECK (id = 1),
             last_tid TEXT DEFAULT '0'                  -- 朋友圈轮询水印（微信tid是20位大数，超int64，必须TEXT）
         );
+        CREATE TABLE IF NOT EXISTS moment_switch (
+            username     TEXT PRIMARY KEY,             -- 发布者 wxid
+            nickname     TEXT,                         -- 开关操作时的昵称（面板展示用，客户暂无新圈也能显示行）
+            auto_like    INTEGER NOT NULL DEFAULT 0,   -- 1=该客户新圈自动点赞（默认关）
+            auto_comment INTEGER NOT NULL DEFAULT 0,   -- 1=该客户新圈自动评论（不可逆，默认关）
+            updated_at   INTEGER DEFAULT 0
+        );
         CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages(conv_id, ts);
         """
     )
@@ -96,6 +136,11 @@ def init(path=None):
             conn.execute("ALTER TABLE messages ADD COLUMN %s TEXT" % col)
         except sqlite3.OperationalError:
             pass
+    # 老库的 moment_switch 可能没有 nickname 列（2026-10-16 加，面板要展示），补齐
+    try:
+        conn.execute("ALTER TABLE moment_switch ADD COLUMN nickname TEXT")
+    except sqlite3.OperationalError:
+        pass
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_hash ON messages(msg_hash)"
     )
@@ -439,6 +484,51 @@ def set_moment_cursor(last_tid):
             "ON CONFLICT(id) DO UPDATE SET last_tid=excluded.last_tid",
             (str(last_tid),))
         conn.commit()
+    finally:
+        conn.close()
+
+
+def set_moment_switch(username, auto_like=None, auto_comment=None, nickname=None):
+    """设置某客户的朋友圈自动互动开关（None=该项不改）。返回最新状态 dict。
+
+    与 conv_switch 同款语义：无记录=全关；开开关只对之后新到的圈生效，
+    不回溯历史（不会批量补赞旧圈）。nickname 只作展示，不影响开关本身。
+    """
+    conn = _conn()
+    try:
+        row = conn.execute(
+            "SELECT auto_like, auto_comment, nickname FROM moment_switch WHERE username=?",
+            (username,)).fetchone()
+        like = int(row[0]) if row else 0
+        comment = int(row[1]) if row else 0
+        nick = (row[2] if row else "") or ""
+        if nickname:
+            nick = nickname
+        if auto_like is not None:
+            like = 1 if auto_like else 0
+        if auto_comment is not None:
+            comment = 1 if auto_comment else 0
+        conn.execute(
+            "INSERT INTO moment_switch (username, nickname, auto_like, auto_comment, updated_at) "
+            "VALUES (?,?,?,?,?) ON CONFLICT(username) DO UPDATE SET "
+            "nickname=excluded.nickname, auto_like=excluded.auto_like, auto_comment=excluded.auto_comment, "
+            "updated_at=excluded.updated_at",
+            (username, nick, like, comment, int(time.time())))
+        conn.commit()
+        return {"username": username, "nickname": nick,
+                "auto_like": like, "auto_comment": comment}
+    finally:
+        conn.close()
+
+
+def get_moment_switches():
+    """全部客户的朋友圈自动互动开关 {username: {nickname, auto_like, auto_comment}}。"""
+    conn = _conn()
+    try:
+        rows = conn.execute(
+            "SELECT username, nickname, auto_like, auto_comment FROM moment_switch").fetchall()
+        return {r[0]: {"nickname": r[1] or "", "auto_like": int(r[2] or 0),
+                       "auto_comment": int(r[3] or 0)} for r in rows}
     finally:
         conn.close()
 

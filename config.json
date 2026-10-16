@@ -38,16 +38,23 @@
     "context_hours": 6,
     "rhythm": "natural",
     "max_replies_per_hour": 20,
-    "reply_types": ["文本"]
+    "reply_types": ["文本"],
+    "task_timeout_seconds": 120,
+    "queue_max": 200
   },
   "ai": {
     "persona": "小光",
     "product": "空间设计 SaaS 平台"
   },
   "moment": {
-    "watch": [],
     "max_actions_per_day": 10,
-    "ai_comment": true
+    "ai_comment": true,
+    "refresh_interval": 180,
+    "refresh_dwell": 4,
+    "task_timeout_seconds": 120
+  },
+  "ui": {
+    "lock_timeout_seconds": 180
   },
   "knowledge": {
     "dir": "knowledge",
