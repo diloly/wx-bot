@@ -36,7 +36,7 @@
    - 接自定义/云端大模型时：`provider` 设 `custom`，`base_url` 写全端点（**自带 `/v1`，代码不拼**），`model` 写该服务实际支持的模型名
    - `system_prompt` / `temperature` / `max_tokens`：可选，不填用代码内置默认
    编辑 `config.json`：
-   - `auto_reply` 块：白名单 `contacts`、频率闸 `cooldown_seconds` / `max_replies_per_hour`
+   - `auto_reply` 块：白名单 `contacts`、合并窗口 `merge_window_seconds` / 频率闸 `max_replies_per_hour`
    - `contacts` 可加 `"wxid"` 字段做精确匹配（可选）
 4. 确认 Ollama 在跑：`ollama serve` + `ollama list` 里有 gemma
 
@@ -117,8 +117,8 @@ python E:\WorkBuddyData\WechatBot\wechat_ui.py --schedule --no-dry
 | `reply_types` | ["文本"] | 只回文本，图片/语音不回（type 是中文字符串） |
 | `allow_groups` | false | 群消息不自动回 |
 | `contacts` | [] | 可选的二级过滤：空=不额外限制（由每会话开关决定）；填了=还需匹配白名单 |
-| `rhythm` | natural | 拟人节流档位（natural/calm/fast/off）：两次发送最小间隔 + 连发 6 条强制冷却 30–75s。与 cooldown/每小时上限叠加取严；状态落盘 `~/.wechatauto/rhythm.json`，auto_reply 与 wechat_ui 手动外发共享节流计数 |
-| `cooldown_seconds` | 30 | 同一会话回复冷却 |
+| `rhythm` | natural | 拟人节流档位（natural/calm/fast/off）：两次发送最小间隔 + 连发 6 条强制冷却 30–75s。与合并窗口/每小时上限叠加取严；状态落盘 `~/.wechatauto/rhythm.json`，auto_reply 与 wechat_ui 手动外发共享节流计数 |
+| `merge_window_seconds` | 8 | 合并窗口：收到消息后静默这么久（无新消息）才把攒的几条合并成一条任务交给 AI。取代旧的 `cooldown_seconds`（已删） |
 | `max_replies_per_hour` | 20 | 全局每小时上限（防风控） |
 | FAILSAFE | 开 | 鼠标甩到屏幕左上角立即急停 |
 
@@ -224,14 +224,27 @@ XML `<id>`（20 位、超 int64）。poll_new 全量拉取 → Python int 排序
 200 条 → `id > cursor` 过滤 → `add_moment` 按 tid 去重 → 推进水印。已验证：
 水印回拨能补收、重复 poll 幂等。
 
-写操作三道闸（默认最严）：① dry-run（看板「互动管理」面板开关
-`__moment_dry__`，默认模拟）；② 每日上限 `max_actions_per_day`（默认 10）；
-③ 库内置 rhythm 连发冷却。定位不到/超上限一律拒绝。
+写操作三道闸：① dry-run（看板「互动管理」面板开关
+`__moment_dry__`，默认模拟）；② 每日上限 `max_actions_per_day`
+（**0 = 不限次数，当前默认 0**——2026-10-16 用户取消固定 10 次：正常人朋友圈大一点
+也不止 10 个，点赞是低风险动作、鼠标又是拟人化的；填正数即恢复硬上限）；
+③ 库内置 rhythm 连发冷却——**这道才是真正防「机械连击」的闸**。定位不到/超上限一律拒绝。
 **放行标准 = 开关 / 人工点击本身**：2026-10-16 移除 `config.moment.watch`
 白名单——按客户开关就是人工确认；白名单是早于开关设计的第二道闸，属冗余，
 还造成过「开了开关却被静默跳过」的困惑。自动模式同样只认开关。
 
-配置在 `config.json` 的 `moment` 块（max_actions_per_day / ai_comment）；
+**光标轨迹全程拟人（2026-10-16）**：库的点赞链路有两处**瞬时/直线**移动——
+`_locate_more_click` 点「…」用 `pyautogui.moveTo(..., duration=0.1)`（直线冲刺）、
+`_click_float_button` 点「赞/评论」用 `pyautogui.click(x, y)`（瞬移，注意
+pyautogui 的 click 内部走 `_mouseMoveDrag` 而非 `moveTo`，两个都得接管），
+另外 `_send_scroll` 滚时间线前用 `user32.SetCursorPos` 直接落位。库装在
+site-packages、不宜改（重装即丢），所以 `moment_ops._human_cursor()` 在**一次写操作内**
+临时把 `pyautogui.moveTo/click` 与 `wechatauto.moment._send_scroll` 接管成
+`rhythm.move_to`（二次贝塞尔 + 末段减速），finally 还原。点赞全程都在 UI 门内，
+无并发冲突。`_send_scroll` 的包装会先照原逻辑做「落点不属于微信就别动」判定，
+避免平移到别的窗口上。
+
+配置在 `config.json` 的 `moment` 块（max_actions_per_day（0=不限）/ ai_comment）；
 命令速查见 COMMANDS.md 2.6。自动互动开关存 `moment_switch` 表
 （monitor_store.set/get_moment_switches），与 conv_switch 同款语义：
 无记录=全关，开开关只对之后新到的圈生效；面板会把开了开关的客户长期列出
@@ -317,10 +330,16 @@ XML `<id>`（20 位、超 int64）。poll_new 全量拉取 → Python int 排序
   发送时把剩余预算当 UI 门的排队上限。
 - 任何一段耗尽即作废并记日志（`任务超时未生成` / `任务超时未发出` / `发送排队超时`）。
 - 朋友圈同理：一条「赞+评」是一条任务，`moment.task_timeout_seconds`（默认 120s）。
-- **同一用户连发多条只算一条任务**：第一条在 `submit()` 里受理的瞬间就更新同会话
-  冷却窗口（`cooldown_seconds`，默认 30s），同一轮里后面的消息自然被挡掉。闸门与
-  计数全部在**投递时**判完（不放到发送成功后），否则同一轮里同一用户连发 3 条会
-  全部通过、排成 3 条任务。
+- **合并窗口（debounce）**：客户常分两三条才说完一个意思，逐条发 AI 只会答半句话。
+  所以收到消息先攒进该会话缓冲（`collect()`），**静默 `merge_window_seconds`（默认 8s）
+  不再来新消息**才合并成**一条**任务投递（`flush()`）；窗口期内每来一条就把计时往后推。
+  静态闸门（类型/群/白名单/会话开关）在 `collect()` 判，动态闸门（每小时上限）
+  在 `flush()` 那一刻判。
+- **合并窗口就是「已处理到哪条」的记录**：一投递就清空缓冲＝把之前收到的消息都标记为
+  「已交给 AI」；回复发出后若又有新消息，它们已在新缓冲里，再等一个窗口就回下一轮。
+- **旧的 `cooldown_seconds` 已废弃删除**：它按「距上次建任务不足 N 秒就跳过」判，
+  会把「回复发出后几秒用户补的一句」直接丢掉；而合并窗口本就保证「用户没停手就不回复」，
+  不需要再叠冷却。
 
 **新增/改动的配套（引入多线程必须处理）**：
 
@@ -336,15 +355,38 @@ XML `<id>`（20 位、超 int64）。poll_new 全量拉取 → Python int 排序
 
 命令速查见 COMMANDS.md 2.8。
 
+### 维护任务队列的可观测（reply_task，2026-10-16）
+
+内存队列（待生成 / 待发送）跑在 auto_reply 进程里，与看板是两个进程、看不到。
+所以每条任务同步落库 `reply_task` 表当**状态账本**，看板侧栏底部「维护任务」条
+（`GET /api/tasks`，只读）显示 `进行中 / 失败 / 作废` 计数，点开看最近 30 条的
+状态 + AI 文案 / 失败原因。
+
+状态机：`pending → generating → generated → sending → sent`，任一环节失败或超时
+落 `failed` / `expired`。**只读，不做取消/插队。**
+
+- **重启清理**：auto_reply 启动时把上次残留的未完成任务标 `expired`（否则面板
+  永远显示假的「进行中」）；**不补跑**（旧回复过时，且可能与新任务重叠）。
+- **不自动重试**：回复有时效（deadline 已兜住过期作废），发送不可逆（重试有重复
+  发送风险）；失败在面板可见，交人工。
+- 账本写失败只记日志、**不影响回复**。
+
+命令速查见 COMMANDS.md 2.9。
+
 ## 九、验收清单（按顺序过）
 
 1. `dashboard.py` 起来，浏览器开 http://localhost:5000
 2. 跑 `auto_reply.py`（当前 enabled=false），日志应显示「仅收消息监控上屏，不回复任何人」
 3. 用另一个号给微信发一条消息 → 10 秒内看板出现**对方气泡 + 正文**（`[store] +`）；群消息带「昵称: 」前缀
 4. 自己在 PC 微信**手动发**的消息同样上屏（右侧「我」气泡）；程序发的不会双渲染；图片/表情/语音等显示 `[图片 md5=...]` 等占位，不露 XML
+   - 不双渲染靠 `send_to_contact` **在按发送键之前**预写 `sent_log`（`monitor_store.add_sent`）：收消息轮询读到这条回执时命中 `was_sent` 即跳过。发送后还要 nap(delay)≈5s 才写看板库，而轮询在另一线程并发跑——若等发送后再写 sent_log，轮询会在这 5s 空窗里把回执当新消息补录一条（2026-10-16 修复）
 5. 单聊确认无误后，把 `config.json` 的 `auto_reply.enabled` 改 `true`，重跑 → dry-run 日志出现「已开启自动回复的会话 N 个」；在看板把目标会话行右侧开关打开 → 该会话来消息时 dry-run 日志出现 `[auto] 生成回复 → ...`
 6. `--no-dry` 真发成功，看板出现「我」的气泡
-7. 连发多条 → 日志出现「冷却中/已达上限」跳过，闸门生效
+7. 合并窗口（2026-10-16 起）：同一客户在 8 秒内连发 3 条 → 日志出现 3 行
+   `收到 X 第 N 条（8s 无新消息后合并提交）`，停手 8s 后出现 1 行
+   `合并 3 条为一条任务 → X` —— 只发 1 次 AI、只回 1 条（这几条一起进任务账本）。
+   停手后又补一句 → 8s 后出现 `合并 1 条为一条任务`（回下一轮）。超过每小时上限
+   才会出现「已达每小时上限」跳过
 8. 在看板关掉某会话开关 → 该会话再来消息不触发回复（静默跳过）
 9. 问「你是机器人吗」→ 回复应坦然承认是 AI 销售助手（合规红线，瞒报不合格），
    承认后拉回价值继续聊正事；问产品问题（如价格）→ 只引用 `knowledge/` 里填了的
@@ -360,12 +402,23 @@ XML `<id>`（20 位、超 int64）。poll_new 全量拉取 → Python int 排序
     日志应出现 `[ui] ...：排队 Ns 后取得 UI`；强杀其中一个进程后另一个仍能
     正常发送（Mutex 自愈，日志会出现「已自动接管」）
 13. 流水线（2026-10-16 新增）：
-    - 让两个客户在同一轮里各来一条消息 → 应出现两条 `已受理`，AI 线程**连续**
-      生成（第二条 `生成回复` 不必等第一条 `已发送`）
-    - 同一用户连发 3 条 → 只出现 1 条 `已受理`，另两条日志为「冷却中」
+    - 让两个客户在同一轮里各来一条消息 → 各自攒批，8s 后各出现一条
+      `合并 1 条为一条任务`；AI 线程**连续**生成（第二条 `生成回复` 不必等第一条
+      `已发送`）
+    - 同一用户连发 3 条（间隔 <8s）→ 只产生 1 条任务（`合并 3 条为一条任务`），
+      这 3 条一起进任务账本；没有「冷却中」这类日志了
     - 把 `auto_reply.task_timeout_seconds` 临时改成 5 测试任务级超时：应出现
       `任务超时未生成` 或 `任务超时未发出`，且**不影响后续任务**（流水线继续跑）
-    - 朋友圈轮询期间给微信发消息 → 消息仍应在 10 秒内被受理（朋友圈不再卡主循环）
+    - 朋友圈轮询期间给微信发消息 → 消息仍应被受理（朋友圈不再卡主循环）；
+      受理判定＝8s 窗口到期，与朋友圈无关
+14. 维护任务队列（2026-10-16 新增）：
+    - 看板侧栏底部出现「维护任务」条；auto_reply 未跑时显示「空闲」
+    - auto_reply 受理一条任务 → 面板计数「进行中 1」；点开可见该条（客户 + 状态
+      徽章，随 pending→generating→generated→sending→sent 变化）
+    - 把 `task_timeout_seconds` 临时改成 5 制造超时 → 面板出现红色「失败」或
+      黄色「作废」，**原因可见**（如「预算耗尽（未生成）」）
+    - 重启 auto_reply（上一次有未完成任务残留）→ 日志出现「上次运行残留 N 条
+      未完成任务，已标为作废」，面板不再有永远卡住的「进行中」
 
 ## 十、走过的弯路（结论备忘，防回头）
 

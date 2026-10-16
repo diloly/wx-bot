@@ -19,8 +19,10 @@
      「赞/评」，他的新圈才会被 auto_interact 自动互动；手动点按钮/CLI 是
      人工显式确认，不受此限
   1. dry_run 默认 True——只验证「能定位到目标圈」，不点不发；看板开关可切真跑
-  2. 每日上限 config.moment.max_actions_per_day（默认 10），防朋友圈风控
-     （朋友圈反垃圾独立于聊天风控，批量互动是公认高危）
+  2. 每日上限 config.moment.max_actions_per_day（**0 = 不限次数**，当前默认 0）
+     ——2026-10-16 用户拍板取消固定 10 次：正常人朋友圈大一点也不止 10 个，
+     而点赞本身是低风险动作、鼠标又是拟人化的。真正的节奏控制交给第 3 条
+     rhythm.gate（连发冷却），它才是防「机械连击」的那道闸
   3. 库内置 rhythm.gate 节流（连发强制冷却），与上面叠加
 
 放行标准 = 「开关 / 人工点击」本身，没有白名单：2026-10-16 移除
@@ -35,6 +37,7 @@ config.moment.watch——开关即确认，避免「开了开关却被白名单�
 auto_interact() 按 moment_switch 开关自动点赞/评论——只对开后新到的
 圈生效（不补赞旧圈）；自动评论走 ai_comment_text（小光人设）。
 """
+import contextlib
 import json
 import os
 import sys
@@ -53,6 +56,103 @@ except Exception:               # 允许在无 wechatauto 的环境导入（看�
 
 ACTIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             ".moment_actions.json")     # 每日动作计数（gitignore）
+
+_HUMAN_CURSOR_ANNOUNCED = False
+
+
+@contextlib.contextmanager
+def _human_cursor():
+    """在 with 块内，把朋友圈的鼠标动作改走 rhythm 的拟人轨迹。
+
+    背景（2026-10-16 用户反馈「点赞也是直接闪现的」）：wechatauto 库里
+    guia.real_click / uia_driver / sender 这些路径都走 ``rhythm.move_to``
+    （二次贝塞尔 + 末段减速），**唯独朋友圈这几处漏了**：
+      - ``_locate_more_click`` 点「…」用 ``pyautogui.moveTo(..., duration=0.1)``
+        ——直线冲刺，没有加减速；
+      - ``_click_float_button`` 点「赞/评论」用 ``pyautogui.click(x, y)``
+        ——瞬时传送（pyautogui 的 click 内部走 ``_mouseMoveDrag``，不经过
+        ``moveTo``，所以两个都得接管）；
+      - ``_send_scroll`` 滚时间线前用 ``user32.SetCursorPos`` 直接落位。
+
+    库是 site-packages 里装好的，不宜直接改（重装即丢），所以在**我们这一侧**
+    临时接管、用完还原。作用域限定在一次朋友圈写操作内，而朋友圈写操作都在
+    UI 门里串行执行，不存在并发冲突。
+
+    注意：接管 ``pyautogui.moveTo/click`` 是**进程级**的，但只有朋友圈这条
+    链路会用到带坐标的 pyautogui 点击（消息发送用的是 press/hotkey，不受影响），
+    所以实际影响面就是我们要修的这一段。
+    """
+    global _HUMAN_CURSOR_ANNOUNCED
+    try:
+        import ctypes
+        import pyautogui
+        import wechatauto.moment as _wm
+        from wechatauto import rhythm
+    except Exception as e:                 # 库缺失时静默沿用默认行为
+        print("[moment] 拟人光标不可用（沿用库默认）: %s" % e)
+        yield
+        return
+
+    u = ctypes.windll.user32
+    orig_move = pyautogui.moveTo
+    orig_click = pyautogui.click
+    orig_scroll = getattr(_wm, "_send_scroll", None)
+
+    def _is_xy(a, b):
+        return isinstance(a, (int, float)) and isinstance(b, (int, float))
+
+    def moveTo(x=None, y=None, *a, **kw):
+        if _is_xy(x, y):
+            try:
+                rhythm.move_to(u, int(x), int(y))
+                return None
+            except Exception:
+                pass
+        return orig_move(x, y, *a, **kw)
+
+    def click(*a, **kw):
+        x = a[0] if a else kw.get("x")
+        y = a[1] if len(a) > 1 else kw.get("y")
+        if _is_xy(x, y):
+            try:
+                rhythm.move_to(u, int(x), int(y))   # 先平滑走过去
+                rhythm.nap(0.15)                    # 落点前停一下再按
+            except Exception:
+                pass
+        return orig_click(*a, **kw)
+
+    if orig_scroll is not None:
+        def send_scroll(x, y, delta=-120, times=1, expect_pid=None):
+            # 先照原逻辑做「落点不属于微信就别动」的判定，避免平移到别的窗口上
+            if expect_pid is not None:
+                try:
+                    from wechatauto.guia import window_owner_pid
+                    owner = window_owner_pid(int(x), int(y))
+                    if owner is not None and owner != expect_pid:
+                        return orig_scroll(x, y, delta=delta, times=times,
+                                           expect_pid=expect_pid)
+                except Exception:
+                    pass
+            try:
+                rhythm.move_to(u, int(x), int(y))
+            except Exception:
+                pass
+            return orig_scroll(x, y, delta=delta, times=times, expect_pid=expect_pid)
+
+    pyautogui.moveTo = moveTo
+    pyautogui.click = click
+    if orig_scroll is not None:
+        _wm._send_scroll = send_scroll
+    if not _HUMAN_CURSOR_ANNOUNCED:
+        _HUMAN_CURSOR_ANNOUNCED = True
+        print("[moment] 拟人光标已启用：朋友圈的移动/点击/滚动定位改走 rhythm 轨迹")
+    try:
+        yield
+    finally:
+        pyautogui.moveTo = orig_move
+        pyautogui.click = orig_click
+        if orig_scroll is not None:
+            _wm._send_scroll = orig_scroll
 
 
 def _today():
@@ -90,7 +190,9 @@ class MomentOps:
     def __init__(self, cfg, dry_run=None):
         self.cfg = cfg or {}
         mcfg = self.cfg.get("moment", {}) or {}
-        self.max_actions = int(mcfg.get("max_actions_per_day", 10))
+        # 每日写动作上限（点赞+评论合计）：<=0 表示**不限次数**（2026-10-16
+        # 用户拍板取消固定 10 次）。仍保留计数（_bump_actions）供看板显示今日用量。
+        self.max_actions = int(mcfg.get("max_actions_per_day", 0))
         self.ai_comment = bool(mcfg.get("ai_comment", True))
         # dry_run：None=看板开关（conv_switch 表 '__moment_dry__'，默认 1=模拟）
         if dry_run is None:
@@ -349,15 +451,23 @@ class MomentOps:
             print("[moment] 未找到「刷新」按钮（工具栏未渲染？），降级为仅切页等待")
             return False
         try:
+            import ctypes
             import pyautogui
             from wechatauto import rhythm
             r = btn.BoundingRectangle
             rect = (r.left, r.top, r.right, r.bottom)
             x, y = rhythm.point(rect)         # 控件内随机点，避开正中心
+            # 平滑移动再点：朋友圈页工具栏「刷新」在顶部，而光标此刻还停在导航
+            # 「发现」附近，SetCursorPos 一步闪现是脚本签名（2026-10-16 用户反馈
+            # 「闪现过去不对」）。rhythm.move_to 走二次贝塞尔 + 随机弓形 + 末段
+            # 减速，以真实光标为起点，落点前再 nap 一下（与库 guia.real_click 同款）；
+            # off 档会退回直接传送（对照实验用，自然档 steps=(6,14) 有过程）。
+            rhythm.move_to(ctypes.windll.user32, x, y)
+            rhythm.nap(0.15)
             # 不调 rhythm.gate：gate 最冷要睡 30-75s，那期间微信一直占着前台；
             # 且点「刷新」是导航/读动作（不对外发布任何内容），按库自己的
-            # 规矩「读和定位不节流」，只保留坐标抖动即可。
-            pyautogui.click(x, y)
+            # 规矩「读和定位不节流」。
+            pyautogui.click()                 # 光标已停在 (x,y)，仅按下抬起，不再传送
             print("[moment] 已点击朋友圈页「刷新」按钮 (%d,%d)，等待客户端同步…"
                   % (x, y))
             return True
@@ -424,7 +534,7 @@ class MomentOps:
         - 只处理本次新到的圈——开开关不回溯历史，不会批量补赞旧圈；
         - 放行标准就是开关本身（2026-10-16 移除了 watch 白名单：开关即确认），
           之后仍走 like()/comment() 的整套闸：dry-run（默认模拟，只验证
-          定位）→ 每日上限 → rhythm 节流；
+          定位）→ 每日上限（`max_actions_per_day`，0=不限）→ rhythm 节流；
         - 自动评论由小光人设生成文案（config.moment.ai_comment=false 时跳过），
           评论不可逆，所以它的开关独立且默认关。
         返回 {liked, commented, skipped, errors}。
@@ -502,7 +612,7 @@ class MomentOps:
 
         放行标准 = 人工显式确认：手动是看板按钮/CLI 调用本身，自动是
         auto_interact 里该客户开了对应开关。这里只做共性校验：
-        目标在库 → dry-run → 每日上限。
+        目标在库 → dry-run → 每日上限（`max_actions<=0` 时不限次数，跳过此闸）。
         （2026-10-16 移除了 watch 白名单——开关即确认，避免双重标准。）
         """
         feed = None
@@ -515,9 +625,11 @@ class MomentOps:
         if self.dry_run:
             return True, "dry-run 模式：只验证定位，不真点", feed
         n = int(_load_actions().get(_today(), 0))
-        if n >= self.max_actions:
+        if self.max_actions > 0 and n >= self.max_actions:
             return False, "今日朋友圈动作已达上限（%d/%d）" % (n, self.max_actions), None
-        return True, "放行（今日第 %d/%d 次）" % (n + 1, self.max_actions), feed
+        if self.max_actions > 0:
+            return True, "放行（今日第 %d/%d 次）" % (n + 1, self.max_actions), feed
+        return True, "放行（今日第 %d 次，不限量）" % (n + 1), feed
 
     def like(self, tid, cancel=False, timeout=None):
         """点赞/取消点赞指定 tid 的朋友圈。tid 必须在库中（先 poll_new）。
@@ -535,20 +647,23 @@ class MomentOps:
             with ui_gate.hold("点赞 %s" % (publisher or tid[-8:]), timeout=timeout):
                 self._ensure_foreground()  # 库的 UIA 点击导航需要微信在前台
                 self._ensure_moments_page()  # 且必须停在朋友圈页（被切回过聊天就得再导航）
-                if self.dry_run:
-                    located = self._locate_only(publisher)
-                    return {"ok": bool(located), "dry": True, "located": bool(located),
-                            "reason": reason, "publisher": publisher,
-                            "detail": "dry-run：定位%s，未发送点赞" % ("成功" if located else "失败")}
-                if cancel:
-                    # LikeMoment 无 cancel 参数，取消赞需先定位再 Like(item, cancel=True)
-                    item = self.moment.find_moment(publisher=publisher)
-                    if item is None:
-                        return {"ok": False, "reason": "未能定位到目标朋友圈",
-                                "publisher": publisher}
-                    r = self.moment.Like(item, cancel=True)
-                else:
-                    r = self.moment.LikeMoment(publisher=publisher)
+                # 库的点赞链路（滚动定位 → 点「…」→ 点浮层「赞」）默认是瞬时/直线
+                # 移动，_human_cursor 期间改成 rhythm 拟人轨迹（用完还原）。
+                with _human_cursor():
+                    if self.dry_run:
+                        located = self._locate_only(publisher)
+                        return {"ok": bool(located), "dry": True, "located": bool(located),
+                                "reason": reason, "publisher": publisher,
+                                "detail": "dry-run：定位%s，未发送点赞" % ("成功" if located else "失败")}
+                    if cancel:
+                        # LikeMoment 无 cancel 参数，取消赞需先定位再 Like(item, cancel=True)
+                        item = self.moment.find_moment(publisher=publisher)
+                        if item is None:
+                            return {"ok": False, "reason": "未能定位到目标朋友圈",
+                                    "publisher": publisher}
+                        r = self.moment.Like(item, cancel=True)
+                    else:
+                        r = self.moment.LikeMoment(publisher=publisher)
                 _bump_actions()
                 return {"ok": bool(getattr(r, "is_success", False)),
                         "reason": str(getattr(r, "message", r)),
@@ -574,13 +689,14 @@ class MomentOps:
             with ui_gate.hold("评论 %s" % (publisher or tid[-8:]), timeout=timeout):
                 self._ensure_foreground()  # 库的 UIA 点击导航需要微信在前台
                 self._ensure_moments_page()  # 且必须停在朋友圈页（被切回过聊天就得再导航）
-                if self.dry_run:
-                    located = self._locate_only(publisher)
-                    return {"ok": bool(located), "dry": True, "located": bool(located),
-                            "reason": reason, "publisher": publisher,
-                            "detail": "dry-run：定位%s，未发送评论「%s」" % (
-                                "成功" if located else "失败", content[:20])}
-                r = self.moment.CommentMoment(publisher=publisher, content=content)
+                with _human_cursor():      # 同 like()：整段改走拟人光标轨迹
+                    if self.dry_run:
+                        located = self._locate_only(publisher)
+                        return {"ok": bool(located), "dry": True, "located": bool(located),
+                                "reason": reason, "publisher": publisher,
+                                "detail": "dry-run：定位%s，未发送评论「%s」" % (
+                                    "成功" if located else "失败", content[:20])}
+                    r = self.moment.CommentMoment(publisher=publisher, content=content)
                 _bump_actions()
                 return {"ok": bool(getattr(r, "is_success", False)),
                         "reason": str(getattr(r, "message", r)),

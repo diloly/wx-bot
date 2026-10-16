@@ -21,6 +21,7 @@ API：
     POST /api/moment/ai-comment   AI 生成评论文案 {tid}
     POST /api/moment/switch       设置某客户自动点赞/评论开关 {username, nickname, field, enabled}（默认关）
     POST /api/moment/inter-read   互动通知全部标为已读
+    GET  /api/tasks               维护任务队列状态（只读：各状态计数 + 最近 30 条）
 """
 import os
 import logging
@@ -30,7 +31,7 @@ from flask import Flask, render_template, jsonify, request, send_from_directory
 from monitor_store import (
     init, list_conversations, get_messages, add_message, clear_unread, set_switch,
     get_moments, get_interactions, mark_interactions_read, moment_unread_count,
-    get_moment_switches, set_moment_switch,
+    get_moment_switches, set_moment_switch, get_tasks, task_counts,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -147,8 +148,9 @@ def api_moments():
 def api_moment_action():
     """点赞/取消/评论。body: {tid, action: like|unlike|comment, text}。
 
-    三道安全闸在 moment_ops 内部：dry-run（默认模拟）→ 每日上限 →
-    库内置 rhythm 节流。放行标准 = 人工显式确认（这次点击本身）。
+    三道安全闸在 moment_ops 内部：dry-run（默认模拟）→ 每日上限
+    （`max_actions_per_day`，0=不限）→ 库内置 rhythm 节流。
+    放行标准 = 人工显式确认（这次点击本身）。
     """
     data = request.get_json(force=True, silent=True) or {}
     tid = str(data.get("tid") or "").strip()
@@ -217,6 +219,21 @@ def api_moment_inter_read():
     """互动通知全部标为已读。"""
     n = mark_interactions_read()
     return jsonify({"ok": True, "cleared": n})
+
+
+# ==================== 维护任务队列（只读可观测） ====================
+
+@app.route("/api/tasks")
+def api_tasks():
+    """auto_reply 维护任务队列的状态账本（只读）。
+
+    队列跑在 auto_reply 进程的内存里，与看板是两个进程；落库到 reply_task 表
+    才能让看板「看得见」待生成/待发送/失败/超时。不提供取消、插队等控制。
+    """
+    return jsonify({
+        "counts": task_counts(),
+        "tasks": get_tasks(limit=30),
+    })
 
 
 if __name__ == "__main__":

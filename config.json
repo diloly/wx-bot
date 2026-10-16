@@ -33,7 +33,7 @@
     "intent": "你正在微信上回复客户发来的消息，目的是激活客户（让沉默的客户愿意重新聊、在用的愿意续费扩购）。语气自然、简洁、口语化，像真人一对一聊天；客户问的产品细节只引用系统提示词里给的资料，资料没有的说'我确认一下再回复你'，不编造。只输出回复正文，不要解释。",
     "contacts": [],
     "allow_groups": false,
-    "cooldown_seconds": 30,
+    "merge_window_seconds": 8,
     "context_turns": 3,
     "context_hours": 6,
     "rhythm": "natural",
@@ -47,7 +47,7 @@
     "product": "空间设计 SaaS 平台"
   },
   "moment": {
-    "max_actions_per_day": 10,
+    "max_actions_per_day": 0,
     "ai_comment": true,
     "refresh_interval": 180,
     "refresh_dwell": 4,
