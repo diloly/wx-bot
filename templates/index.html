@@ -57,6 +57,38 @@
     line-height: 1.5; padding: 8px 14px; border-bottom: 1px solid #383838;
   }
 
+  /* 维护任务队列（只读；auto_reply 的两个内存队列落库后的状态账本） */
+  .task-bar {
+    display: flex; align-items: center; gap: 8px; padding: 9px 14px; cursor: pointer;
+    border-top: 1px solid #383838; font-size: 12px; color: #9a9a9a; user-select: none;
+  }
+  .task-bar:hover { background: #3a3a3a; }
+  .task-bar .tb-label { color: #cfcfcf; flex-shrink: 0; }
+  .task-bar .tb-stat { flex: 1; text-align: right; }
+  .task-bar .tb-caret { color: #777; flex-shrink: 0; }
+  .tb-chip { padding: 1px 7px; border-radius: 8px; background: #3d3d3d; color: #9a9a9a; }
+  .tb-chip.open { background: #2a4a6b; color: #8fc7ff; }
+  .tb-chip.fail { background: #5a2a2a; color: #ff9b9b; }
+  .task-panel {
+    max-height: 42vh; overflow-y: auto; border-top: 1px solid #383838; background: #262626;
+  }
+  .task-item { padding: 8px 14px; border-bottom: 1px solid #333; font-size: 12px; }
+  .task-item .ti-top { display: flex; align-items: center; gap: 6px; }
+  .task-item .ti-name {
+    color: #ddd; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .task-item .ti-time { color: #777; flex-shrink: 0; }
+  .task-item .ti-text {
+    color: #999; margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .task-item .ti-reason { color: #d98b8b; margin-top: 3px; }
+  .ti-badge { padding: 0 6px; border-radius: 8px; font-size: 11px; flex-shrink: 0; }
+  .st-pending { background: #444; color: #bbb; }
+  .st-generating, .st-generated, .st-sending { background: #2a4a6b; color: #8fc7ff; }
+  .st-sent { background: #24503a; color: #7fe0a8; }
+  .st-failed { background: #5a2a2a; color: #ff9b9b; }
+  .st-expired { background: #5a4520; color: #ffcf7a; }
+
   /* 右侧聊天 */
   .chat { flex: 1; display: flex; flex-direction: column; background: #f5f5f5; }
   .chat .header {
@@ -298,6 +330,12 @@
     <div id="searchWrap"><div class="search"><input id="search" placeholder="搜索会话" /></div></div>
     <div class="conv-list" id="convList"></div>
     <div class="conv-list" id="momentList" style="display:none"></div>
+    <div class="task-bar" id="taskBar" onclick="toggleTaskPanel()">
+      <span class="tb-label">维护任务</span>
+      <span class="tb-stat" id="taskStat">—</span>
+      <span class="tb-caret" id="taskCaret">▸</span>
+    </div>
+    <div class="task-panel" id="taskPanel" style="display:none"></div>
   </div>
   <div class="chat" id="chatPane">
     <div class="empty" id="emptyTip">从左侧选择一个会话</div>
@@ -705,11 +743,14 @@ function renderMomentPanel(data) {
   }
   const names = Object.keys(pubs).sort((a, b) =>
     String(pubs[a] || '').localeCompare(String(pubs[b] || ''), 'zh'));
+  const guardTxt = data.max_actions > 0
+    ? `每日 ${data.max_actions} 次上限 + 连发冷却`
+    : `连发冷却（未设每日次数上限）`;
   const dryTxt = data.dry_run
     ? `当前 <b>模拟模式（dry-run）</b>：点赞/评论只验证「能定位到目标圈」，不会真的点、真的发。<br>
-       演练无误后关掉它切真跑（仍受每日 ${data.max_actions} 次上限 + 连发冷却保护）。<br>
+       演练无误后关掉它切真跑（仍受 ${guardTxt} 保护）。<br>
        注意：这是朋友圈独立开关，与 auto_reply.py 的 --no-dry（消息回复）互不影响。`
-    : `当前 <b>真跑模式</b>：点赞/评论会真实执行（每日上限 ${data.max_actions} 次 + 连发冷却）。<br>
+    : `当前 <b>真跑模式</b>：点赞/评论会真实执行（${guardTxt}）。<br>
        想先演练的话打开模拟开关。`;
   pane.innerHTML = `
     <div class="msw-panel">
@@ -929,13 +970,75 @@ async function readInteractions() {
   loadMoments();
 }
 
+/* ---------- 维护任务队列（只读） ----------
+   auto_reply 的「待生成 / 待发送」队列跑在它的进程内存里，与看板是两个进程。
+   落库到 reply_task 表后，这里才有东西可看：谁在待生成、谁卡住了、哪条失败/超时。
+   不做取消/插队——只看得见。 */
+let taskPanelOpen = false;
+const TASK_LABEL = {
+  pending: '待生成', generating: '生成中', generated: '待发送',
+  sending: '发送中', sent: '已发送', failed: '失败', expired: '已作废'
+};
+
+async function loadTasks() {
+  try {
+    const res = await fetch('/api/tasks');
+    const data = await res.json();
+    renderTaskBar(data.counts || {});
+    if (taskPanelOpen) renderTaskPanel(data.tasks || []);
+  } catch (e) { /* 任务面板不可用不该影响主看板 */ }
+}
+
+function renderTaskBar(c) {
+  const bits = [];
+  if (c.open) bits.push(`<span class="tb-chip open">进行中 ${c.open}</span>`);
+  if (c.failed) bits.push(`<span class="tb-chip fail">失败 ${c.failed}</span>`);
+  if (c.expired) bits.push(`<span class="tb-chip">作废 ${c.expired}</span>`);
+  if (!bits.length) bits.push(`<span class="tb-chip">空闲</span>`);
+  document.getElementById('taskStat').innerHTML = bits.join('');
+}
+
+function toggleTaskPanel() {
+  taskPanelOpen = !taskPanelOpen;
+  document.getElementById('taskPanel').style.display = taskPanelOpen ? 'block' : 'none';
+  document.getElementById('taskCaret').textContent = taskPanelOpen ? '▾' : '▸';
+  if (taskPanelOpen) loadTasks();
+}
+
+function renderTaskPanel(tasks) {
+  const box = document.getElementById('taskPanel');
+  if (!tasks.length) {
+    box.innerHTML = '<div class="task-item"><div class="ti-text">本次运行暂无任务（收到消息并开启会话开关后才会出现）</div></div>';
+    return;
+  }
+  box.innerHTML = tasks.map(t => {
+    const st = TASK_LABEL[t.status] || t.status;
+    const ts = (t.updated || t.created || 0) * 1000;
+    const time = ts ? new Date(ts).toLocaleTimeString('zh-CN', { hour12: false }) : '';
+    // 终态失败/作废展示原因；其余展示 AI 文案（没生成就展示客户原话）
+    const bad = (t.status === 'failed' || t.status === 'expired');
+    const body = bad ? (t.reason || '') : (t.reply || t.text || '');
+    const cls = bad ? 'ti-reason' : 'ti-text';
+    return `<div class="task-item">
+      <div class="ti-top">
+        <span class="ti-badge st-${esc(t.status)}">${esc(st)}</span>
+        <span class="ti-name">${esc(t.name || t.conv_id || '')}</span>
+        <span class="ti-time">${esc(time)}</span>
+      </div>
+      ${body ? `<div class="${cls}">${esc(String(body).slice(0, 60))}</div>` : ''}
+    </div>`;
+  }).join('');
+}
+
 setInterval(() => {
   loadConversations();
   if (activeConv) loadMessages();
   loadMoments();
+  loadTasks();
 }, POLL);
 loadConversations();
 loadMoments();
+loadTasks();
 </script>
 </body>
 </html>

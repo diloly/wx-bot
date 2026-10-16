@@ -127,6 +127,21 @@ def _init_schema(path=None):
             auto_comment INTEGER NOT NULL DEFAULT 0,   -- 1=该客户新圈自动评论（不可逆，默认关）
             updated_at   INTEGER DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS reply_task (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind     TEXT DEFAULT 'reply',            -- 'reply'=会话回复；'moment' 预留
+            conv_id  TEXT,
+            name     TEXT,
+            text     TEXT,                            -- 触发任务的客户原话
+            status   TEXT,                            -- 见下方 TASK_* 状态机
+            reply    TEXT,                            -- AI 生成结果
+            reason   TEXT,                            -- 失败/作废原因（面板展示）
+            created  INTEGER,                         -- 投递时刻
+            deadline INTEGER,                         -- 任务预算截止（created + task_timeout）
+            updated  INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_task_status ON reply_task(status, id);
+        CREATE INDEX IF NOT EXISTS idx_task_updated ON reply_task(updated);
         CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages(conv_id, ts);
         """
     )
@@ -551,3 +566,99 @@ def _jload(s):
         return json.loads(s)
     except Exception:
         return None
+
+
+# ==================== 维护任务队列（看板可观测） ====================
+# 2026-10-16：auto_reply 的「待生成 / 待发送」两个内存队列落库成这张表。
+# 内存 queue 仍是实际的工作队列（worker 靠它阻塞取值、保证 FIFO），这张表是
+# **状态账本**——两个进程不共享内存，看板（另一个进程）只能通过库看见队列。
+# 不做控制（取消/插队）：只读展示。
+# 状态机：pending → generating → generated → sending → sent
+#         任一环节失败/超时 → failed / expired（终态）
+TASK_OPEN = ("pending", "generating", "generated", "sending")   # 未终态
+TASK_DONE = ("sent", "failed", "expired")                       # 终态
+
+
+def add_task(conv_id, name, text, deadline, kind="reply", created=None):
+    """投递一条维护任务（落库，状态 pending），返回任务 id。"""
+    now = int(created or time.time())
+    conn = init()
+    try:
+        cur = conn.execute(
+            "INSERT INTO reply_task(kind, conv_id, name, text, status, "
+            "created, deadline, updated) VALUES(?, ?, ?, ?, 'pending', ?, ?, ?)",
+            (kind, conv_id, name, text, now, int(deadline), now))
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def update_task(task_id, status=None, reply=None, reason=None):
+    """更新任务状态。只传要改的字段（None 表示不动）。"""
+    sets, params = ["updated=?"], [int(time.time())]
+    if status is not None:
+        sets.append("status=?")
+        params.append(status)
+    if reply is not None:
+        sets.append("reply=?")
+        params.append(reply)
+    if reason is not None:
+        sets.append("reason=?")
+        params.append(reason)
+    params.append(int(task_id))
+    conn = init()
+    try:
+        conn.execute("UPDATE reply_task SET %s WHERE id=?" % ", ".join(sets), params)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_tasks(limit=30):
+    """最近的任务（新→旧），供看板展示。"""
+    conn = _conn()
+    try:
+        return [dict(r) for r in conn.execute(
+            "SELECT id, kind, conv_id, name, text, status, reply, reason, "
+            "created, deadline, updated FROM reply_task ORDER BY id DESC LIMIT ?",
+            (int(limit),)).fetchall()]
+    finally:
+        conn.close()
+
+
+def task_counts():
+    """各状态计数 + open（未终态合计）。看板顶部条用。"""
+    conn = _conn()
+    try:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) AS c FROM reply_task GROUP BY status").fetchall()
+    finally:
+        conn.close()
+    out = {r["status"]: r["c"] for r in rows}
+    for s in TASK_OPEN + TASK_DONE:
+        out.setdefault(s, 0)
+    out["open"] = sum(out.get(s, 0) for s in TASK_OPEN)
+    return out
+
+
+def expire_open_tasks(reason="进程重启，任务作废"):
+    """启动清理：把上次运行残留的未完成任务标为 expired，返回作废条数。
+
+    为什么必须做（而不只是"可选"）：内存队列随进程一起没了，库里那些
+    pending/generating 再也没人会动；不清理，看板会永远显示一堆假的"进行中"，
+    「看得见」这个需求本身就失真了。
+    为什么不做「补跑」：旧回复早已过时，补跑还可能与重启后新收的消息任务重叠
+    （同一个客户被回两次）。故一律作废，交人工。
+    """
+    conn = init()
+    try:
+        qs = ",".join("?" * len(TASK_OPEN))
+        cur = conn.execute(
+            "UPDATE reply_task SET status='expired', reason=?, updated=? "
+            "WHERE status IN (%s)" % qs,
+            (reason, int(time.time())) + TASK_OPEN)
+        conn.commit()
+        return cur.rowcount or 0
+    finally:
+        conn.close()

@@ -394,6 +394,17 @@ class WeChatPCBot:
             log.info("[DRY-RUN] 按键序列: %s", plan)
             return
         try:
+            # 先在**门外**、且在按发送键**之前**记 sent_log：收消息轮询读到这条
+            # 回执时要靠它去重跳过。必须在按键前写——发送后本函数还要 nap(delay)
+            # ≈5s 才写看板库，而收消息轮询跑在另一个线程、并发进行；若等发送后
+            # 再写 sent_log，轮询就会在这 5s 空窗里把回执当成新消息再入库一条
+            # （2026-10-16 用户看到同一句话在会话里出现两遍：收桥那条 id 更小、
+            # 时间更早，发送那条 id 更大、晚 7s）。写在这里也顺便保证这次 DB 写
+            # 不在 UI 门内（不占着微信锁做 IO）。
+            try:
+                store_add_sent(conv_id or name, message)
+            except Exception as e:
+                log.warning("预写 sent_log 失败（回执可能重复上屏）: %s", e)
             with ui_gate.hold("发送给 %s" % name, timeout=ui_timeout):
                 hwnd, title = focus_wechat()
                 _require_foreground(hwnd)   # 关键：确保按键只发到微信，发错就中止
@@ -411,8 +422,6 @@ class WeChatPCBot:
             # 放在门外做，别白占 UI 锁）
             try:
                 store_add_message(conv_id or name, "me", message, name=name)
-                # 同时记 sent_log：收消息轮询再从库里读到这条自己的消息时跳过，避免双渲染
-                store_add_sent(conv_id or name, message)
             except Exception as e:
                 log.warning("写入看板消息库失败（不影响已发送）: %s", e)
         except ui_gate.UITimeoutError as e:
