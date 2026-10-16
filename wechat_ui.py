@@ -46,6 +46,7 @@ import pyperclip
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+import ui_gate
 from ai_client import generate as ai_generate
 from monitor_store import add_message as store_add_message
 from monitor_store import add_sent as store_add_sent
@@ -78,7 +79,9 @@ _kernel32 = ctypes.windll.kernel32
 # 也曾被误判成微信主窗口，导致快捷键全发进浏览器。见到这些类名一律排除。
 _BROWSER_CLASSES = ("Chrome_WidgetWin", "MozillaWindowClass",
                     "ApplicationFrame", "Windows.UI.Core", "EE_Window")
-# 微信主窗口的 Qt 类名（实测 Qt51514QWindowIcon；微信升级可能变，仅作优先信号，不当硬条件）
+# 微信主窗口的 Qt 类名（实测 Qt51514QWindowIcon；微信升级可能变）。
+# 它是**主判据**：开着会话时主窗标题会变成联系人名，标题不可靠，
+# 类名才是稳定标识（2026-10-16 focus_wechat 因标题变化找不到窗口）。
 _WECHAT_CLASS_HINT = "Qt515"
 VK_MENU = 0x12           # Alt 键，用于解除 Windows 前台锁
 KEYEVENTF_KEYUP = 0x0002
@@ -91,13 +94,39 @@ def _class_of(hwnd):
     return buf.value
 
 
+def _proc_path(hwnd):
+    """窗口所属进程的可执行路径（查询失败返回空串，如权限不足）。"""
+    try:
+        pid = wintypes.DWORD()
+        _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if not pid.value:
+            return ""
+        h = _kernel32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return ""
+        try:
+            buf = ctypes.create_unicode_buffer(260)
+            n = wintypes.DWORD(260)
+            if _kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)):
+                return buf.value
+        finally:
+            _kernel32.CloseHandle(h)
+    except Exception:
+        pass
+    return ""
+
+
 def find_wechat_windows():
     """返回 [(hwnd, title), ...]，只认个人微信主窗口。
     双保险防误判（历史事故：标题含「微信」的看板浏览器窗口被当成微信，
     快捷键 Ctrl+F/粘贴/Enter 全发进浏览器）：
-    ① 类名含 Qt515（微信 Qt 主窗口）——优先信号；
-    ② 或标题精确等于「微信」（主窗口标题就是它；「微信客户维护·看板」这类一律排除）；
-    类名是浏览器/系统容器的一律先排除。多个命中时 Qt 类窗口排前。"""
+    ① 类名含 Qt515（微信 Qt 主窗口）——**不依赖标题**：开着会话时主窗
+      标题会变成联系人名（2026-10-16 实测 focus_wechat 因此找不到窗口），
+      类名才是稳定标识；
+    ② 或标题精确等于「微信」；
+    类名是浏览器/系统容器的一律先排除；标题含「企业」「开发者」的一律排除。
+    多个命中时排序：Weixin.exe 进程优先 → 精确标题「微信」优先 → 其余。
+    """
     found = []
 
     def _enum(hwnd, _lparam):
@@ -109,7 +138,7 @@ def find_wechat_windows():
         buf = ctypes.create_unicode_buffer(length + 1)
         _user32.GetWindowTextW(hwnd, buf, length + 1)
         title = buf.value
-        if ("微信" not in title) or ("企业" in title) or ("开发者" in title):
+        if ("企业" in title) or ("开发者" in title):
             return
         cls = _class_of(hwnd)
         if any(b in cls for b in _BROWSER_CLASSES):
@@ -119,8 +148,14 @@ def find_wechat_windows():
 
     ENUMPROC = ctypes.WINFUNCTYPE(None, wintypes.HWND, wintypes.LPARAM)
     _user32.EnumWindows(ENUMPROC(_enum), 0)
-    # 微信 Qt 主窗口优先（多窗口命中时）
-    found.sort(key=lambda t: 0 if _WECHAT_CLASS_HINT in _class_of(t[0]) else 1)
+
+    def _rank(t):
+        hwnd, title = t
+        proc = _proc_path(hwnd).replace("/", "\\").lower()
+        is_weixin = proc.endswith("\\weixin.exe")
+        return (0 if is_weixin else 1, 0 if title == "微信" else 1)
+
+    found.sort(key=_rank)
     return found
 
 
@@ -156,26 +191,82 @@ def _activate(hwnd):
     return False
 
 
-def focus_wechat():
-    """把个人微信主窗口激活到前台并返回 (hwnd, title)。找不到/激活失败则抛错。"""
-    wins = find_wechat_windows()
-    if not wins:
-        raise RuntimeError(
-            "找不到个人微信窗口（已自动排除企业微信/浏览器页面）。"
-            "请确认个人微信已登录并打开；可用 --inspect 查看当前识别到的窗口。"
-        )
-    hwnd, title = wins[0]
-    if not _activate(hwnd):
-        fg = _user32.GetForegroundWindow()
-        n = _user32.GetWindowTextLengthW(fg)
+def _rejected_candidates_desc():
+    """报错时附上「像微信但被排除」的可见窗口，辅助排查（只读）。"""
+    seen = []
+
+    def _enum(hwnd, _lparam):
+        if not _user32.IsWindowVisible(hwnd):
+            return
+        n = _user32.GetWindowTextLengthW(hwnd)
+        if n == 0:
+            return
         buf = ctypes.create_unicode_buffer(n + 1)
-        _user32.GetWindowTextW(fg, buf, n + 1)
-        raise RuntimeError(
-            "无法把微信窗口激活到前台（当前前台是 %r）。"
-            "可能原因：微信刚启动未就绪 / 系统前台限制。"
-            "请手动点一下微信窗口再重试。" % buf.value
-        )
-    return hwnd, title
+        _user32.GetWindowTextW(hwnd, buf, n + 1)
+        title = buf.value
+        cls = _class_of(hwnd)
+        if "微信" in title or _WECHAT_CLASS_HINT in cls:
+            seen.append((title, cls))
+
+    ENUMPROC = ctypes.WINFUNCTYPE(None, wintypes.HWND, wintypes.LPARAM)
+    _user32.EnumWindows(ENUMPROC(_enum), 0)
+    if not seen:
+        return ""
+    return " 当前可见的疑似窗口：" + "; ".join(
+        "%r(%s)" % (t[:30], c) for t, c in seen[:5])
+
+
+def _foreground_desc():
+    fg = _user32.GetForegroundWindow()
+    n = _user32.GetWindowTextLengthW(fg)
+    buf = ctypes.create_unicode_buffer(n + 1)
+    _user32.GetWindowTextW(fg, buf, n + 1)
+    return buf.value
+
+
+def focus_wechat(retries=3, gap=1.0):
+    """把个人微信主窗口激活到前台并返回 (hwnd, title)。找不到/激活失败则抛错。
+
+    retries：页面切换/树物化期间窗口枚举可能**瞬时**失败（2026-10-16 实测：
+    切回聊天页后立刻枚举不到窗口，而微信明明开着），重试几次再认输。
+    """
+    err = ""
+    for i in range(max(1, int(retries))):
+        wins = find_wechat_windows()
+        if wins:
+            hwnd, title = wins[0]
+            if _activate(hwnd):
+                return hwnd, title
+            err = ("无法把微信窗口激活到前台（当前前台是 %r）。"
+                   "可能原因：微信刚启动未就绪 / 系统前台限制。"
+                   "请手动点一下微信窗口再重试。" % _foreground_desc())
+        else:
+            err = ("找不到个人微信窗口（已自动排除企业微信/浏览器页面）。"
+                   "请确认个人微信已登录并打开；可用 --inspect 查看当前识别到的窗口。"
+                   + _rejected_candidates_desc())
+        if i < retries - 1:
+            time.sleep(gap)
+    raise RuntimeError(err)
+
+
+def wechat_is_foreground():
+    """当前前台窗口是否就是个人微信主窗（Qt515 类名或标题精确「微信」）。
+
+    用于「已在前台就别再激活」——refresh 刚聚焦过时重复枚举会撞上瞬时
+    竞态（2026-10-16：切回聊天页后立刻枚举不到窗口，其实前台就是微信）。
+    """
+    fg = _user32.GetForegroundWindow()
+    if not fg:
+        return False
+    cls = _class_of(fg)
+    if any(b in cls for b in _BROWSER_CLASSES):
+        return False
+    if _WECHAT_CLASS_HINT in cls:
+        return True
+    n = _user32.GetWindowTextLengthW(fg)
+    buf = ctypes.create_unicode_buffer(n + 1)
+    _user32.GetWindowTextW(fg, buf, n + 1)
+    return buf.value == "微信"
 
 
 def _require_foreground(hwnd):
@@ -190,6 +281,41 @@ def _require_foreground(hwnd):
             "微信未成为前台窗口（当前前台是 %r），已中止本次发送以防按键发错窗口。"
             "请先手动点一下微信窗口，再重跑脚本。" % buf.value
         )
+
+
+def switch_to_chat_page(require_list=True, settle=1.0, max_clicks=2):
+    """把微信主窗带回聊天页（控件树点左侧导航「微信」tab，复用库的 UIA 路线）。
+
+    为什么必须有：键盘发送流程（Ctrl+F 搜人 → 粘贴 → Enter）**只在聊天页
+    有效**。客户端停在朋友圈页时，会话列表/搜索框整片不渲染，Ctrl+F 直接
+    失效、后续步骤全废（2026-10-16 实测：朋友圈刷新后/用户手动逛朋友圈后
+    发送全挂）。库作者同样踩到——wechatauto 的 SwitchToMoments 会把主窗
+    留在朋友圈页，其 uia_driver.back_to_chat_tab 注释原话：「之后一切按
+    搜索框/消息列表走的操作静默失败」。所以不自己造轮子，直接调库。
+
+    require_list=True：保证回到**会话列表**（窄窗口开着会话时要点两次才退出
+    会话，库里已处理）；False 只保证回聊天页、保留原打开会话（备用能力，
+    当前流程（发消息前）只用默认 True）。
+
+    best-effort：失败只打印返回 False，不抛——调用方继续，真发送时随后的
+    _require_foreground + 定位失败会兜底暴露。
+    """
+    try:
+        from wechatauto.uia_driver import WeChatUIA
+        uia = WeChatUIA()
+        if not uia.ensure_window():
+            print("[ui] 切回聊天页失败：找不到微信主窗口或 UIA 树未物化")
+            return False
+        ok = uia.back_to_chat_tab(settle=settle, max_clicks=max_clicks,
+                                  require_list=require_list)
+        if ok:
+            print("[ui] 已通过控件树切回聊天页")
+        else:
+            print("[ui] 切回聊天页未确认（会话列表未出现），仍继续尝试发送")
+        return ok
+    except Exception as e:
+        print("[ui] 切回聊天页异常（不影响本次发送尝试）: %s" % e)
+        return False
 
 
 def load_config(path: str = CONFIG_PATH) -> dict:
@@ -243,10 +369,22 @@ class WeChatPCBot:
             time.sleep(self.delay)
 
     # ---------- 业务动作 ----------
-    def send_to_contact(self, name, message, conv_id=None):
+    def send_to_contact(self, name, message, conv_id=None, ui_timeout=None):
         """对一个联系人：搜索→进会话→发消息。execute 由 dry_run 控制。
         conv_id 传入微信 wxid 时，看板消息库按 wxid 归并会话（与收消息桥一致）；
-        省略时按 name 归并（手动 CLI 发送的兼容行为）。"""
+        省略时按 name 归并（手动 CLI 发送的兼容行为）。
+        ui_timeout：在 UI 门上排队等待的上限（秒）。调用方传「本条任务的剩余
+        时间预算」（auto_reply 的任务级超时），省略则用全局默认
+        （config.ui.lock_timeout_seconds）。
+
+        **整个键盘流程在 UI 门内串行执行**（2026-10-16 并发加固）：微信只有
+        一份 UI，auto_reply 自动回复与看板手动发送是**两个进程**，不加跨进程
+        互斥就会互相抢前台（按键发错窗口 / 朋友圈定位在聊天页白跑）。拿不到
+        门就排队等，不丢弃；等超时抛 UITimeoutError 交给调用方报错，不静默吞。
+        键盘序列本身（聚焦→切页→Ctrl+F→粘贴→Enter→等待发送节流）全部在门内，
+        包括发送后的 rhythm 节流等待——那段时间微信仍应独占前台，放出去会让
+        两条外发贴太近（风控）。
+        """
         plan = (
             f"聚焦微信窗口 → Ctrl+F 搜索 → 粘贴{name!r} → Enter 进会话 "
             f"→ 粘贴消息 → {_SEND_KEY} 发送 → 等待 {self.delay}s"
@@ -256,23 +394,32 @@ class WeChatPCBot:
             log.info("[DRY-RUN] 按键序列: %s", plan)
             return
         try:
-            hwnd, title = focus_wechat()
-            _require_foreground(hwnd)       # 关键：确保按键只发到微信，发错就中止
-            self._hotkey("ctrl", "f")       # 打开搜索
-            self._hotkey("ctrl", "a")       # 全选搜索框旧内容
-            self._paste(name)               # 粘贴要搜的名字
-            self._press("enter")            # 打开顶部搜索结果（需名字唯一）
-            time.sleep(0.6)
-            self._paste(message)            # 粘贴消息到会话输入框
-            self._send_keystroke()          # 发送
+            with ui_gate.hold("发送给 %s" % name, timeout=ui_timeout):
+                hwnd, title = focus_wechat()
+                _require_foreground(hwnd)   # 关键：确保按键只发到微信，发错就中止
+                switch_to_chat_page()       # 关键：Ctrl+F 只在聊天页有效（停在朋友圈页会静默失效）
+                _require_foreground(hwnd)   # 切页后再确认一次前台（双保险，历史事故教训）
+                self._hotkey("ctrl", "f")   # 打开搜索
+                self._hotkey("ctrl", "a")   # 全选搜索框旧内容
+                self._paste(name)           # 粘贴要搜的名字
+                self._press("enter")        # 打开顶部搜索结果（需名字唯一）
+                time.sleep(0.6)
+                self._paste(message)        # 粘贴消息到会话输入框
+                self._send_keystroke()      # 发送
             log.info("已发送消息给 %s", name)
-            # 写回统一消息库，供网页看板即时上屏（失败不影响已发送）
+            # 写回统一消息库，供网页看板即时上屏（失败不影响已发送；不碰 UI，
+            # 放在门外做，别白占 UI 锁）
             try:
                 store_add_message(conv_id or name, "me", message, name=name)
                 # 同时记 sent_log：收消息轮询再从库里读到这条自己的消息时跳过，避免双渲染
                 store_add_sent(conv_id or name, message)
             except Exception as e:
                 log.warning("写入看板消息库失败（不影响已发送）: %s", e)
+        except ui_gate.UITimeoutError as e:
+            # 排队超时＝有别的操作长时间占着微信。不吞：抛给调用方
+            # （看板手动发送要报错，自动回复要记日志本轮跳过）。
+            log.error("等待微信 UI 空闲超时，已取消本次发送(%s): %s", name, e)
+            raise
         except Exception as e:
             log.error("发送失败(%s): %s", name, e)
 

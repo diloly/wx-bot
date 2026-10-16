@@ -36,20 +36,20 @@
     padding: 1px 6px; margin-left: 8px; min-width: 18px; text-align: center;
   }
 
-  /* 每会话AI自动回复开关（右侧小toggle，默认关） */
-  .conv .sw { flex-shrink: 0; margin-left: 8px; cursor: pointer; }
-  .conv .sw input { display: none; }
-  .conv .sw .track {
+  /* 小toggle开关（每会话AI自动回复 / 朋友圈自动互动共用，默认关） */
+  .sw { flex-shrink: 0; margin-left: 8px; cursor: pointer; }
+  .sw input { display: none; }
+  .sw .track {
     display: block; width: 34px; height: 20px; border-radius: 10px;
     background: #555; position: relative; transition: background .15s;
   }
-  .conv .sw .track::after {
+  .sw .track::after {
     content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
     border-radius: 50%; background: #fff; transition: left .15s;
   }
-  .conv .sw input:checked + .track { background: #07c160; }
-  .conv .sw input:checked + .track::after { left: 16px; }
-  .conv .sw input:disabled + .track { opacity: .35; }
+  .sw input:checked + .track { background: #07c160; }
+  .sw input:checked + .track::after { left: 16px; }
+  .sw input:disabled + .track { opacity: .35; }
 
   /* 自动回复全局状态提示条（总开关未开时提醒，解释会话开关为何不生效） */
   .ar-banner {
@@ -149,6 +149,30 @@
   }
   .moment-empty { padding: 40px 20px; text-align: center; color: #777; font-size: 13px; line-height: 1.8; }
 
+  /* 右栏：自动互动管理面板（「朋友圈」页默认视图：模拟/真跑 + 按客户开关） */
+  .msw-panel { max-width: 640px; margin: 0 auto; padding: 20px; }
+  .msw-card { background: #2f2f2f; border: 1px solid #3d3d3d; border-radius: 10px; padding: 14px 16px; margin-bottom: 14px; }
+  .msw-card h3 { font-size: 14px; color: #eee; margin: 0 0 6px; font-weight: 600; }
+  .msw-title { font-size: 12px; color: #9a9a9a; margin-bottom: 10px; line-height: 1.7; }
+  .msw-title b { color: #ddd; }
+  .msw-sec { font-size: 12px; color: #777; padding: 6px 2px; }
+  .msw-dry { display: flex; align-items: center; gap: 12px; }
+  .msw-dry .msw-dry-txt { flex: 1; font-size: 12px; color: #9a9a9a; line-height: 1.7; }
+  .msw-dry .msw-dry-txt b { color: #ddd; }
+  .msw-row { display: flex; align-items: center; padding: 8px 0; }
+  .msw-row + .msw-row { border-top: 1px solid #3d3d3d; }
+  .msw-name {
+    flex: 1; min-width: 0; font-size: 13px; color: #fff;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-right: 8px;
+  }
+  .msw-row .sw { margin-left: 10px; }
+  .msw-row .sw-tag { font-size: 11px; color: #9a9a9a; margin-left: 5px; }
+  /* 圈详情顶栏：返回互动管理 + 模式标签 */
+  .md-topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+  .md-mode { font-size: 11px; padding: 3px 10px; border-radius: 10px; cursor: pointer; }
+  .md-mode.sim { background: #eef3ff; color: #3a5a9a; }
+  .md-mode.real { background: #e8f9ee; color: #0a7a3d; }
+
   /* 右栏：圈详情 */
   .moment-detail { max-width: 620px; margin: 0 auto; padding: 20px; }
   .md-card { background: #fff; border-radius: 10px; padding: 18px 20px; }
@@ -204,12 +228,6 @@
   .inter-card .ic-row b { color: #576b95; font-weight: 500; }
   .inter-card .ic-row .ic-time { color: #b0b0b0; font-size: 11px; margin-left: 6px; }
   /* dry-run 提示条 */
-  .md-drybar {
-    background: #fff7e0; color: #8a6d1a; font-size: 12px; line-height: 1.6;
-    padding: 9px 14px; border-radius: 8px; margin-bottom: 14px;
-  }
-  .md-drybar b { cursor: pointer; text-decoration: underline; }
-
   /* 引用回复（type 57）：引用块 + 回复正文 */
   .quote-card { width: 300px; }
   .quote-ref {
@@ -602,6 +620,7 @@ function fmtTime(ts){
 let activeTab = 'chat';        // 'chat' | 'moment'
 let momentData = null;         // /api/moments 最近一次响应
 let activeMoment = null;       // 当前打开的圈 tid
+let momentView = 'panel';      // 'panel'=自动互动管理 | 'detail'=圈详情
 let momentSigs = '';           // 增量渲染签名（与消息区同理，免打扰复制/滚动）
 
 function switchTab(tab) {
@@ -615,6 +634,7 @@ function switchTab(tab) {
   document.getElementById('momentPane').style.display = tab === 'moment' ? '' : 'none';
   if (tab === 'moment') {
     document.getElementById('emptyTip').style.display = 'none';
+    momentView = 'panel';      // 进朋友圈页默认落在「互动管理」面板
     loadMoments();
   } else {
     document.getElementById('emptyTip').style.display = activeConv ? 'none' : 'flex';
@@ -622,12 +642,9 @@ function switchTab(tab) {
 }
 
 async function loadMoments() {
-  if (activeTab !== 'moment') {
-    // 非朋友圈 tab 也刷一次（为了红点角标），但不渲染面板
-  }
   const res = await fetch('/api/moments');
   const data = await res.json();
-  const sig = JSON.stringify([data.moments, data.interactions, data.unread_inter, data.dry_run]);
+  const sig = JSON.stringify([data.moments, data.interactions, data.unread_inter, data.dry_run, data.switches]);
   // 红点角标：两个 tab 都要更新
   const badge = document.getElementById('momentBadge');
   if (data.unread_inter > 0) {
@@ -641,36 +658,114 @@ async function loadMoments() {
   momentSigs = sig;
   momentData = data;
 
+  // 左栏：纯新圈列表（开关面板在右栏，不再塞这里）
   const box = document.getElementById('momentList');
   const ms = data.moments || [];
   if (!ms.length) {
-    box.innerHTML = `<div class="moment-empty">还没有关注客户的新圈。<br>
-      在 config.json 的 <b>moment.watch</b> 里填客户 wxid（空=只监控不互动）；<br>
-      新圈由 auto_reply.py 每约 60 秒拉取一次。</div>`;
-    return;
+    box.innerHTML = `<div class="moment-empty">还没有朋友圈数据。<br>
+      新圈由 auto_reply.py 每约 60 秒拉取一次；<br>
+      也可手动跑 <b>python moment_ops.py --poll</b> 立即拉一次。</div>`;
+  } else {
+    box.innerHTML = '';
+    for (const m of ms) {
+      const div = document.createElement('div');
+      div.className = 'moment-item' + (String(m.tid) === String(activeMoment) ? ' active' : '');
+      div.innerHTML = `
+        <div class="m-avatar">${esc((m.nickname || '?').slice(0, 1))}</div>
+        <div class="m-meta">
+          <div class="m-name">${esc(m.nickname || m.username)}<span class="m-time">${fmtTime(m.create_time)}</span></div>
+          <div class="m-text">${esc(m.text || '')}</div>
+        </div>`;
+      div.onclick = () => openMoment(m.tid);
+      box.appendChild(div);
+    }
   }
-  box.innerHTML = '';
-  for (const m of ms) {
-    const div = document.createElement('div');
-    div.className = 'moment-item' + (String(m.tid) === String(activeMoment) ? ' active' : '');
-    div.innerHTML = `
-      <div class="m-avatar">${esc((m.nickname || '?').slice(0, 1))}</div>
-      <div class="m-meta">
-        <div class="m-name">${esc(m.nickname || m.username)}<span class="m-time">${fmtTime(m.create_time)}</span></div>
-        <div class="m-text">${esc(m.text || '')}</div>
-      </div>`;
-    div.onclick = () => openMoment(m.tid);
-    box.appendChild(div);
-  }
-  // 若打开的圈已被选中/失效，刷新右栏
-  if (activeMoment) {
+  // 右栏：详情视图（圈还在就继续显示，被水印挤没了就回管理面板）/ 管理面板
+  if (momentView === 'detail' && activeMoment) {
     const cur = ms.find(m => String(m.tid) === String(activeMoment));
-    if (cur) renderMomentPane(data, cur);
+    if (cur) { renderMomentPane(data, cur); return; }
+    momentView = 'panel';
+  }
+  renderMomentPanel(data);
+}
+
+// 右栏默认视图：自动互动管理（模拟/真跑开关 + 按客户赞/评开关，默认全关）
+function renderMomentPanel(data) {
+  const pane = document.getElementById('momentPane');
+  const ms = data.moments || [];
+  const sws = data.switches || {};
+  // 客户集合 = 最近有新圈的 + 有开关记录的（开了开关的客户不会因暂无新圈从面板消失）
+  const pubs = {};
+  for (const m of ms) {
+    const u = m.username || '';
+    if (u && !pubs[u]) pubs[u] = m.nickname || u;
+  }
+  for (const u of Object.keys(sws)) {
+    if (!pubs[u]) pubs[u] = sws[u].nickname || u;
+  }
+  const names = Object.keys(pubs).sort((a, b) =>
+    String(pubs[a] || '').localeCompare(String(pubs[b] || ''), 'zh'));
+  const dryTxt = data.dry_run
+    ? `当前 <b>模拟模式（dry-run）</b>：点赞/评论只验证「能定位到目标圈」，不会真的点、真的发。<br>
+       演练无误后关掉它切真跑（仍受每日 ${data.max_actions} 次上限 + 连发冷却保护）。<br>
+       注意：这是朋友圈独立开关，与 auto_reply.py 的 --no-dry（消息回复）互不影响。`
+    : `当前 <b>真跑模式</b>：点赞/评论会真实执行（每日上限 ${data.max_actions} 次 + 连发冷却）。<br>
+       想先演练的话打开模拟开关。`;
+  pane.innerHTML = `
+    <div class="msw-panel">
+      <div class="msw-card">
+        <h3>模拟 / 真跑</h3>
+        <div class="msw-dry">
+          <span class="msw-dry-txt">${dryTxt}</span>
+          <label class="sw" title="开=模拟（只验证定位，不真点不发）"><input type="checkbox" ${data.dry_run ? 'checked' : ''}
+            onchange="setMomentDry(this.checked)"><span class="track"></span></label>
+        </div>
+      </div>
+      <div class="msw-card">
+        <h3>自动互动（按客户）</h3>
+        <div class="msw-title">给客户开<b>赞</b>：他之后新发的圈自动点赞；开<b>评</b>：自动评论（文案由小光按销售人设生成）。<br>
+          默认全关；只对开后<b>新到</b>的圈生效，不补赞旧圈。<b>评论不可逆，慎开。</b></div>
+        ${names.length ? names.map(u => {
+          const s = sws[u] || {};
+          return `<div class="msw-row">
+            <span class="msw-name" title="${esc(u)}">${esc(pubs[u])}</span>
+            <span class="sw-tag">赞</span>
+            <label class="sw" title="新圈自动点赞"><input type="checkbox" ${s.auto_like ? 'checked' : ''}
+              onchange="toggleMomentSwitch(this,'${esc(u)}','like')"><span class="track"></span></label>
+            <span class="sw-tag">评</span>
+            <label class="sw" title="新圈自动评论（不可逆）"><input type="checkbox" ${s.auto_comment ? 'checked' : ''}
+              onchange="toggleMomentSwitch(this,'${esc(u)}','comment')"><span class="track"></span></label>
+          </div>`;
+        }).join('') : '<div class="msw-sec">还没有可管理的客户（等有客户发了新圈，行就会出现在这里）。</div>'}
+      </div>
+    </div>`;
+}
+
+function showMomentPanel() {
+  momentView = 'panel';
+  if (momentData) renderMomentPanel(momentData);
+}
+
+async function toggleMomentSwitch(inputEl, username, field) {
+  const on = inputEl.checked;
+  const row = inputEl.closest('.msw-row');
+  const nick = row ? ((row.querySelector('.msw-name') || {}).textContent || '').trim() : '';
+  try {
+    const res = await fetch('/api/moment/switch', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username: username, field: field, enabled: on, nickname: nick})
+    });
+    const d = await res.json();
+    if (!d.ok) { inputEl.checked = !on; showToast('err', d.error || '设置失败'); }
+  } catch (e) {
+    inputEl.checked = !on;
+    showToast('err', '请求失败：' + e);
   }
 }
 
 function openMoment(tid) {
   activeMoment = tid;
+  momentView = 'detail';
   const ms = (momentData && momentData.moments) || [];
   const cur = ms.find(m => String(m.tid) === String(tid));
   if (cur && momentData) renderMomentPane(momentData, cur);
@@ -710,21 +805,17 @@ function renderMomentPane(data, m) {
       </div>`
     : '';
 
-  // dry-run 提示条 + 切换真跑入口
-  const dryHtml = data.dry_run
-    ? `<div class="md-drybar">当前是 <b>模拟模式（dry-run）</b>：点赞/评论只验证「能定位到目标圈」，不会真的点。
-       确认无误后点这里 <b onclick="setMomentDry(false)">切换到真跑</b>（仍受白名单+每日 ${data.max_actions} 次上限保护）。</div>`
-    : `<div class="md-drybar" style="background:#e8f9ee;color:#0a7a3d">当前是 <b>真跑模式</b>：点赞/评论会真实执行（每日上限 ${data.max_actions} 次）。
-       只想演练的话点 <b onclick="setMomentDry(true)">切回模拟</b>。</div>`;
-
-  const watchHtml = !data.watch_count
-    ? `<div class="md-drybar" style="background:#eef3ff;color:#3a5a9a">config.json 的 moment.watch 为空：现在只能对<b>自己的</b>朋友圈练习点赞/评论，客户的新圈只看不动。填上客户 wxid 后才能互动。</div>`
-    : '';
+  // 顶栏：返回互动管理 + 当前模式标签（点标签回面板切模拟/真跑）
+  const modeChip = data.dry_run
+    ? `<span class="md-mode sim" onclick="showMomentPanel()" title="点它去「互动管理」切换模拟/真跑">模拟模式</span>`
+    : `<span class="md-mode real" onclick="showMomentPanel()" title="点它去「互动管理」切换模拟/真跑">真跑模式</span>`;
 
   pane.innerHTML = `
     <div class="moment-detail">
-      ${dryHtml}
-      ${watchHtml}
+      <div class="md-topbar">
+        <button class="md-btn ghost" onclick="showMomentPanel()">← 互动管理</button>
+        ${modeChip}
+      </div>
       ${interHtml}
       <div class="md-card">
         <div class="md-head">
