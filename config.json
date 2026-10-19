@@ -29,11 +29,12 @@
   "auto_reply": {
     "enabled": true,
     "dry_run": true,
-    "interval_seconds": 10,
+    "interval_seconds": 5,
     "intent": "你正在微信上回复客户发来的消息，目的是激活客户（让沉默的客户愿意重新聊、在用的愿意续费扩购）。语气自然、简洁、口语化，像真人一对一聊天；客户问的产品细节只引用系统提示词里给的资料，资料没有的说'我确认一下再回复你'，不编造。只输出回复正文，不要解释。",
     "contacts": [],
     "allow_groups": false,
-    "merge_window_seconds": 8,
+    "merge_window_seconds": 10,
+    "confirm_timeout_seconds": 6,
     "context_turns": 3,
     "context_hours": 6,
     "rhythm": "natural",
@@ -52,6 +53,20 @@
     "refresh_interval": 180,
     "refresh_dwell": 4,
     "task_timeout_seconds": 120
+  },
+  "add_friend": {
+    "enabled": false,
+    "daily_limit": 10,
+    "interval_min_seconds": 480,
+    "interval_max_seconds": 900,
+    "work_start_hour": 9,
+    "work_end_hour": 21,
+    "weekend_factor": 0.5,
+    "max_consecutive_failures": 3,
+    "retry_days": 30,
+    "first_touch_delay_min": 60,
+    "first_touch_delay_max": 120,
+    "first_touch_intent": ""
   },
   "ui": {
     "lock_timeout_seconds": 180

@@ -484,12 +484,25 @@ def msg_text(m):
 
 def msg_key_of(m, user):
     """每条消息一个稳定 key，供 monitor_store 去重。
-    get_messages 的 dict 不含 server_id，local_id 在会话内唯一，优先用它。"""
+
+    **必须带 create_time**：local_id 只是「会话内自增」，不是全局唯一。
+    删好友后重新加、或清空会话时，微信会**重建该会话**，local_id 从 1
+    重新数（2026-10-19 实测：删好友重加后库里 local_id 变成 1/2/3/4，
+    而 9 月那次会话早已存过同 key 的旧记录 → 哈希唯一索引冲突 →
+    INSERT OR IGNORE 静默丢弃，客户发的「你是谁」「hello?」全都没入库，
+    AI 自然无从触发）。带上 create_time 后，同 local_id 不同时间的消息
+    是两个不同的 key，重建会话不再互相顶掉。
+
+    create_time 是消息固有属性、跨轮询稳定，所以去重仍然有效；
+    万一缺失就退回不含时间的老形态（宁可偶尔重复，不能永久丢消息）。
+    """
+    ct = m.get("create_time")
+    ct = "" if ct in (None, "", 0, "0") else str(ct)
     for k in ("local_id", "server_id"):
         v = m.get(k)
         if v:
-            return "%s|%s" % (user, v)
-    return "%s|%s|%s|%s" % (user, m.get("create_time"), m.get("sender_id"), m.get("content"))
+            return "%s|%s|%s" % (user, v, ct) if ct else "%s|%s" % (user, v)
+    return "%s|%s|%s|%s" % (user, ct, m.get("sender_id"), m.get("content"))
 
 
 def norm_ts(ts):
@@ -603,7 +616,7 @@ def poll_new(db, progress=False):
                 if monitor_store.add_message(
                     conv_id=user, role=role, text=text, ts=ts,
                     raw=raw, name=name, msg_key=msg_key_of(m, user),
-                    media=media_rel, card=card_json,
+                    media=media_rel, card=card_json, dedupe_loose=True,
                 ):
                     new_items.append({
                         "conv_id": user, "name": name, "text": text,
@@ -719,10 +732,20 @@ def main():
     ap.add_argument("--no-scroll-original", action="store_true",
                     help="配合 --original：只在当前屏幕可见区找原图，不滚动消息列表"
                          "（找不到就跳过，绝不打扰界面）")
+    ap.add_argument("--reset-cursor", metavar="CONV_ID",
+                    help="重置某会话的轮询水印，下一轮会重建基线（重读最近 50 条，"
+                         "已入库的按宽松判重跳过）。传 all 重置全部。"
+                         "用于「微信重建了会话（删好友重加/清空），新消息入不了库」")
     args = ap.parse_args()
 
     monitor_store.init()
     print("[*] 库存统计: %s" % monitor_store.stats())
+    if args.reset_cursor:
+        target = None if args.reset_cursor.lower() == "all" else args.reset_cursor
+        n = monitor_store.reset_cursor(target)
+        print("[*] 已重置 %d 个会话的水印（%s）；下一次轮询会重建基线"
+              % (n, "全部" if target is None else target))
+        return
     try:
         db = WeChatDB()
         me = db.get_self_info()
