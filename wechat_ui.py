@@ -65,6 +65,28 @@ CONFIG_PATH = "config.json"
 
 # 发消息用的「发送键」。默认 Enter；若微信设成 Ctrl+Enter 发送，改成 ("ctrl", "enter")
 _SEND_KEY = "enter"
+
+
+class SendNotVerified(Exception):
+    """键盘流程跑完了，但回去查微信库没看到这条消息 —— 判定「没真正发出」。
+
+    为什么需要这个异常（2026-10-19 实测事故）：Qt 渲染版微信用键盘驱动发送，
+    Enter 可能按在一个**没聚焦的输入框**上，全程不抛任何异常；调用方于是以为
+    发送成功，看板写了「已发送」、任务标 sent，而微信客户端里什么都没有。
+    既然读不到输入框状态，唯一可靠的判据就是**回读微信库**。
+    """
+
+
+class SendUnconfirmed(Exception):
+    """消息可能发出去了，但**没法确认**（回读微信库不可用）。
+
+    和 SendNotVerified 的区别：那个是「查了，确实没有」；这个是「查不了，
+    不知道有没有」。处理方式也不同——
+      · 不写库：看板不能凭空多一条没证据的消息（用户口径：真实发出才落库）。
+      · 不重试：可能已经发出去了，重发就是给客户发两遍（发送不可逆，更糟）。
+    结果就是任务落 failed + reason 标「无法确认」，留给人工核对。
+    """
+
 # 搜索/输入之间的安全间隔（秒），太短微信吃不到按键
 _STEP_GAP = 0.4
 
@@ -369,13 +391,21 @@ class WeChatPCBot:
             time.sleep(self.delay)
 
     # ---------- 业务动作 ----------
-    def send_to_contact(self, name, message, conv_id=None, ui_timeout=None):
+    def send_to_contact(self, name, message, conv_id=None, ui_timeout=None, by="manual",
+                        confirm=None):
         """对一个联系人：搜索→进会话→发消息。execute 由 dry_run 控制。
         conv_id 传入微信 wxid 时，看板消息库按 wxid 归并会话（与收消息桥一致）；
         省略时按 name 归并（手动 CLI 发送的兼容行为）。
+        by：写回消息库时标注发送方——'ai'（auto_reply 自动回复）/ 'manual'
+        （看板或 CLI 人工发）。看板据此在气泡旁打 AI/人工 小标。
         ui_timeout：在 UI 门上排队等待的上限（秒）。调用方传「本条任务的剩余
         时间预算」（auto_reply 的任务级超时），省略则用全局默认
         （config.ui.lock_timeout_seconds）。
+        confirm：**发送结果校验回调** `confirm(conv_id, message) -> bool`。
+        键盘动作跑完不等于消息真的出去了（Enter 可能按在没聚焦的输入框上，
+        全程不抛异常）。传了回调就**先校验、通过才写库**；校验不过抛
+        SendNotVerified，调用方据此把任务落 failed，而不是记一条假成功。
+        回读数据库由调用方负责，本函数不持有连接。
 
         **整个键盘流程在 UI 门内串行执行**（2026-10-16 并发加固）：微信只有
         一份 UI，auto_reply 自动回复与看板手动发送是**两个进程**，不加跨进程
@@ -417,17 +447,48 @@ class WeChatPCBot:
                 time.sleep(0.6)
                 self._paste(message)        # 粘贴消息到会话输入框
                 self._send_keystroke()      # 发送
-            log.info("已发送消息给 %s", name)
+            # 注意：这里**不**打「已发送」——键盘动作跑完只代表按了键，
+            # 真正算不算发出去要看下面的回读校验。日志必须与真实结果一致，
+            # 否则排查时会被一行"已发送"带偏。
+            # 发送结果校验：键盘序列跑完 ≠ 消息真出去了（见 SendNotVerified）。
+            # 放在 UI 门外做——回读数据库不占微信锁，且此时按键已经完成，别人
+            # 抢前台也不会把这条已排进微信发送队列的消息弄丢。
+            # 三态：True=确认到 → 写库；False=查了没有 → 未发出；None=查不了
+            # → 无法确认（既不写库也不重发，交人工核对）。
+            if confirm is not None:
+                try:
+                    verified = confirm(conv_id or name, message)
+                except Exception as e:      # noqa: BLE001
+                    log.warning("发送校验回调异常，按「无法确认」处理: %s", e)
+                    verified = None
+                if verified is None:
+                    raise SendUnconfirmed(
+                        "回读微信库不可用，无法确认是否发出：%r" % (message[:24],))
+                if not verified:
+                    raise SendNotVerified(
+                        "微信库里没查到这条消息，按未发出处理：%r" % (message[:24],))
             # 写回统一消息库，供网页看板即时上屏（失败不影响已发送；不碰 UI，
             # 放在门外做，别白占 UI 锁）
             try:
-                store_add_message(conv_id or name, "me", message, name=name)
+                store_add_message(conv_id or name, "me", message, name=name, sent_by=by)
             except Exception as e:
                 log.warning("写入看板消息库失败（不影响已发送）: %s", e)
+            # 到这里才是「回读确认过 + 已落库」，日志和账本含义一致
+            log.info("已发送并确认(%s)", name)
         except ui_gate.UITimeoutError as e:
             # 排队超时＝有别的操作长时间占着微信。不吞：抛给调用方
             # （看板手动发送要报错，自动回复要记日志本轮跳过）。
             log.error("等待微信 UI 空闲超时，已取消本次发送(%s): %s", name, e)
+            raise
+        except SendNotVerified as e:
+            # 这一步**必须**往外抛：调用方要据此把任务标失败、不能记成已发送。
+            # 也不能落到下面的 Exception 分支被「发送失败」四个字糊过去——
+            # 它跟「键盘流程抛异常」是两种完全不同的故障。
+            log.error("发送未确认(%s): %s", name, e)
+            raise
+        except SendUnconfirmed as e:
+            # 同上：必须让调用方看见，且不能写库（真实发出才落库）。
+            log.error("发送无法确认(%s): %s", name, e)
             raise
         except Exception as e:
             log.error("发送失败(%s): %s", name, e)

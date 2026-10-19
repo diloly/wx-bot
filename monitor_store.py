@@ -76,7 +76,8 @@ def _init_schema(path=None):
             raw     TEXT,
             msg_hash TEXT,
             media   TEXT,           -- 媒体文件相对路径（wechat_media/ 下，图片/视频/文件）
-            card    TEXT            -- 链接/文件卡片 JSON（title/descr/url/thumb/kind）
+            card    TEXT,           -- 链接/文件卡片 JSON（title/descr/url/thumb/kind）
+            sent_by TEXT            -- 'ai' 自动回复 | 'manual' 看板手发 | NULL 未知（历史/手机端）
         );
         CREATE TABLE IF NOT EXISTS sent_log (
             conv_id TEXT,
@@ -143,10 +144,36 @@ def _init_schema(path=None):
         CREATE INDEX IF NOT EXISTS idx_task_status ON reply_task(status, id);
         CREATE INDEX IF NOT EXISTS idx_task_updated ON reply_task(updated);
         CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages(conv_id, ts);
+        -- 加好友名单/队列（2026-10-19）
+        -- 一张表既是名单也是队列：CSV 导入 → pending → worker 逐个处理 → sent。
+        -- status: pending / sent / passed / rejected / already / failed / expired
+        CREATE TABLE IF NOT EXISTS friend_task (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            keyword   TEXT NOT NULL,                  -- 手机号或微信号（搜索框认这两种）
+            name      TEXT,                           -- 称呼/备注名，日志与话术用
+            note      TEXT,                           -- 背景：哪来的、聊过什么（喂 AI）
+            source    TEXT,                           -- 工作坊/转介绍/展会（挑申请语变体）
+            status    TEXT DEFAULT 'pending',
+            reason    TEXT,                           -- 失败原因（面板展示）
+            conv_id   TEXT,                           -- 通过后回填的 username
+            sent_at   INTEGER,                        -- 发出申请的时刻
+            passed_at INTEGER,                        -- 检测到通过的時刻
+            tries     INTEGER DEFAULT 0,              -- 技术失败重试次数
+            created   INTEGER,
+            updated   INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_friend_status ON friend_task(status, id);
+        CREATE INDEX IF NOT EXISTS idx_friend_sent ON friend_task(sent_at);
+        -- 运行期开关（看板改、auto_reply 每轮读）。为什么不写 config.json：
+        -- 那是另一个进程启动时读的，改了要重启才生效；开关要「点一下立刻停」。
+        CREATE TABLE IF NOT EXISTS app_setting (
+            k TEXT PRIMARY KEY,
+            v TEXT
+        );
         """
     )
-    # 老库可能没有 msg_hash / media / card 列，补齐（ALTER 不支持 IF NOT EXISTS，用异常吞掉已存在）
-    for col in ("msg_hash", "media", "card"):
+    # 老库可能没有 msg_hash / media / card / sent_by 列，补齐（ALTER 不支持 IF NOT EXISTS，用异常吞掉已存在）
+    for col in ("msg_hash", "media", "card", "sent_by"):
         try:
             conn.execute("ALTER TABLE messages ADD COLUMN %s TEXT" % col)
         except sqlite3.OperationalError:
@@ -159,6 +186,22 @@ def _init_schema(path=None):
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_hash ON messages(msg_hash)"
     )
+    # 一次性回填：sent_by 是 2026-10-19 才加的列，此前的自动回复都没有标记。
+    # 用 reply_task 账本反查（同会话 + 文案完全相同）把历史 AI 回复补成 'ai'。
+    # 只补 IS NULL 的、只认完全一致的文案——宁可留空也不乱标（人工发的没账本，
+    # 补不上就保持 NULL，看板不显示标记）。幂等：补过的不会再命中。
+    try:
+        cur = conn.execute(
+            "UPDATE messages SET sent_by='ai' "
+            "WHERE role='me' AND sent_by IS NULL AND EXISTS ("
+            "  SELECT 1 FROM reply_task t "
+            "  WHERE t.conv_id = messages.conv_id AND t.reply = messages.text)"
+        )
+        if cur.rowcount and cur.rowcount > 0:
+            print("[monitor_store] 已回填 %d 条历史消息的发送方标记（sent_by=ai）"
+                  % cur.rowcount)
+    except sqlite3.OperationalError:
+        pass
     # 一次性迁移：moment_cursor.last_tid 早先按 INTEGER 建（微信 tid 是 20 位
     # 大数、超 int64，INTEGER 列存不下），改为 TEXT。水位丢了最多多拉一轮，
     # add_moment 按 tid 去重，无副作用。幂等。
@@ -193,9 +236,14 @@ def stats():
 
 
 def add_message(conv_id, role, text, ts=None, raw=None, name=None, msg_key=None,
-                media=None, card=None):
+                media=None, card=None, sent_by=None, dedupe_loose=False):
     """写入一条消息。msg_key 用于去重（如微信 MsgSvrID）；缺省则用 会话+角色+时间+内容 推算。
     media=媒体文件相对路径（wechat_media/ 下）；card=链接/文件卡片 JSON。
+    sent_by：role='me' 时标注是谁发的——'ai'（auto_reply 自动回复）/ 'manual'
+    （看板手发）；收消息桥与手机端发的不传，保持 NULL（看板不显示标记）。
+    dedupe_loose：额外按 (会话+时间+角色+文本) 判重。收消息桥用——msg_key 的
+    算法在 2026-10-19 换过（加了 create_time），老记录的 msg_hash 是旧算法算的，
+    重建基线时算不出同一个 hash，会把这些消息当新的重复入库。
     返回是否真正新增（被去重跳过则返回 False）。"""
     ts = ts or int(time.time())
     if msg_key is None:
@@ -209,10 +257,17 @@ def add_message(conv_id, role, text, ts=None, raw=None, name=None, msg_key=None,
             (conv_id, name),
         )
         cur.execute("UPDATE conversations SET name=? WHERE conv_id=?", (name, conv_id))
+    # 宽松二次判重：见 dedupe_loose 说明。索引 idx_msg_conv(conv_id, ts) 覆盖。
+    if dedupe_loose and cur.execute(
+        "SELECT 1 FROM messages WHERE conv_id=? AND ts=? AND role=? AND text=? LIMIT 1",
+        (conv_id, ts, role, text),
+    ).fetchone():
+        conn.close()
+        return False
     cur.execute(
-        "INSERT OR IGNORE INTO messages(conv_id, role, text, ts, raw, msg_hash, media, card) "
-        "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
-        (conv_id, role, text, ts, raw, h, media, card),
+        "INSERT OR IGNORE INTO messages(conv_id, role, text, ts, raw, msg_hash, media, card, sent_by) "
+        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (conv_id, role, text, ts, raw, h, media, card, sent_by),
     )
     inserted = cur.rowcount > 0
     if inserted:
@@ -322,6 +377,20 @@ def set_cursor(conv_id, last_time, max_seq):
     conn.close()
 
 
+def reset_cursor(conv_id=None):
+    """删除某会话（conv_id=None 则全部）的轮询水印，下一轮 poll_new 会重建基线。
+    用于「消息被去重挡掉、水印却已经推过去」的补救（如微信重建会话）。"""
+    conn = init()
+    if conv_id:
+        cur = conn.execute("DELETE FROM poll_cursor WHERE conv_id=?", (conv_id,))
+    else:
+        cur = conn.execute("DELETE FROM poll_cursor")
+    n = cur.rowcount or 0
+    conn.commit()
+    conn.close()
+    return n
+
+
 def clear_unread(conv_id):
     conn = init()
     conn.execute("UPDATE conversations SET unread=0 WHERE conv_id=?", (conv_id,))
@@ -371,7 +440,7 @@ def get_messages(conv_id, limit=300, since_ts=None):
     """
     conn = _conn()
     sql = ("SELECT * FROM ("
-           "SELECT role, text, ts, media, card FROM messages WHERE conv_id=?")
+           "SELECT role, text, ts, media, card, sent_by FROM messages WHERE conv_id=?")
     params = [conv_id]
     if since_ts:
         sql += " AND ts>=?"
@@ -381,6 +450,30 @@ def get_messages(conv_id, limit=300, since_ts=None):
     rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
     conn.close()
     return rows
+
+
+def recent_messages_matching(patterns, since_ts, limit=200):
+    """找 since_ts 之后、文本命中任一 pattern 的消息（按 ts 正序返回）。
+
+    用途：启动时补跑「好友通过」事件。这类事件原本只在消息**新入库那一刻**
+    被 auto_reply 的 collect 触发，进程没开、或归属判定把事件吞掉，这次通过
+    就永久丢了——客户通过了却永远收不到第一条消息。
+    """
+    pats = [p for p in (patterns or []) if p]
+    if not pats:
+        return []
+    where = " OR ".join(["text LIKE ?"] * len(pats))
+    params = ["%" + p + "%" for p in pats]
+    conn = _conn()
+    try:
+        rows = conn.execute(
+            "SELECT conv_id, role, text, ts FROM messages "
+            "WHERE ts>=? AND (%s) ORDER BY ts ASC LIMIT ?" % where,
+            [int(since_ts)] + params + [int(limit)],
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 
 # ==================== 朋友圈（moment_ops 的数据落地） ====================
@@ -660,5 +753,223 @@ def expire_open_tasks(reason="进程重启，任务作废"):
             (reason, int(time.time())) + TASK_OPEN)
         conn.commit()
         return cur.rowcount or 0
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 加好友：名单 / 队列 / 通过检测（2026-10-19）
+#
+# 状态机：pending → sent → passed
+#                 └→ failed（技术执行失败，可重试）
+#         already（已在通讯录，跳过） / rejected（对方拒绝） / expired（长期未通过）
+#
+# **「未通过」不是失败**：发完即走，状态停在 sent，不占队列、不阻塞。
+# failed 只表示这一次的技术执行挂了（搜不到人/找不到按钮/界面异常）。
+# ---------------------------------------------------------------------------
+FRIEND_OPEN = ("pending", "sent")
+FRIEND_DONE = ("passed", "rejected", "already", "failed", "expired")
+_FRIEND_COLS = {"keyword", "name", "note", "source", "status", "reason",
+                "conv_id", "sent_at", "passed_at", "tries"}
+
+
+def add_friend_task(keyword, name=None, note=None, source=None, retry_days=30):
+    """把一条名单入队。返回 (id, 跳过原因)；成功入队时原因为 None。
+
+    去重规则（直接决定会不会给同一个人发两次申请）：
+      ① 同关键词已有 pending/sent → 跳过（还在流程里）；
+      ② 同关键词在 retry_days 天内 failed/expired/rejected → 跳过（别反复骚扰）。
+    已 passed/already 的不拦：那是很久以前的事，用户可能想再联系（由人判断）。
+    """
+    kw = (keyword or "").strip()
+    if not kw:
+        return None, "空关键词"
+    now = int(time.time())
+    conn = init()
+    try:
+        row = conn.execute(
+            "SELECT id, status FROM friend_task WHERE keyword=? AND status IN ('pending','sent') "
+            "ORDER BY id DESC LIMIT 1", (kw,)).fetchone()
+        if row:
+            return row["id"], "已在队列中(%s)" % row["status"]
+        since = now - int(retry_days) * 86400
+        row = conn.execute(
+            "SELECT id, status FROM friend_task WHERE keyword=? AND created>=? "
+            "AND status IN ('failed','expired','rejected') ORDER BY id DESC LIMIT 1",
+            (kw, since)).fetchone()
+        if row:
+            return row["id"], "%d 天内失败过(%s)" % (int(retry_days), row["status"])
+        cur = conn.execute(
+            "INSERT INTO friend_task(keyword, name, note, source, status, tries, "
+            "created, updated) VALUES(?, ?, ?, ?, 'pending', 0, ?, ?)",
+            (kw, name, note, source, now, now))
+        conn.commit()
+        return cur.lastrowid, None
+    finally:
+        conn.close()
+
+
+def update_friend_task(task_id, **kw):
+    """按字段更新（只认 _FRIEND_COLS 里的列，其余静默忽略）。"""
+    sets, params = ["updated=?"], [int(time.time())]
+    for k, v in kw.items():
+        if k in _FRIEND_COLS:
+            sets.append("%s=?" % k)
+            params.append(v)
+    params.append(int(task_id))
+    conn = init()
+    try:
+        conn.execute("UPDATE friend_task SET %s WHERE id=?" % ", ".join(sets), params)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_friend_pending(limit=1):
+    """取最老的 pending 名单项（FIFO）。"""
+    conn = _conn()
+    try:
+        rows = conn.execute(
+            "SELECT id, keyword, name, note, source, tries FROM friend_task "
+            "WHERE status='pending' ORDER BY id ASC LIMIT ?", (int(limit),)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_friend_sent(limit=5):
+    """最近的已发申请（用于把「通过」系统消息匹配回名单项）。"""
+    conn = _conn()
+    try:
+        rows = conn.execute(
+            "SELECT id, keyword, name, note, source, sent_at FROM friend_task "
+            "WHERE status='sent' ORDER BY sent_at DESC LIMIT ?", (int(limit),)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_friend_passed_pending_touch(limit=20, days=7):
+    """已通过、但首条激活**一条都没真正发出去**的名单项（启动补排用）。
+
+    为什么要它：首条激活失败（搜索词错、UI 排队超时、AI 生成失败）时任务落
+    failed，而 friend_task 早就是 passed 了——没人补排，这个客户就永远不会被
+    激活，用户只能删好友重加才能再试一次。
+
+    幂等靠 NOT EXISTS：只要存在一条 kind='first_touch' 且 status='sent' 的任务
+    就不再返回，不会重复打扰。days 限制只补最近通过的那批，避免把一个月前的
+    人突然翻出来打招呼。
+
+    **额外排除 reason 含「无法确认」的 failed**：那是「消息可能已经发出去了，
+    只是读库确认不了」，自动补排等于赌它没发出——赌输就是给客户发两遍。
+    这种留给人工核对（看板能看到失败原因）。
+    """
+    conn = _conn()
+    try:
+        cutoff = int(time.time()) - int(days) * 86400
+        rows = conn.execute(
+            "SELECT f.id, f.keyword, f.name, f.note, f.source, f.conv_id, f.passed_at "
+            "FROM friend_task f "
+            "WHERE f.status='passed' AND f.conv_id IS NOT NULL AND f.conv_id<>'' "
+            "  AND COALESCE(f.passed_at, 0) > ? "
+            "  AND NOT EXISTS (SELECT 1 FROM reply_task t WHERE t.conv_id=f.conv_id "
+            "                  AND t.kind='first_touch' "
+            "                  AND (t.status='sent' OR t.reason LIKE '%无法确认%')) "
+            "ORDER BY f.passed_at ASC LIMIT ?",
+            (cutoff, int(limit))).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_friend_tasks(limit=50):
+    """看板展示用（新→旧）。"""
+    conn = _conn()
+    try:
+        rows = conn.execute(
+            "SELECT id, keyword, name, note, source, status, reason, conv_id, "
+            "sent_at, passed_at, tries, created, updated FROM friend_task "
+            "ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def friend_counts():
+    conn = _conn()
+    try:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) AS c FROM friend_task GROUP BY status").fetchall()
+    finally:
+        conn.close()
+    out = {r["status"]: r["c"] for r in rows}
+    for s in FRIEND_OPEN + FRIEND_DONE:
+        out.setdefault(s, 0)
+    return out
+
+
+def friend_sent_today(day=None):
+    """今天已发出的申请数（按 sent_at 落在当天 0 点之后算）。
+
+    直接数 friend_task 行，不用额外计数器——计数器会漂移，行不会。
+    """
+    import datetime
+    d = day or datetime.date.today()
+    start = int(datetime.datetime(d.year, d.month, d.day).timestamp())
+    conn = _conn()
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) AS c FROM friend_task WHERE sent_at>=? "
+            "AND status IN ('sent','passed')", (start,)).fetchone()["c"]
+    finally:
+        conn.close()
+
+
+def conv_existed_before(conv_id, ts):
+    """这个会话在 ts 之前是否已有消息（= 是老联系人，不是刚通过的新好友）。"""
+    conn = _conn()
+    try:
+        return conn.execute(
+            "SELECT 1 FROM messages WHERE conv_id=? AND ts<? LIMIT 1",
+            (conv_id, int(ts))).fetchone() is not None
+    finally:
+        conn.close()
+
+
+def expire_stale_friend_tasks(days=7, reason="超过 %d 天未通过"):
+    """把久未通过的 sent 标 expired。只在启动时调一次，幂等。"""
+    import datetime
+    cutoff = int((datetime.datetime.now()
+                  - datetime.timedelta(days=int(days))).timestamp())
+    conn = init()
+    try:
+        cur = conn.execute(
+            "UPDATE friend_task SET status='expired', reason=?, updated=? "
+            "WHERE status='sent' AND sent_at<?",
+            (reason % int(days), int(time.time()), cutoff))
+        conn.commit()
+        return cur.rowcount or 0
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 运行期开关（看板 ↔ auto_reply 跨进程，不写 config.json）
+# ---------------------------------------------------------------------------
+def get_setting(k, default=None):
+    conn = _conn()
+    try:
+        row = conn.execute("SELECT v FROM app_setting WHERE k=?", (k,)).fetchone()
+        return row["v"] if row else default
+    finally:
+        conn.close()
+
+
+def set_setting(k, v):
+    conn = init()
+    try:
+        conn.execute("INSERT OR REPLACE INTO app_setting(k, v) VALUES(?, ?)",
+                     (k, "" if v is None else str(v)))
+        conn.commit()
     finally:
         conn.close()

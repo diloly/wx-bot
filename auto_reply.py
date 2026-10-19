@@ -53,6 +53,7 @@ auto_reply.py —— 自动回复闭环：实时收消息 -> 大模型生成 -> 
 """
 import argparse
 import queue
+import random
 import sys
 import threading
 import time
@@ -60,10 +61,20 @@ import time
 import monitor_store
 import ui_gate
 from ai_client import generate as ai_generate
-from wechat_ui import WeChatPCBot, load_config
+from wechat_ui import (WeChatPCBot, load_config, SendNotVerified,
+                       SendUnconfirmed)
 from wx_recv_bridge import poll_new, WeChatDB
 
 GROUP_SUFFIX = "@chatroom"
+
+# 「好友通过」的系统提示措辞（2026-10-19 查库实测存在的三种）。
+# **注意**：其中「我通过了你的朋友验证请求…」在库里 raw type 是「文本」，
+# 与客户真消息同类型——所以只能靠文案识别，不能只靠 type。
+FRIEND_PASS_PATTERNS = (
+    "我通过了你的朋友验证请求",
+    "你已添加了",
+    "以上是打招呼的消息",
+)
 
 
 class ReplyTask:
@@ -73,9 +84,10 @@ class ReplyTask:
     也算在预算里——这正是用户要的「对单条任务做限制」：一条任务不能因为前面
     排了别人就无限期挂着。
     """
-    __slots__ = ("id", "conv_id", "name", "text", "created", "deadline", "reply")
+    __slots__ = ("id", "conv_id", "name", "text", "created", "deadline", "reply",
+                 "kind")
 
-    def __init__(self, conv_id, name, text, timeout, task_id=None):
+    def __init__(self, conv_id, name, text, timeout, task_id=None, kind="reply"):
         self.id = task_id          # reply_task 表主键（落库后回填；None=未落库）
         self.conv_id = conv_id
         self.name = name
@@ -83,6 +95,7 @@ class ReplyTask:
         self.created = time.time()
         self.deadline = self.created + float(timeout)
         self.reply = None           # AI 生成后回填
+        self.kind = kind            # 'reply'=正常回复；'first_touch'=通过后的首条激活
 
     def remaining(self):
         return self.deadline - time.time()
@@ -135,6 +148,9 @@ class AutoReplier:
         # 不足 N 秒就跳过」判，会把「回复发出去之后又补的一句」直接丢掉，而合并窗口
         # 本身已经保证「用户没停手就不回复」，无需再叠一层冷却）。
         self.merge_window = float(ar.get("merge_window_seconds", 8))
+        # 发送结果校验的等待上限（秒）：按完发送键后回读微信库，等它把消息写进去。
+        # 微信写库有 1~3s 延迟，给到 6s 足够；读不到就判「未真正发出」，不写库。
+        self.confirm_timeout = float(ar.get("confirm_timeout_seconds", 6))
         self.max_per_hour = ar.get("max_replies_per_hour", 20)
         self.context_turns = ar.get("context_turns", 3)    # 带给AI的最近对话轮数（1轮=1来1回）
         self.context_hours = ar.get("context_hours", 6)    # 上下文时间窗：更早的历史不带
@@ -158,8 +174,30 @@ class AutoReplier:
         self.switches = {}      # conv_id -> bool：每会话AI自动回复开关（默认全关，monitor_store.conv_switch 表）
         self._contact_cache = {}  # conv_id -> contact dict：反查结果缓存，避免重复查库
         self.rhythm_profile = ar.get("rhythm", "natural")  # 拟人节流档位（natural/calm/fast/off）
+        # ---------- 加好友：名单节奏 / 通过检测 / 首条激活（2026-10-19） ----------
+        af = cfg.get("add_friend", {}) or {}
+        self.af_enabled = bool(af.get("enabled", False))
+        self.af_daily_limit = int(af.get("daily_limit", 10))
+        self.af_gap_min = float(af.get("interval_min_seconds", 480))    # 8 分钟
+        self.af_gap_max = float(af.get("interval_max_seconds", 900))    # 15 分钟
+        self.af_work_start = int(af.get("work_start_hour", 9))
+        self.af_work_end = int(af.get("work_end_hour", 21))
+        self.af_weekend_factor = float(af.get("weekend_factor", 0.5))
+        self.af_max_fail = int(af.get("max_consecutive_failures", 3))
+        self.af_retry_days = int(af.get("retry_days", 30))
+        self.ft_delay_min = float(af.get("first_touch_delay_min", 60))
+        self.ft_delay_max = float(af.get("first_touch_delay_max", 120))
+        self.ft_intent = (af.get("first_touch_intent") or "").strip()
+        self._af_fail_streak = 0      # 连续技术失败次数（只有 add worker 读写）
+        self._af_paused_day = ""      # 因连续失败而停手的那一天
+        self._af_last_at = 0.0        # 上次尝试的时刻（用于间隔闸）
+        self._af_limit_logged = False # 「今日已达上限」只打印一次
+        # conv_id -> {due, name, note, source, tid}：通过后待发的首条
+        self._first_touch = {}
+        self._pass_seen = set()       # 通过事件去重（conv_id|ts）
         self.db = None                    # 主线程用（收消息轮询）
         self._ai_db_obj = None            # AI 线程用（联系人反查），避免跨线程共享连接
+        self._send_db_obj = None          # 发送线程用（发送结果校验回读），同上
         self._moment_ops = None          # 朋友圈模块（惰性创建，见 _poll_moments）
         self._last_moment_refresh = 0.0  # 上次 UI 刷新朋友圈的时间戳
         # ---------- 流水线：待生成 -> 待发送 ----------
@@ -244,7 +282,7 @@ class AutoReplier:
         try:
             return monitor_store.add_task(
                 task.conv_id, task.name, task.text, task.deadline,
-                kind="reply", created=task.created)
+                kind=task.kind, created=task.created)
         except Exception as e:      # noqa: BLE001
             print("[auto] 任务落库失败（不影响本次回复）: %s" % e)
             return None
@@ -275,11 +313,20 @@ class AutoReplier:
         不放进缓冲的消息，窗口期自然也不会被合并提交。动态闸门（每小时上限）
         留到 flush 那一刻判。
         """
-        if not self.enabled:
+        if not self.enabled and not self.af_enabled:
             return
         if item.get("role") == "me":
             return  # 自己发的消息不触发回复（防自问自答循环）
         conv_id, name = item["conv_id"], item["name"]
+        # 系统消息一律不进 AI 缓冲；「好友通过」在这里被识别成事件处理。
+        # 注意这一步**不能**放在 enabled 闸之后：加好友是独立开关，
+        # 只开加好友、关掉自动回复时，通过事件照样要能检测到。
+        if self._handle_system(item):
+            return
+        # 客户已经主动说话 → 取消脚本化的首条（否则会先发模板再回话，很机械）
+        self._cancel_first_touch(conv_id)
+        if not self.enabled:
+            return
         if item.get("type") not in self.reply_types:
             print("[auto] 跳过非回复类型(%s): %s" % (item.get("type"), name))
             return
@@ -338,6 +385,280 @@ class AutoReplier:
         print("[auto] 合并 %d 条为一条任务 → %s（预算 %.0fs，待生成队列 %d 条）"
               % (len(texts), name, self.task_timeout, self._ai_q.qsize()))
 
+    # ---------- 好友通过检测 / 首条激活 ----------
+    # 为什么要有这一层（2026-10-19）：微信把「我通过了你的朋友验证请求…」这条
+    # 系统提示的 raw type 记成**文本**，跟客户真消息一模一样。不单独拦，新好友
+    # 一通过，AI 就会去回这句话；而如果为了躲它把开关全关掉，客户主动说话又没人接。
+    # 所以拆成：系统消息 → 事件（不对话）；真人消息 → 正常对话。
+    def _handle_system(self, item):
+        """系统消息一律不进 AI 缓冲，返回 True 表示「已在这个分支消化掉」。"""
+        text = item.get("text") or ""
+        typ = item.get("type") or ""
+        if typ == "系统消息":
+            self._maybe_friend_pass(item)
+            return True
+        if any(p in text for p in FRIEND_PASS_PATTERNS):
+            self._maybe_friend_pass(item)
+            return True
+        return False
+
+    def _maybe_friend_pass(self, item, quiet=False):
+        """识别「好友通过」并排期首条激活。
+
+        归属判定：**用「通过事件与申请发出的时间距离」认领**，不看会话历史。
+
+        为什么换掉旧判据（2026-10-19 实测三个测试对象全部误判）：旧实现用
+        `conv_existed_before(conv_id, sent_at)`——「申请之前该会话有没有消息」——
+        来判「是不是刚通过的新好友」。但
+          ① 删了好友再加回来，微信**保留历史消息**，这个判据必然为真；
+          ② 我们自己那条申请语写库的时间比 sent_at 早 1 秒，连全新会话都会被
+             判成「老会话」。
+        两个原因叠起来，要激活的人一个都匹配不上，于是既不标 passed、也不排
+        首条，看板永远显示「已申请」。
+
+        现在的规则：申请已发出（容差 120s，覆盖写库先后的倒挂）且未超过
+        retry_days 的才是候选，取与通过事件时间差最小的那条。队列是串行发的，
+        这个信号在实际数据上极准（实测差距 0~1 秒）。
+        """
+        conv_id = item.get("conv_id") or ""
+        text = item.get("text") or ""
+        if not conv_id or not any(p in text for p in FRIEND_PASS_PATTERNS):
+            return
+        try:
+            item_ts = int(item.get("ts") or time.time())
+        except (TypeError, ValueError):
+            item_ts = int(time.time())
+        key = "%s|%s" % (conv_id, item_ts)
+        if key in self._pass_seen:
+            return
+        self._pass_seen.add(key)
+
+        try:
+            cands = monitor_store.get_friend_sent(limit=20) or []
+        except Exception as e:      # noqa: BLE001
+            print("[auto] 读待确认名单失败: %s" % e)
+            cands = []
+        pool = []
+        for c in cands:
+            sa = c.get("sent_at")
+            if not sa:
+                continue
+            gap = item_ts - int(sa)
+            if gap < -120 or gap > int(self.af_retry_days * 86400):
+                continue            # 申请还没发出 / 早已过期，都不是这次通过
+            pool.append((abs(gap), c))
+        matched = min(pool, key=lambda t: t[0])[1] if pool else None
+        # 搜索词必须是**微信备注/昵称**：Ctrl+F 只认昵称和备注，喂 wxid 搜不到
+        # （2026-10-19 实测：名单里没填 name 的两条首条激活，全挂在
+        # 「wxid_xxxxxxxx」上，任务落 failed）。
+        # 三级回退：消息里的昵称 → 名单里填的 name → 联系人库反查 → wxid（保底）。
+        name = item.get("name") or (matched.get("name") if matched else None) or ""
+        if not name:
+            name = self._nick_of(conv_id) or conv_id
+        if matched:
+            try:
+                monitor_store.update_friend_task(matched["id"], status="passed",
+                                                 conv_id=conv_id,
+                                                 passed_at=int(time.time()))
+            except Exception as e:  # noqa: BLE001
+                print("[auto] 标记通过失败(task=%s): %s" % (matched.get("id"), e))
+            print("[auto] 好友通过：%s（名单 #%s %s）"
+                  % (name, matched["id"], matched.get("keyword")))
+        else:
+            if not quiet:
+                print("[auto] 好友通过但未匹配到名单项：%s（可能是手动加的）" % name)
+
+        # 自动打开该会话的 AI 开关：不打开，客户主动说话也没人接
+        try:
+            if not self.switches.get(conv_id, False):
+                monitor_store.set_switch(conv_id, True)
+                self.switches[conv_id] = True
+                print("[auto] 已自动打开该会话的自动回复开关：%s" % name)
+        except Exception as e:      # noqa: BLE001
+            print("[auto] 自动开会话开关失败（不影响首条）: %s" % e)
+
+        # 只有匹配到名单项才排首条：来源不明的人不主动打扰。
+        # 另外客户在通过之后已经说过话的也不排——首条激活是为了打破沉默，人家
+        # 自己开口了还去打招呼只会显得多余。实时流程里 collect 会用
+        # _cancel_first_touch 兜住，但**启动补跑**时客户的话是既成事实，不会
+        # 再有新消息来触发取消，必须在这里就判掉。
+        if matched and self._has_real_message_after(conv_id, item_ts):
+            print("[auto] 首条激活不排期（客户已主动说话）：%s" % name)
+        elif matched:
+            # 错开：一批客户同时通过时（启动补跑尤其容易一次排好几条），不要
+            # 挤在同一分钟里发出去——那看着就是群发。以「已排的最后一条」为
+            # 基准往后顺延，每条间隔 ft_delay_min~max，像一个个单独打招呼。
+            base = time.time()
+            if self._first_touch:
+                base = max(base, max(f["due"] for f in self._first_touch.values()))
+            delay = random.uniform(self.ft_delay_min, self.ft_delay_max)
+            self._first_touch[conv_id] = {
+                "due": base + delay,
+                "name": name,
+                "note": matched.get("note") or "",
+                "source": matched.get("source") or "",
+                "tid": matched["id"],
+            }
+            print("[auto] 首条激活已排期：%s，%.0fs 后（客户先说话则取消）"
+                  % (name, self._first_touch[conv_id]["due"] - time.time()))
+
+    def _nick_of(self, conv_id):
+        """conv_id → 微信备注/昵称（Ctrl+F 的搜索词只能用它，不能用 wxid）。
+
+        只在主线程调用（collect / 启动补跑），复用 self.db；不用 AI 线程的实例。
+        """
+        try:
+            nm = self.db.get_nickname(conv_id) if self.db else ""
+        except Exception:           # noqa: BLE001
+            return ""
+        nm = (nm or "").strip()
+        return "" if not nm or nm == conv_id else nm
+
+    def _has_real_message_after(self, conv_id, ts):
+        """通过事件之后，对方有没有发过**真正的**消息（不是系统提示）。
+
+        用来判断「还要不要主动打招呼」。读库失败按「没说过」处理——宁可多发
+        一条，也别把该激活的人漏掉：漏发的代价是这个客户从此沉寂，而多发一条
+        最多显得热情。
+        """
+        try:
+            rows = monitor_store.get_messages(conv_id, limit=20, since_ts=ts)
+        except Exception:           # noqa: BLE001
+            return False
+        for m in rows:
+            if m.get("role") != "them":
+                continue
+            if (m.get("ts") or 0) <= ts:
+                continue            # since_ts 是 >=，会把事件本身带进来
+            t = m.get("text") or ""
+            if any(p in t for p in FRIEND_PASS_PATTERNS):
+                continue            # 通过提示本身不算「说过话」
+            return True
+        return False
+
+    def _backfill_pass_events(self, hours=24):
+        """启动补跑：把最近 N 小时内漏判的「好友通过」补上。
+
+        为什么需要：通过事件原本只在消息**新入库那一刻**由 collect 触发。进程
+        没开、或归属判定把事件吞了（旧版本正是这个 bug），这次通过就永久丢了
+        ——客户明明通过了，却永远收不到第一条消息，看板也永远停在「已申请」。
+
+        幂等：get_friend_sent 只返回 status='sent' 的，已 passed 的不会再被认领；
+        按 ts 升序处理，保证串行认领的顺序与实时流程一致。
+        """
+        since = int(time.time()) - int(hours * 3600)
+        try:
+            rows = monitor_store.recent_messages_matching(
+                FRIEND_PASS_PATTERNS, since, limit=200)
+        except Exception as e:      # noqa: BLE001
+            print("[auto] 补跑好友通过失败（不影响启动）: %s" % e)
+            rows = []
+        if rows:
+            before = len(self._pass_seen)
+            for r in rows:
+                try:
+                    self._maybe_friend_pass(
+                        {"conv_id": r.get("conv_id"), "text": r.get("text"),
+                         "ts": r.get("ts"), "name": None, "type": ""},
+                        quiet=True)
+                except Exception as e:  # noqa: BLE001
+                    print("[auto] 补跑好友通过异常: %s" % e)
+            n = len(self._pass_seen) - before
+            if n:
+                print("[auto] 启动补跑：处理了 %d 条历史好友通过事件（近 %d 小时）"
+                      % (n, hours))
+
+        # 第二步：已通过、但首条激活一条都没真正发出去的，补排一次。
+        # 覆盖「上一版拿 wxid 当搜索词导致整批 failed」这种情况——不补的话，
+        # 用户只能删好友重加才能再验证一次（2026-10-19 就踩了这坑）。
+        # 上一步刚排过的不会重复：_first_touch 里已经有它。
+        try:
+            pend = monitor_store.get_friend_passed_pending_touch(limit=20)
+        except Exception as e:      # noqa: BLE001
+            print("[auto] 补排首条激活失败（不影响启动）: %s" % e)
+            return
+        n2 = 0
+        for r in pend:
+            cid = (r.get("conv_id") or "").strip()
+            if not cid or cid in self._first_touch:
+                continue
+            try:
+                if r.get("passed_at") and self._has_real_message_after(
+                        cid, int(r["passed_at"])):
+                    continue        # 客户自己已经开口了，别去打扰
+            except Exception:       # noqa: BLE001
+                pass
+            name = r.get("name") or self._nick_of(cid) or cid
+            base = time.time()
+            if self._first_touch:
+                base = max(base, max(f["due"] for f in self._first_touch.values()))
+            d = random.uniform(self.ft_delay_min, self.ft_delay_max)
+            self._first_touch[cid] = {
+                "due": base + d,
+                "name": name,
+                "note": r.get("note") or "",
+                "source": r.get("source") or "",
+                "tid": r["id"],
+            }
+            n2 += 1
+            print("[auto] 补排首条激活：%s，%.0fs 后" % (name, base + d - time.time()))
+        if n2:
+            print("[auto] 启动补跑：%d 条已通过但首条未发出的，已重新排期" % n2)
+
+    def _cancel_first_touch(self, conv_id):
+        ft = self._first_touch.pop(conv_id, None)
+        if ft:
+            print("[auto] 取消首条激活（客户已主动说话）：%s" % ft["name"])
+
+    def _first_touch_intent(self):
+        """首条激活的专用意图（不复用日常回复的 intent）。"""
+        if self.ft_intent:
+            return self.ft_intent
+        ai = self.cfg.get("ai") or {}
+        persona = ai.get("persona") or "小光"
+        product = (ai.get("product") or "").strip()
+        prod = ("，做" + product) if product else ""
+        return (
+            "你正在微信上给一位**刚通过好友验证、还没说过话**的联系人写第一条主动消息。\n"
+            "你的身份：「%s」，代表中照金智%s。\n"
+            "目标：让对方愿意继续聊，不是立刻成交。\n"
+            "要求：①一句话自报身份；②说明来意（结合对方背景/行业）；"
+            "③给一个具体、可感知的价值点，可以说“需要的话我发您看看”；"
+            "④不报价、不催单、不堆产品功能；⑤口语化、80 字以内，只输出正文。"
+            % (persona, prod))
+
+    def _tick_first_touch(self):
+        """每秒检查一次：到点且未被取消的，投递一条 first_touch 任务。"""
+        if not self._first_touch:
+            return
+        now = time.time()
+        for conv_id in list(self._first_touch.keys()):
+            ft = self._first_touch[conv_id]
+            if now < ft["due"]:
+                continue
+            del self._first_touch[conv_id]
+            if not self.switches.get(conv_id, False):
+                print("[auto] 首条激活跳过（会话开关已关）：%s" % ft["name"])
+                continue
+            if not self._rate_ok(now):
+                print("[auto] 首条激活跳过（每小时上限）：%s" % ft["name"])
+                continue
+            ctx = "（系统事件）对方刚刚通过好友申请，还没有发过任何消息。"
+            if ft.get("source"):
+                ctx += "来源：%s。" % ft["source"]
+            if ft.get("note"):
+                ctx += "背景：%s。" % ft["note"]
+            task = ReplyTask(conv_id, ft["name"], ctx, self.task_timeout,
+                             kind="first_touch")
+            task.id = self._task_open(task)
+            try:
+                self._ai_q.put_nowait(task)
+            except queue.Full:
+                print("[auto] 待生成队列已满，首条激活放弃：%s" % ft["name"])
+                continue
+            self._hour_window.append(now)
+            print("[auto] 首条激活投递 → %s" % ft["name"])
+
     # ---------- 流水线 1：AI 生成（串行，一条完成立刻接下一单） ----------
     def _ai_worker(self):
         """消费「待生成」队列：调大模型出文案 → 投递到「待发送」队列。
@@ -380,9 +701,11 @@ class AutoReplier:
         except Exception as e:
             print("[auto] 拟人节流异常（已跳过，不影响发送）: %s" % e)
         try:
+            intent = (self._first_touch_intent() if task.kind == "first_touch"
+                      else self._build_intent(task.conv_id))
             reply = ai_generate(
                 self.cfg, self._contact_of(task.conv_id, task.name),
-                self._build_intent(task.conv_id),
+                intent,
                 extra_context=task.text,
                 # AI 自身也受任务预算约束：剩余不足就别再等满 60s
                 timeout=max(5, min(60, task.remaining())),
@@ -404,6 +727,72 @@ class AutoReplier:
                   % (self.queue_max, task.name))
             self._task_set(task, "failed",
                            reason="待发送队列已满(%d)，未发出" % self.queue_max)
+
+    # ---------- 发送结果校验（回读微信库，真实发出才算数） ----------
+    def _send_db(self):
+        """发送线程专属的 WeChatDB 实例。
+
+        不共用主线程的 self.db、也不共用 AI 线程的 _ai_db_obj：WeChatDB 底下是
+        sqlite 连接，跨线程共用是隐患（与 _contact_of 同一个道理）。
+        """
+        if self._send_db_obj is None:
+            try:
+                self._send_db_obj = WeChatDB()
+            except Exception as e:          # noqa: BLE001
+                print("[auto] 发送校验初始化 WeChatDB 失败（无法校验，不写库）: %s" % e)
+                return None
+        return self._send_db_obj
+
+    def _confirm_sent(self, conv_id, text, timeout=None):
+        """回读微信库，确认这条消息真的出现在会话里——确认到才允许写库。
+
+        为什么不能只认「键盘序列没抛异常」（2026-10-19 实测事故）：微信是 Qt
+        自绘界面，读不到输入框状态；Enter 按在一个**没聚焦的输入框**上时全程
+        静默不报错，调用方于是把一条**根本没发出去**的消息记成已发送——看板
+        有、微信客户端没有，用户以为发了。
+
+        微信写库有延迟（实测 1~3s），所以轮询等待，默认最多
+        `auto_reply.confirm_timeout_seconds`（6s）。
+
+        返回**三态**（2026-10-19 用户口径修正：真实发出才落库）：
+          True  = 微信库里查到了这条 → 可以写库；
+          False = 查了，确认没有 → 判未发出（SendNotVerified）；
+          None  = 读库本身不可用，根本没法判断。**既不写库也不重发**：
+                  写库等于记一条没证据的消息；重发等于给客户发两遍
+                  （发送不可逆，重复比漏记更糟）。交人工核对。
+        """
+        conv_id = conv_id or ""
+        probe = (text or "").strip()[:24]
+        if not conv_id or not probe:
+            return True
+        db = self._send_db()
+        if db is None:
+            return None
+        budget = self.confirm_timeout if timeout is None else timeout
+        deadline = time.time() + max(1.0, budget)
+        while True:
+            try:
+                msgs = db.get_messages(conv_id, limit=6)
+            except Exception as e:          # noqa: BLE001
+                print("[auto] 发送校验读库失败（无法确认，不写库也不重发）: %s" % e)
+                return None
+            for m in msgs:
+                if str(m.get("sender_id")) != "2":
+                    continue
+                if probe in str(m.get("content") or ""):
+                    return True
+            if time.time() >= deadline:
+                # 附上该会话最新几条：能区分「按键没进输入框」（会话尾部没变化）
+                # 和「发到别处去了」（别处会出现这条）——排查时少猜一轮。
+                try:
+                    tail = ["%s:%s" % (m.get("sender_id"), str(m.get("content"))[:16])
+                            for m in (msgs or [])[-3:]]
+                    print("[auto] 校验超时，%s 最新 %d 条: %s"
+                          % (conv_id, len(tail), " / ".join(tail)))
+                except Exception:       # noqa: BLE001
+                    pass
+                return False
+            time.sleep(1.0)
 
     # ---------- 流水线 2：发送（串行，在 UI 门内） ----------
     def _send_worker(self):
@@ -429,12 +818,30 @@ class AutoReplier:
             self._task_set(task, "sending")    # 账本：发送线程已接手
             try:
                 self.bot.send_to_contact(task.name, task.reply,
-                                         conv_id=task.conv_id, ui_timeout=rem)
+                                         conv_id=task.conv_id, ui_timeout=rem,
+                                         by="ai",   # 看板打「AI」标，别和人工发混在一起
+                                         confirm=self._confirm_sent)
             except ui_gate.UITimeoutError as e:
                 print("[auto] 发送排队超时（本条 %.0fs 预算内没排到）: %s —— %s"
                       % (task.name, rem, e))
                 self._task_set(task, "expired",
                                reason="UI 排队超时（%.0fs 预算内没排到）" % rem)
+                continue
+            except SendNotVerified as e:
+                # 键盘动作跑完了，但回读微信库没有这条 → 真的没发出去。
+                # 这种**不重试**：发送不可逆，万一其实发了再补一次就是重复打扰客户。
+                # 落 failed 让看板看得见，交人工决定。
+                print("[auto] 发送未确认，按未发出处理(%s): %s" % (task.name, e))
+                self._task_set(task, "failed",
+                               reason="发送未确认：微信库里没查到，可能没真正发出")
+                continue
+            except SendUnconfirmed as e:
+                # 校验链路本身不可用（读库打不开、微信刚重启）。这条消息**可能
+                # 已经发出去了**，所以绝不重试；也不写库——真实发出才落库。
+                # 落 failed 并写明「无法确认」，人工去客户端看一眼即可。
+                print("[auto] 发送无法确认(%s): %s" % (task.name, e))
+                self._task_set(task, "failed",
+                               reason="无法确认：回读微信库不可用，可能已发出")
                 continue
             except Exception as e:      # noqa: BLE001
                 print("[auto] 发送异常(%s): %s" % (task.name, e))
@@ -444,16 +851,124 @@ class AutoReplier:
             self._task_set(task, "sent", reply=task.reply,
                            reason=("dry-run：未真发" if self.dry_run else None))
 
+    # ---------- 加好友 worker（名单队列，发完即走） ----------
+    # 关键语义：**添加好友是异步的**。点完「确定」这条就结束，worker 立刻处理
+    # 下一条，绝不等待对方通过。所以「未通过」不是失败、不占队列、不阻塞。
+    def _in_work_hours(self, now=None):
+        import datetime
+        d = datetime.datetime.fromtimestamp(now or time.time())
+        return self.af_work_start <= d.hour < self.af_work_end
+
+    def _af_daily_limit(self):
+        """当天额度：周末按 weekend_factor 折算（10 条 × 0.5 = 5 条）。"""
+        import datetime
+        if datetime.date.today().weekday() >= 5:
+            return max(1, int(round(self.af_daily_limit * self.af_weekend_factor)))
+        return self.af_daily_limit
+
+    def _add_worker(self):
+        while not self._stop.is_set():
+            try:
+                self._add_step()
+            except Exception as e:      # noqa: BLE001
+                print("[auto] 加好友 worker 异常（已跳过本轮）: %s" % e)
+            self._stop.wait(20)
+
+    def _add_enabled(self):
+        """生效开关：看板设置（app_setting）优先，没有则用 config。
+
+        为什么不用 config.json 直接改：auto_reply 只在启动时读一次配置，
+        看板上点「关」要等重启才停，等于没有紧急刹车。走库的话 20 秒内生效。
+        """
+        try:
+            v = monitor_store.get_setting("add_friend_enabled")
+        except Exception:           # noqa: BLE001
+            v = None
+        if v is None or v == "":
+            return self.af_enabled
+        return (v == "1")
+
+    def _add_step(self):
+        """一次决策：能不能发，发谁。所有闸门都在这里判。"""
+        if not self._add_enabled():
+            return
+        now = time.time()
+        day = time.strftime("%Y-%m-%d")
+        if self._af_paused_day == day:
+            return
+        if not self._in_work_hours(now):
+            return
+        # 间隔闸：上次尝试之后，随机 8~15 分钟才允许下一次（失败也计入，免得
+        # 一条失败的记录每 20 秒被重试一次）
+        if self._af_last_at:
+            if now - self._af_last_at < random.uniform(self.af_gap_min,
+                                                       self.af_gap_max):
+                return
+        limit = self._af_daily_limit()
+        try:
+            done = monitor_store.friend_sent_today()
+        except Exception as e:          # noqa: BLE001
+            print("[auto] 读今日加好友计数失败: %s" % e)
+            return
+        if done >= limit:
+            if not getattr(self, "_af_limit_logged", False):
+                print("[auto] 今日加好友已达上限 %d 条，明天继续" % limit)
+                self._af_limit_logged = True
+            return
+        try:
+            rows = monitor_store.get_friend_pending(limit=1)
+        except Exception as e:          # noqa: BLE001
+            print("[auto] 读加好友队列失败: %s" % e)
+            return
+        if not rows:
+            return
+        row = rows[0]
+        tid, kw = row["id"], row["keyword"]
+        print("[auto] 加好友开始：#%s %s（今日 %d/%d）" % (tid, kw, done, limit))
+        try:
+            import friend_add
+            res = friend_add.add_friend(kw)
+        except Exception as e:          # noqa: BLE001
+            res = {"status": "failed", "reason": "模块异常: %s" % e}
+        st = res.get("status")
+        self._af_last_at = time.time()
+        if st == "sent":
+            monitor_store.update_friend_task(tid, status="sent",
+                                             sent_at=int(time.time()), reason=None)
+            self._af_fail_streak = 0
+            self._af_limit_logged = False
+            print("[auto] 加好友已发出：#%s %s（不等通过，继续下一条）" % (tid, kw))
+        elif st == "already":
+            monitor_store.update_friend_task(tid, status="already",
+                                             reason=res.get("reason"))
+            self._af_fail_streak = 0
+            print("[auto] 跳过（对方已是好友）：#%s %s" % (tid, kw))
+        else:
+            tries = int(row.get("tries") or 0) + 1
+            # 失败后放回 pending 再试；同一号码累计 3 次技术失败才落 failed
+            status = "failed" if tries >= 3 else "pending"
+            monitor_store.update_friend_task(tid, status=status,
+                                             reason=res.get("reason"), tries=tries)
+            self._af_fail_streak += 1
+            print("[auto] 加好友失败：#%s %s —— %s（第 %d 次，连续 %d 次）"
+                  % (tid, kw, res.get("reason"), tries, self._af_fail_streak))
+            if self._af_fail_streak >= self.af_max_fail:
+                self._af_paused_day = day
+                print("[auto] 连续 %d 次加好友失败，今天停手"
+                      "（大概率被限流/微信改版，继续点只会加重风控）"
+                      % self._af_fail_streak)
+
     # ---------- worker 启停 ----------
     def _start_workers(self):
         for fn, nm in ((self._ai_worker, "ai-worker"),
                        (self._send_worker, "send-worker"),
-                       (self._moment_worker, "moment-worker")):
+                       (self._moment_worker, "moment-worker"),
+                       (self._add_worker, "add-friend-worker")):
             t = threading.Thread(target=self._worker_entry, args=(fn, nm),
                                  name=nm, daemon=True)
             t.start()
             self._threads.append(t)
-        print("[auto] 流水线已启动：AI 生成 / 发送 / 朋友圈 三个线程"
+        print("[auto] 流水线已启动：AI 生成 / 发送 / 朋友圈 / 加好友 四个线程"
               "（生成与发送互不阻塞，朋友圈刷新也不再卡住收消息）")
 
     def _worker_entry(self, fn, name):
@@ -506,6 +1021,16 @@ class AutoReplier:
                       % n_stale)
         except Exception as e:      # noqa: BLE001
             print("[auto] 清理历史任务失败（不影响启动）: %s" % e)
+        try:
+            n_af = monitor_store.expire_stale_friend_tasks(days=7)
+            if n_af:
+                print("[auto] %d 条 7 天未通过的好友申请已标为过期" % n_af)
+        except Exception as e:      # noqa: BLE001
+            print("[auto] 清理加好友队列失败（不影响启动）: %s" % e)
+        # 补跑：进程停着的时候通过的好友，事件只在消息入库那一刻触发过一次，
+        # 不补就永久丢了（客户通过了却永远收不到第一条）。必须在 self.switches
+        # 加载之后调用——排首条要用它判会话开关。
+        self._backfill_pass_events(hours=24)
         # __moment_dry__ 是朋友圈 dry-run 状态，复用 conv_switch 表存，不算会话
         on = [c for c, v in self.switches.items() if v and c != "__moment_dry__"]
         print("[auto] 库存统计: %s" % monitor_store.stats())
@@ -517,6 +1042,15 @@ class AutoReplier:
             print("[auto] 已开启自动回复的会话 %d 个: %s" % (len(on), ", ".join(on[:10])))
         print("[auto] 自动回复启动 dry_run=%s 轮询间隔=%ds 合并窗口=%ds 单条任务预算=%ds（Ctrl+C 停止）"
               % (self.dry_run, self.interval, int(self.merge_window), self.task_timeout))
+        if self._add_enabled():
+            print("[auto] 加好友已启用：每日 %d 条（周末 ×%.1f）、间隔 %.0f~%.0f 分钟、"
+                  "%02d:00-%02d:00（看板可随时开关，20 秒内生效）"
+                  % (self.af_daily_limit, self.af_weekend_factor,
+                     self.af_gap_min / 60.0, self.af_gap_max / 60.0,
+                     self.af_work_start, self.af_work_end))
+        else:
+            print("[auto] 加好友未启用（config.add_friend.enabled=false 或看板已关）："
+                  "名单只入库，不会自动发申请")
         print("[auto] 首轮要全量解密全部数据库，可能数分钟；之后每轮秒级。进度见 [scan] 行")
         # 朋友圈轮询（读路线：MomentDB 解密 sns.db，零 UI；写操作默认手动，
         # 开了客户自动开关（moment_switch）才对新圈自动点赞/评论）
@@ -539,6 +1073,7 @@ class AutoReplier:
                 # 才检查一次（否则 interval=10s 时窗口会被拉成 10~18s）。
                 for _ in range(max(1, int(self.interval))):
                     self._flush_due()
+                    self._tick_first_touch()
                     time.sleep(1)
         except KeyboardInterrupt:
             print("[auto] 收到停止信号，收尾中…")

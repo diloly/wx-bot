@@ -7,7 +7,154 @@
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { height: 100%; font-family: -apple-system, "Microsoft YaHei", sans-serif; }
-  .app { display: flex; height: 100vh; background: #f5f5f5; }
+  :root {
+    --chrome: #2b2b2b; --line: #3c3c3c; --text: #e8e8e8; --muted: #9a9a9a;
+    --green: #07c160; --bg: #f5f6f7;
+  }
+  .app { display: flex; flex-direction: column; height: 100vh; background: var(--bg); }
+
+  /* ---------- 顶部导航 ---------- */
+  .topnav {
+    height: 54px; flex-shrink: 0; display: flex; align-items: center; gap: 24px;
+    padding: 0 18px; background: var(--chrome); color: var(--text);
+    border-bottom: 1px solid #1f1f1f;
+  }
+  .topnav .brand {
+    display: flex; align-items: center; gap: 8px; font-size: 15px;
+    font-weight: 600; letter-spacing: .3px; flex-shrink: 0;
+  }
+  .topnav .brand .dot {
+    width: 8px; height: 8px; border-radius: 50%; background: var(--green);
+    box-shadow: 0 0 0 3px rgba(7,193,96,.16);
+  }
+  .topnav .nav { display: flex; gap: 4px; }
+  .topnav .nav-item {
+    position: relative; padding: 7px 14px; border: none; border-radius: 6px;
+    background: transparent; color: var(--muted); font-size: 13px; cursor: pointer;
+    font-family: inherit; transition: background .15s, color .15s;
+  }
+  .topnav .nav-item:hover { background: #3a3a3a; color: #dcdcdc; }
+  .topnav .nav-item.active { background: #3d3d3d; color: #fff; }
+  .topnav .nav-item.active::after {
+    content: ''; position: absolute; left: 14px; right: 14px; bottom: -13px;
+    height: 2px; background: var(--green); border-radius: 1px;
+  }
+  .topnav .nav-badge {
+    display: inline-block; min-width: 16px; padding: 0 4px; margin-left: 6px;
+    background: #fa5151; color: #fff; border-radius: 8px; font-size: 10px;
+    line-height: 16px; text-align: center; vertical-align: 1px;
+  }
+  .topnav .nav-hint { margin-left: auto; font-size: 12px; color: #ffd161; }
+
+  .workspace { flex: 1; display: flex; min-height: 0; }
+  .main { flex: 1; display: flex; min-width: 0; }
+
+  /* ---------- 独立功能页（加好友 / 维护任务） ---------- */
+  .page { flex: 1; overflow-y: auto; background: var(--bg); padding: 22px 26px 30px; }
+  .page-head {
+    display: flex; align-items: flex-start; justify-content: space-between;
+    gap: 20px; margin-bottom: 16px;
+  }
+  .page-head h2 { font-size: 18px; color: #1f2329; font-weight: 600; }
+  .page-head .sub { margin-top: 5px; font-size: 12px; color: #8a9099; }
+  /* 注意：.card 这个名字在聊天消息里已经用于「链接/文件卡片」，此处必须另起名，
+     否则后定义的聊天卡片会把功能页卡片压成 300px 宽 */
+  .pcard {
+    background: #fff; border: 1px solid #e9ecf0; border-radius: 10px;
+    padding: 16px 18px; margin-bottom: 14px; box-shadow: 0 1px 2px rgba(16,24,40,.04);
+  }
+  .pcard h3 { font-size: 13px; color: #1f2329; font-weight: 600; margin-bottom: 10px; }
+  .muted { font-size: 12px; color: #8a9099; font-weight: 400; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .btn {
+    margin-top: 10px; padding: 7px 14px; border: none; border-radius: 6px;
+    background: var(--green); color: #fff; font-size: 12px; cursor: pointer;
+    font-family: inherit;
+  }
+  .btn:hover { background: #06ad56; }
+  /* 次要按钮（下载模板）：白底描边，靠 .row-btns 与主按钮并排 */
+  .btn.ghost {
+    background: #fff; color: #4a5058; border: 1px solid #e0e4ea;
+    display: inline-block; text-decoration: none; line-height: 1.5;
+  }
+  .btn.ghost:hover { background: #f7f8fa; color: #1f2329; }
+  .row-btns { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+  .row-btns .btn { margin-top: 0; }
+  .pcard code {
+    background: #f2f4f7; color: #4a5058; border-radius: 4px;
+    padding: 1px 5px; font-size: 11px;
+    font-family: ui-monospace, Consolas, monospace;
+  }
+  #afText {
+    width: 100%; box-sizing: border-box; padding: 8px 10px; margin-top: 8px;
+    border: 1px solid #e0e4ea; border-radius: 6px; font-size: 12px;
+    color: #1f2329; font-family: inherit; resize: vertical; outline: none;
+  }
+  #afText:focus { border-color: #07c160; }
+  #afFile { display: block; margin-top: 8px; font-size: 12px; color: #6b7280; }
+  .af-msg { margin-left: 10px; font-size: 12px; color: #8a9099; }
+  .switch-lg {
+    display: flex; align-items: center; gap: 9px; padding: 8px 14px;
+    background: #fff; border: 1px solid #e9ecf0; border-radius: 10px;
+    font-size: 13px; color: #1f2329; cursor: pointer; flex-shrink: 0;
+    box-shadow: 0 1px 2px rgba(16,24,40,.04);
+  }
+  .switch-lg em { font-style: normal; font-size: 12px; color: #8a9099; }
+  /* 大号开关（加好友总开关） */
+  .switch-lg input[type=checkbox] {
+    -webkit-appearance: none; appearance: none; flex-shrink: 0;
+    width: 40px; height: 22px; border-radius: 11px; background: #d7dbe0;
+    position: relative; cursor: pointer; transition: background .15s; outline: none;
+    margin: 0;
+  }
+  .switch-lg input[type=checkbox]::after {
+    content: ''; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px;
+    border-radius: 50%; background: #fff; transition: left .15s;
+    box-shadow: 0 1px 2px rgba(0,0,0,.2);
+  }
+  .switch-lg input[type=checkbox]:checked { background: var(--green); }
+  .switch-lg input[type=checkbox]:checked::after { left: 20px; }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; }
+  .chip {
+    padding: 4px 10px; border-radius: 20px; font-size: 12px;
+    background: #fff; border: 1px solid #e9ecf0; color: #4a5058;
+  }
+  .chip.ok { background: #eafaf1; border-color: #c7f0da; color: #12864a; }
+  .chip.bad { background: #fdeeee; border-color: #f7d4d4; color: #b43636; }
+
+  /* 列表（加好友 / 任务共用，CSS grid） */
+  .tbl { display: flex; flex-direction: column; }
+  .tbl .tr {
+    display: grid; grid-template-columns: 92px 1fr 1.1fr 118px; gap: 12px;
+    align-items: center; padding: 10px 4px; border-bottom: 1px solid #f0f2f5;
+    font-size: 12px; color: #4a5058;
+  }
+  .tbl .tr:last-child { border-bottom: none; }
+  .tbl .th { color: #9aa0a8; font-size: 11px; letter-spacing: .4px; padding-top: 0; }
+  .tbl .name {
+    color: #1f2329; font-weight: 500; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+  }
+  .tbl .sub2 {
+    color: #8a9099; font-size: 11px; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+  }
+  .tbl .time { color: #9aa0a8; font-size: 11px; text-align: right; }
+  /* 空态：不套 .tr，否则会被压进第一列的 92px 里截断 */
+  .tbl .blank { padding: 16px 4px; color: #8a9099; font-size: 12px; }
+  .dotst { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
+  .dotst i { width: 7px; height: 7px; border-radius: 50%; background: #c9ced6; flex-shrink: 0; }
+  .dotst.pending i { background: #d9a441; }
+  .dotst.generating i, .dotst.generated i, .dotst.sending i { background: #3f7fd0; }
+  .dotst.sent i, .dotst.passed i { background: #07c160; }
+  .dotst.failed i, .dotst.rejected i, .dotst.expired i { background: #e05252; }
+  .dotst.already i { background: #9aa0a8; }
+
+  /* 窄屏：两栏卡片改单栏，列表列宽压缩 */
+  @media (max-width: 980px) {
+    .grid2 { grid-template-columns: 1fr; }
+    .tbl .tr { grid-template-columns: 84px 1fr 1fr 92px; }
+  }
 
   /* 左侧栏 */
   .sidebar { width: 320px; background: #2e2e2e; color: #e6e6e6; display: flex; flex-direction: column; }
@@ -51,44 +198,6 @@
   .sw input:checked + .track::after { left: 16px; }
   .sw input:disabled + .track { opacity: .35; }
 
-  /* 自动回复全局状态提示条（总开关未开时提醒，解释会话开关为何不生效） */
-  .ar-banner {
-    display: none; background: #4a3b1a; color: #ffd161; font-size: 12px;
-    line-height: 1.5; padding: 8px 14px; border-bottom: 1px solid #383838;
-  }
-
-  /* 维护任务队列（只读；auto_reply 的两个内存队列落库后的状态账本） */
-  .task-bar {
-    display: flex; align-items: center; gap: 8px; padding: 9px 14px; cursor: pointer;
-    border-top: 1px solid #383838; font-size: 12px; color: #9a9a9a; user-select: none;
-  }
-  .task-bar:hover { background: #3a3a3a; }
-  .task-bar .tb-label { color: #cfcfcf; flex-shrink: 0; }
-  .task-bar .tb-stat { flex: 1; text-align: right; }
-  .task-bar .tb-caret { color: #777; flex-shrink: 0; }
-  .tb-chip { padding: 1px 7px; border-radius: 8px; background: #3d3d3d; color: #9a9a9a; }
-  .tb-chip.open { background: #2a4a6b; color: #8fc7ff; }
-  .tb-chip.fail { background: #5a2a2a; color: #ff9b9b; }
-  .task-panel {
-    max-height: 42vh; overflow-y: auto; border-top: 1px solid #383838; background: #262626;
-  }
-  .task-item { padding: 8px 14px; border-bottom: 1px solid #333; font-size: 12px; }
-  .task-item .ti-top { display: flex; align-items: center; gap: 6px; }
-  .task-item .ti-name {
-    color: #ddd; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
-  .task-item .ti-time { color: #777; flex-shrink: 0; }
-  .task-item .ti-text {
-    color: #999; margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
-  .task-item .ti-reason { color: #d98b8b; margin-top: 3px; }
-  .ti-badge { padding: 0 6px; border-radius: 8px; font-size: 11px; flex-shrink: 0; }
-  .st-pending { background: #444; color: #bbb; }
-  .st-generating, .st-generated, .st-sending { background: #2a4a6b; color: #8fc7ff; }
-  .st-sent { background: #24503a; color: #7fe0a8; }
-  .st-failed { background: #5a2a2a; color: #ff9b9b; }
-  .st-expired { background: #5a4520; color: #ffcf7a; }
-
   /* 右侧聊天 */
   .chat { flex: 1; display: flex; flex-direction: column; background: #f5f5f5; }
   .chat .header {
@@ -104,7 +213,18 @@
   }
   .msg.them .bubble { background: #fff; }
   .msg.me .bubble { background: #95ec69; }
-  .msg .time { font-size: 11px; color: #b0b0b0; align-self: flex-end; margin: 0 8px; }
+  .msg .time {
+    font-size: 11px; color: #b0b0b0; align-self: flex-end; margin: 0 8px;
+    white-space: nowrap;
+  }
+  /* 「谁发的」小标（仅外发气泡）：AI=蓝，人工=灰，未标记的不显示 */
+  .bytag {
+    display: inline-block; margin-right: 5px; padding: 0 4px;
+    border-radius: 3px; font-size: 10px; line-height: 14px;
+    vertical-align: 1px; white-space: nowrap;
+  }
+  .bytag.ai { background: #e8f0fe; color: #3568c4; }
+  .bytag.human { background: #eef0f2; color: #8a9099; }
 
   /* 群聊卡片的真实发送者（普通文本消息靠「昵称: 」前缀，卡片会丢，故单独渲染） */
   .bubble .msg-sender { font-size: 11px; color: #9a9a9a; margin: -2px 0 6px; }
@@ -147,22 +267,6 @@
   .card-foot .card-foot-icon { font-size: 13px; line-height: 1; }
 
   /* ===== 朋友圈轻互动面板 ===== */
-  /* 左栏顶部 tab（消息 / 朋友圈） */
-  .side-tabs { display: flex; border-bottom: 1px solid #383838; }
-  .side-tabs .tab {
-    flex: 1; text-align: center; padding: 11px 0 9px; font-size: 13px; color: #9a9a9a;
-    cursor: pointer; position: relative; user-select: none;
-  }
-  .side-tabs .tab.active { color: #fff; font-weight: 500; }
-  .side-tabs .tab.active::after {
-    content: ''; position: absolute; left: 50%; transform: translateX(-50%);
-    bottom: 0; width: 28px; height: 2px; background: #07c160; border-radius: 1px;
-  }
-  .side-tabs .tab .tbadge {
-    display: inline-block; min-width: 16px; padding: 0 4px; margin-left: 5px;
-    background: #fa5151; color: #fff; border-radius: 8px; font-size: 10px;
-    line-height: 16px; text-align: center; vertical-align: 1px;
-  }
   /* 左栏：新圈列表项 */
   .moment-item { display: flex; padding: 12px 14px; cursor: pointer; border-bottom: 1px solid #383838; }
   .moment-item:hover { background: #3a3a3a; }
@@ -182,23 +286,29 @@
   .moment-empty { padding: 40px 20px; text-align: center; color: #777; font-size: 13px; line-height: 1.8; }
 
   /* 右栏：自动互动管理面板（「朋友圈」页默认视图：模拟/真跑 + 按客户开关） */
-  .msw-panel { max-width: 640px; margin: 0 auto; padding: 20px; }
-  .msw-card { background: #2f2f2f; border: 1px solid #3d3d3d; border-radius: 10px; padding: 14px 16px; margin-bottom: 14px; }
-  .msw-card h3 { font-size: 14px; color: #eee; margin: 0 0 6px; font-weight: 600; }
-  .msw-title { font-size: 12px; color: #9a9a9a; margin-bottom: 10px; line-height: 1.7; }
-  .msw-title b { color: #ddd; }
-  .msw-sec { font-size: 12px; color: #777; padding: 6px 2px; }
+  .msw-panel { max-width: 680px; margin: 0 auto; padding: 20px; }
+  .msw-card {
+    background: #fff; border: 1px solid #e9ecf0; border-radius: 10px;
+    padding: 14px 16px; margin-bottom: 14px; box-shadow: 0 1px 2px rgba(16,24,40,.04);
+  }
+  .msw-card h3 { font-size: 14px; color: #1f2329; margin: 0 0 6px; font-weight: 600; }
+  .msw-title { font-size: 12px; color: #8a9099; margin-bottom: 10px; line-height: 1.7; }
+  .msw-title b { color: #1f2329; }
+  .msw-sec { font-size: 12px; color: #9aa0a8; padding: 6px 2px; }
   .msw-dry { display: flex; align-items: center; gap: 12px; }
-  .msw-dry .msw-dry-txt { flex: 1; font-size: 12px; color: #9a9a9a; line-height: 1.7; }
-  .msw-dry .msw-dry-txt b { color: #ddd; }
+  .msw-dry .msw-dry-txt { flex: 1; font-size: 12px; color: #8a9099; line-height: 1.7; }
+  .msw-dry .msw-dry-txt b { color: #1f2329; }
   .msw-row { display: flex; align-items: center; padding: 8px 0; }
-  .msw-row + .msw-row { border-top: 1px solid #3d3d3d; }
+  .msw-row + .msw-row { border-top: 1px solid #f0f2f5; }
   .msw-name {
-    flex: 1; min-width: 0; font-size: 13px; color: #fff;
+    flex: 1; min-width: 0; font-size: 13px; color: #1f2329;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-right: 8px;
   }
   .msw-row .sw { margin-left: 10px; }
-  .msw-row .sw-tag { font-size: 11px; color: #9a9a9a; margin-left: 5px; }
+  .msw-row .sw-tag { font-size: 11px; color: #9aa0a8; margin-left: 5px; }
+  /* .sw 原本是深色底上的灰轨，放进白卡片后换成浅轨免得糊成一团 */
+  .msw-card .sw .track { background: #d7dbe0; }
+  .msw-card .sw input:checked + .track { background: var(--green); }
   /* 圈详情顶栏：返回互动管理 + 模式标签 */
   .md-topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
   .md-mode { font-size: 11px; padding: 3px 10px; border-radius: 10px; cursor: pointer; }
@@ -321,26 +431,79 @@
 </head>
 <body>
 <div class="app">
-  <div class="sidebar">
-    <div class="ar-banner" id="arBanner"></div>
-    <div class="side-tabs">
-      <div class="tab active" id="tabChat" onclick="switchTab('chat')">消息</div>
-      <div class="tab" id="tabMoment" onclick="switchTab('moment')">朋友圈<span class="tbadge" id="momentBadge" style="display:none"></span></div>
+  <header class="topnav">
+    <div class="brand"><span class="dot"></span>客户维护</div>
+    <nav class="nav">
+      <button class="nav-item active" id="navChat" onclick="navTo('chat')">消息</button>
+      <button class="nav-item" id="navMoment" onclick="navTo('moment')">朋友圈<span class="nav-badge" id="momentBadge" style="display:none"></span></button>
+      <button class="nav-item" id="navFriends" onclick="navTo('friends')">加好友<span class="nav-badge" id="friendBadge" style="display:none"></span></button>
+      <button class="nav-item" id="navTasks" onclick="navTo('tasks')">维护任务<span class="nav-badge" id="taskBadge" style="display:none"></span></button>
+    </nav>
+    <div class="nav-hint" id="arBanner"></div>
+  </header>
+  <div class="workspace">
+    <div class="sidebar" id="sidebar">
+      <div id="searchWrap"><div class="search"><input id="search" placeholder="搜索会话" /></div></div>
+      <div class="conv-list" id="convList"></div>
+      <div class="conv-list" id="momentList" style="display:none"></div>
     </div>
-    <div id="searchWrap"><div class="search"><input id="search" placeholder="搜索会话" /></div></div>
-    <div class="conv-list" id="convList"></div>
-    <div class="conv-list" id="momentList" style="display:none"></div>
-    <div class="task-bar" id="taskBar" onclick="toggleTaskPanel()">
-      <span class="tb-label">维护任务</span>
-      <span class="tb-stat" id="taskStat">—</span>
-      <span class="tb-caret" id="taskCaret">▸</span>
-    </div>
-    <div class="task-panel" id="taskPanel" style="display:none"></div>
+    <main class="main">
+      <div class="chat" id="chatPane">
+        <div class="empty" id="emptyTip">从左侧选择一个会话</div>
+      </div>
+      <div class="chat" id="momentPane" style="display:none"></div>
+
+      <div class="page" id="friendPage" style="display:none">
+        <div class="page-head">
+          <div>
+            <h2>加好友</h2>
+            <p class="sub">名单导入后按 8~15 分钟间隔逐条发申请；点完即走，不等对方通过。</p>
+          </div>
+          <label class="switch-lg">
+            <input type="checkbox" id="afSwitch" onchange="toggleFriendSwitch(this.checked)">
+            <span>自动加好友</span>
+            <em id="afQuota">—</em>
+          </label>
+        </div>
+        <div class="grid2">
+          <section class="pcard">
+            <h3>上传 CSV</h3>
+            <p class="muted">第一行是表头 <code>keyword,name,note,source</code>，只有 <code>keyword</code> 必填（手机号或微信号）。<br>
+              不知道怎么写就先下模板，填好再传。</p>
+            <input type="file" id="afFile" accept=".csv,text/csv">
+            <div class="row-btns">
+              <button class="btn" onclick="importFriendFile()">上传名单</button>
+              <a class="btn ghost" href="/api/friends/template" download>下载模板</a>
+            </div>
+          </section>
+          <section class="pcard">
+            <h3>直接粘贴</h3>
+            <p class="muted">一行一个手机号/微信号；也可 keyword,name,note,source</p>
+            <textarea id="afText" rows="3" placeholder="13800138000,王工,某设计院照明所,展会"></textarea>
+            <div class="row-btns">
+              <button class="btn" onclick="importFriendText()">导入粘贴内容</button>
+              <span class="af-msg" id="afMsg"></span>
+            </div>
+          </section>
+        </div>
+        <section class="pcard">
+          <h3>进度 <span class="muted" id="afCounts"></span></h3>
+          <div class="tbl" id="friendList"></div>
+        </section>
+      </div>
+
+      <div class="page" id="taskPage" style="display:none">
+        <div class="page-head">
+          <div>
+            <h2>维护任务</h2>
+            <p class="sub">自动回复队列的状态账本（只读）：谁在生成、谁在发送、哪条失败或超时。</p>
+          </div>
+          <div class="chips" id="taskChips"></div>
+        </div>
+        <section class="pcard"><div class="tbl" id="taskList"></div></section>
+      </div>
+    </main>
   </div>
-  <div class="chat" id="chatPane">
-    <div class="empty" id="emptyTip">从左侧选择一个会话</div>
-  </div>
-  <div class="chat" id="momentPane" style="display:none"></div>
 </div>
 
 <script>
@@ -563,9 +726,18 @@ function bubbleContent(m) {
   return esc(m.text);
 }
 
-// 消息签名：内容/媒体/卡片任一变化都能被增量渲染感知
+// 消息签名：内容/媒体/卡片/发送方任一变化都能被增量渲染感知
 function sigOf(m) {
-  return [m.role, m.ts, m.text || '', m.media || '', m.card || ''].join('\u0001');
+  return [m.role, m.ts, m.text || '', m.media || '', m.card || '', m.sent_by || ''].join('\u0001');
+}
+
+// 「谁发的」小标：AI=蓝，人工=灰。sent_by 为空（历史消息 / 手机端发的）不标，
+// 宁可不标也不标错——AI 的标只认账本，认不出来就留白。
+function byTag(m) {
+  if (m.role !== 'me') return '';
+  if (m.sent_by === 'ai') return '<span class="bytag ai">AI</span>';
+  if (m.sent_by === 'manual') return '<span class="bytag human">人工</span>';
+  return '';
 }
 
 // 群聊卡片的真实发送者（card.sender；普通文本消息用「昵称: 」前缀，不适用本函数）
@@ -582,7 +754,7 @@ function buildMsgEl(m) {
   div.className = 'msg ' + (m.role === 'me' ? 'me' : 'them');
   const t = fmtTime(m.ts);
   const isMedia = m.media && !m.card;
-  div.innerHTML = `<div class="bubble${isMedia ? ' media-bubble' : ''}">${cardSender(m)}${bubbleContent(m)}</div><div class="time">${t}</div>`;
+  div.innerHTML = `<div class="bubble${isMedia ? ' media-bubble' : ''}">${cardSender(m)}${bubbleContent(m)}</div><div class="time">${byTag(m)}${t}</div>`;
   return div;
 }
 
@@ -655,27 +827,40 @@ function fmtTime(ts){
 }
 
 /* ==================== 朋友圈轻互动 ==================== */
-let activeTab = 'chat';        // 'chat' | 'moment'
+let activeView = 'chat';       // 'chat' | 'moment' | 'friends' | 'tasks'
 let momentData = null;         // /api/moments 最近一次响应
 let activeMoment = null;       // 当前打开的圈 tid
 let momentView = 'panel';      // 'panel'=自动互动管理 | 'detail'=圈详情
 let momentSigs = '';           // 增量渲染签名（与消息区同理，免打扰复制/滚动）
 
-function switchTab(tab) {
-  activeTab = tab;
-  document.getElementById('tabChat').classList.toggle('active', tab === 'chat');
-  document.getElementById('tabMoment').classList.toggle('active', tab === 'moment');
-  document.getElementById('convList').style.display = tab === 'chat' ? '' : 'none';
-  document.getElementById('momentList').style.display = tab === 'moment' ? '' : 'none';
-  document.getElementById('searchWrap').style.display = tab === 'chat' ? '' : 'none';
-  document.getElementById('chatPane').style.display = tab === 'chat' ? '' : 'none';
-  document.getElementById('momentPane').style.display = tab === 'moment' ? '' : 'none';
-  if (tab === 'moment') {
-    document.getElementById('emptyTip').style.display = 'none';
+const VIEW_NAV = { chat: 'navChat', moment: 'navMoment', friends: 'navFriends', tasks: 'navTasks' };
+
+function navTo(view) {
+  activeView = view;
+  for (const v in VIEW_NAV) {
+    document.getElementById(VIEW_NAV[v]).classList.toggle('active', v === view);
+  }
+  // 左栏只服务「消息 / 朋友圈」两页；加好友与维护任务是整页宽
+  const inSide = (view === 'chat' || view === 'moment');
+  document.getElementById('sidebar').style.display = inSide ? 'flex' : 'none';
+  document.getElementById('searchWrap').style.display = view === 'chat' ? '' : 'none';
+  document.getElementById('convList').style.display = view === 'chat' ? '' : 'none';
+  document.getElementById('momentList').style.display = view === 'moment' ? '' : 'none';
+  document.getElementById('chatPane').style.display = view === 'chat' ? 'flex' : 'none';
+  document.getElementById('momentPane').style.display = view === 'moment' ? 'flex' : 'none';
+  document.getElementById('friendPage').style.display = view === 'friends' ? 'block' : 'none';
+  document.getElementById('taskPage').style.display = view === 'tasks' ? 'block' : 'none';
+  // 空会话提示：opened 会话后 chatPane 已被整体重写，这个节点可能不存在
+  const et = document.getElementById('emptyTip');
+  if (et) et.style.display = (view === 'chat' && !activeConv) ? 'flex' : 'none';
+
+  if (view === 'moment') {
     momentView = 'panel';      // 进朋友圈页默认落在「互动管理」面板
     loadMoments();
-  } else {
-    document.getElementById('emptyTip').style.display = activeConv ? 'none' : 'flex';
+  } else if (view === 'friends') {
+    loadFriends();
+  } else if (view === 'tasks') {
+    loadTasks();
   }
 }
 
@@ -691,7 +876,7 @@ async function loadMoments() {
   } else {
     badge.style.display = 'none';
   }
-  if (activeTab !== 'moment') { momentData = data; return; }
+  if (activeView !== 'moment') { momentData = data; return; }
   if (sig === momentSigs) return;          // 没变不动 DOM（不打断选择/滚动）
   momentSigs = sig;
   momentData = data;
@@ -974,60 +1159,169 @@ async function readInteractions() {
    auto_reply 的「待生成 / 待发送」队列跑在它的进程内存里，与看板是两个进程。
    落库到 reply_task 表后，这里才有东西可看：谁在待生成、谁卡住了、哪条失败/超时。
    不做取消/插队——只看得见。 */
-let taskPanelOpen = false;
 const TASK_LABEL = {
   pending: '待生成', generating: '生成中', generated: '待发送',
   sending: '发送中', sent: '已发送', failed: '失败', expired: '已作废'
 };
 
+function setNavBadge(id, n) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  if (n > 0) { el.style.display = ''; el.textContent = n > 99 ? '99+' : n; }
+  else el.style.display = 'none';
+}
+
+// 表头（grid 列宽由 .tbl .tr 统一给，这里只管文案）
+function tblHead(cols) {
+  return `<div class="tr th">${cols.map(c => `<span>${c}</span>`).join('')}</div>`;
+}
+
 async function loadTasks() {
   try {
     const res = await fetch('/api/tasks');
     const data = await res.json();
-    renderTaskBar(data.counts || {});
-    if (taskPanelOpen) renderTaskPanel(data.tasks || []);
-  } catch (e) { /* 任务面板不可用不该影响主看板 */ }
+    const c = data.counts || {};
+    setNavBadge('taskBadge', c.open || 0);
+    if (activeView !== 'tasks') return;   // 不在这一页就不动 DOM
+    renderTaskChips(c);
+    renderTaskList(data.tasks || []);
+  } catch (e) { /* 任务页不可用不该影响主看板 */ }
 }
 
-function renderTaskBar(c) {
+function renderTaskChips(c) {
   const bits = [];
-  if (c.open) bits.push(`<span class="tb-chip open">进行中 ${c.open}</span>`);
-  if (c.failed) bits.push(`<span class="tb-chip fail">失败 ${c.failed}</span>`);
-  if (c.expired) bits.push(`<span class="tb-chip">作废 ${c.expired}</span>`);
-  if (!bits.length) bits.push(`<span class="tb-chip">空闲</span>`);
-  document.getElementById('taskStat').innerHTML = bits.join('');
+  if (c.open) bits.push(`<span class="chip ok">进行中 ${c.open}</span>`);
+  if (c.failed) bits.push(`<span class="chip bad">失败 ${c.failed}</span>`);
+  if (c.expired) bits.push(`<span class="chip">作废 ${c.expired}</span>`);
+  if (!bits.length) bits.push(`<span class="chip">当前空闲</span>`);
+  document.getElementById('taskChips').innerHTML = bits.join('');
 }
 
-function toggleTaskPanel() {
-  taskPanelOpen = !taskPanelOpen;
-  document.getElementById('taskPanel').style.display = taskPanelOpen ? 'block' : 'none';
-  document.getElementById('taskCaret').textContent = taskPanelOpen ? '▾' : '▸';
-  if (taskPanelOpen) loadTasks();
-}
-
-function renderTaskPanel(tasks) {
-  const box = document.getElementById('taskPanel');
+function renderTaskList(tasks) {
+  const box = document.getElementById('taskList');
   if (!tasks.length) {
-    box.innerHTML = '<div class="task-item"><div class="ti-text">本次运行暂无任务（收到消息并开启会话开关后才会出现）</div></div>';
+    box.innerHTML = '<div class="blank">本次运行暂无任务（收到消息并开启会话开关后才会出现）</div>';
     return;
   }
-  box.innerHTML = tasks.map(t => {
+  const rows = tasks.map(t => {
     const st = TASK_LABEL[t.status] || t.status;
-    const ts = (t.updated || t.created || 0) * 1000;
-    const time = ts ? new Date(ts).toLocaleTimeString('zh-CN', { hour12: false }) : '';
-    // 终态失败/作废展示原因；其余展示 AI 文案（没生成就展示客户原话）
     const bad = (t.status === 'failed' || t.status === 'expired');
+    // 终态失败/作废展示原因；其余展示 AI 文案（没生成就展示客户原话）
     const body = bad ? (t.reason || '') : (t.reply || t.text || '');
-    const cls = bad ? 'ti-reason' : 'ti-text';
-    return `<div class="task-item">
-      <div class="ti-top">
-        <span class="ti-badge st-${esc(t.status)}">${esc(st)}</span>
-        <span class="ti-name">${esc(t.name || t.conv_id || '')}</span>
-        <span class="ti-time">${esc(time)}</span>
-      </div>
-      ${body ? `<div class="${cls}">${esc(String(body).slice(0, 60))}</div>` : ''}
+    const kind = t.kind === 'first_touch' ? ' <span class="muted">首条激活</span>' : '';
+    return `<div class="tr">
+      <span class="dotst ${esc(t.status)}"><i></i>${esc(st)}</span>
+      <span class="name">${esc(t.name || t.conv_id || '')}${kind}</span>
+      <span class="sub2">${esc(String(body).slice(0, 60))}</span>
+      <span class="time">${esc(fmtTime(t.updated || t.created))}</span>
     </div>`;
   }).join('');
+  box.innerHTML = tblHead(['状态', '客户', '内容 / 原因', '时间']) + rows;
+}
+
+/* ---------- 加好友（名单导入 / 开关 / 进度） ----------
+   开关落库（app_setting），auto_reply 每 20 秒读一次 → 点一下 20 秒内停手，
+   不需要重启进程。名单进 friend_task 后由 worker 按 8~15 分钟间隔逐条发。 */
+const FRIEND_LABEL = {
+  pending: '排队', sent: '已申请', passed: '已通过', rejected: '被拒',
+  already: '已是好友', failed: '失败', expired: '超时'
+};
+
+async function loadFriends() {
+  try {
+    const res = await fetch('/api/friends');
+    const d = await res.json();
+    const c = d.counts || {};
+    // 徽章只报「还在排队」的数量：已通过的不需要盯着看
+    setNavBadge('friendBadge', c.pending || 0);
+    if (activeView !== 'friends') return;   // 不在这一页就不动 DOM
+    const sw = document.getElementById('afSwitch');
+    if (sw) sw.checked = !!d.enabled;
+    const q = document.getElementById('afQuota');
+    if (q) q.textContent = `今日 ${d.sent_today || 0}/${d.daily_limit || 0}`;
+    renderFriendCounts(d);
+    renderFriendList(d.tasks || []);
+  } catch (e) { /* 加好友页不可用不该影响主看板 */ }
+}
+
+function renderFriendCounts(d) {
+  const c = d.counts || {};
+  const bits = [d.enabled ? '已开启' : '已关闭'];
+  if (c.pending) bits.push(`排队 ${c.pending}`);
+  if (c.sent) bits.push(`已申请 ${c.sent}`);
+  if (c.passed) bits.push(`已通过 ${c.passed}`);
+  if (c.failed) bits.push(`失败 ${c.failed}`);
+  document.getElementById('afCounts').textContent = bits.join(' · ');
+}
+
+function setAfMsg(t, ok) {
+  const el = document.getElementById('afMsg');
+  el.textContent = t;
+  el.style.color = ok ? '#12864a' : '#c0392b';
+}
+
+async function toggleFriendSwitch(on) {
+  try {
+    await fetch('/api/friends/toggle', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: on })
+    });
+    setAfMsg(on ? '已开启（20 秒内开始执行）' : '已关闭（当前这条发完就停）', true);
+    loadFriends();
+  } catch (e) { setAfMsg('切换失败: ' + e, false); }
+}
+
+async function importFriendFile() {
+  const f = document.getElementById('afFile').files[0];
+  if (!f) { setAfMsg('先选一个 CSV 文件', false); return; }
+  const fd = new FormData();
+  fd.append('file', f);
+  try {
+    const res = await fetch('/api/friends/import', { method: 'POST', body: fd });
+    const d = await res.json();
+    if (!d.ok) { setAfMsg(d.error || '导入失败', false); return; }
+    const sk = (d.skipped || []).length;
+    setAfMsg(`新增 ${d.added} 条${sk ? `，跳过 ${sk} 条（已存在或格式不对）` : ''}`, true);
+    loadFriends();
+  } catch (e) { setAfMsg('导入失败: ' + e, false); }
+}
+
+async function importFriendText() {
+  const t = document.getElementById('afText').value.trim();
+  if (!t) { setAfMsg('粘贴框是空的', false); return; }
+  try {
+    const res = await fetch('/api/friends/import', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: t })
+    });
+    const d = await res.json();
+    if (!d.ok) { setAfMsg(d.error || '导入失败', false); return; }
+    const sk = (d.skipped || []).length;
+    setAfMsg(`新增 ${d.added} 条${sk ? `，跳过 ${sk} 条（已存在或格式不对）` : ''}`, true);
+    if (!sk) document.getElementById('afText').value = '';
+    loadFriends();
+  } catch (e) { setAfMsg('导入失败: ' + e, false); }
+}
+
+function renderFriendList(tasks) {
+  const box = document.getElementById('friendList');
+  if (!tasks.length) {
+    box.innerHTML = '<div class="blank">名单为空。上传 CSV 或粘贴后，任务会按节奏逐条发出。</div>';
+    return;
+  }
+  const rows = tasks.map(t => {
+    const st = FRIEND_LABEL[t.status] || t.status;
+    const bad = ['failed', 'rejected', 'expired'].includes(t.status);
+    const sub = bad ? (t.reason || '') : (t.note || t.source || '');
+    const kw = (t.keyword && t.keyword !== t.name) ? ` <span class="muted">${esc(t.keyword)}</span>` : '';
+    return `<div class="tr">
+      <span class="dotst ${esc(t.status)}"><i></i>${esc(st)}</span>
+      <span class="name">${esc(t.name || t.keyword || '')}${kw}</span>
+      <span class="sub2">${esc(String(sub).slice(0, 50))}</span>
+      <span class="time">${esc(fmtTime(t.passed_at || t.sent_at || t.created))}</span>
+    </div>`;
+  }).join('');
+  box.innerHTML = tblHead(['状态', '客户', '备注 / 原因', '时间']) + rows;
 }
 
 setInterval(() => {
@@ -1035,10 +1329,12 @@ setInterval(() => {
   if (activeConv) loadMessages();
   loadMoments();
   loadTasks();
+  loadFriends();
 }, POLL);
 loadConversations();
 loadMoments();
 loadTasks();
+loadFriends();
 </script>
 </body>
 </html>

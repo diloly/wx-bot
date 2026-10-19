@@ -22,16 +22,24 @@ API：
     POST /api/moment/switch       设置某客户自动点赞/评论开关 {username, nickname, field, enabled}（默认关）
     POST /api/moment/inter-read   互动通知全部标为已读
     GET  /api/tasks               维护任务队列状态（只读：各状态计数 + 最近 30 条）
+    加好友（friend_add）：
+    GET  /api/friends             开关状态 + 今日用量 + 各状态计数 + 最近 50 条
+    POST /api/friends/toggle      {enabled} 开关自动加好友（落库，20 秒内生效，无需重启）
+    POST /api/friends/import      导入名单：multipart 字段 file=CSV，或 JSON {text}
 """
 import os
+import io
+import csv
 import logging
 
-from flask import Flask, render_template, jsonify, request, send_from_directory
+from flask import (Flask, render_template, jsonify, request, send_from_directory,
+                   Response)
 
 from monitor_store import (
     init, list_conversations, get_messages, add_message, clear_unread, set_switch,
     get_moments, get_interactions, mark_interactions_read, moment_unread_count,
     get_moment_switches, set_moment_switch, get_tasks, task_counts,
+    friend_counts, get_friend_tasks, friend_sent_today, get_setting, set_setting,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -234,6 +242,96 @@ def api_tasks():
         "counts": task_counts(),
         "tasks": get_tasks(limit=30),
     })
+
+
+# ==================== 加好友（名单 / 开关 / 进度） ====================
+# 开关为什么不写 config.json：auto_reply 只在启动时读配置，写了要重启才生效。
+# 改成落 app_setting 表，auto_reply 每 20 秒读一次 → 看板上点「关」立刻停手。
+
+def _af_cfg():
+    """读 config.json 的 add_friend 节（只为拿默认值与展示用的上限）。"""
+    try:
+        import json
+        with open(os.path.join(BASE, "config.json"), "r", encoding="utf-8") as f:
+            return (json.load(f) or {}).get("add_friend", {}) or {}
+    except Exception:
+        return {}
+
+
+@app.route("/api/friends")
+def api_friends():
+    af = _af_cfg()
+    setting = get_setting("add_friend_enabled")
+    # 没在库里设过 → 用 config 的默认值（首次打开看板时看到的就是配置里的状态）
+    enabled = (setting == "1") if setting not in (None, "") else bool(af.get("enabled", False))
+    return jsonify({
+        "enabled": enabled,
+        "daily_limit": int(af.get("daily_limit", 10)),
+        "sent_today": friend_sent_today(),
+        "counts": friend_counts(),
+        "tasks": get_friend_tasks(limit=50),
+    })
+
+
+@app.route("/api/friends/toggle", methods=["POST"])
+def api_friends_toggle():
+    body = request.get_json(silent=True) or {}
+    if "enabled" not in body:
+        return jsonify({"ok": False, "error": "缺少 enabled"}), 400
+    on = bool(body.get("enabled"))
+    set_setting("add_friend_enabled", "1" if on else "0")
+    return jsonify({"ok": True, "enabled": on})
+
+
+@app.route("/api/friends/import", methods=["POST"])
+def api_friends_import():
+    """上传 CSV（multipart 字段 file）或直接粘贴（JSON {text}）。"""
+    try:
+        import friend_add
+    except Exception as e:      # noqa: BLE001
+        return jsonify({"ok": False, "error": "friend_add 不可用: %s" % e}), 500
+    text = ""
+    f = request.files.get("file")
+    if f is not None:
+        raw = f.read()
+        for enc in ("utf-8-sig", "utf-8", "gbk"):
+            try:
+                text = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            return jsonify({"ok": False, "error": "编码无法识别（utf-8/gbk 都试了）"}), 400
+    else:
+        text = ((request.get_json(silent=True) or {}).get("text") or "")
+    if not text.strip():
+        return jsonify({"ok": False, "error": "没有内容"}), 400
+    added, skipped = friend_add.import_text(text)
+    return jsonify({"ok": True, "added": added,
+                    "skipped": [{"keyword": k, "reason": r} for k, r in skipped]})
+
+
+@app.route("/api/friends/template")
+def api_friends_template():
+    """下载名单 CSV 模板。
+
+    与 friend_add.import_text 的解析规则严格对齐（表头 keyword,name,note,source）。
+    输出带 UTF-8 BOM + CRLF：Excel 双击直接打开不乱码，另存回 CSV 也不用改编码。
+    文件名走 ASCII，避免 Content-Disposition 里中文要额外做 RFC 5987 编码。
+    """
+    rows = [
+        ["keyword", "name", "note", "source"],
+        ["13800138000", "王工", "某设计院照明所所长，去年展会加的", "2026广州照明展"],
+        ["wxid_abc123", "李总", "空间设计公司创始人，关注AI出图", "朋友介绍"],
+    ]
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\r\n")
+    w.writerows(rows)
+    data = "\ufeff".encode("utf-8") + buf.getvalue().encode("utf-8")
+    return Response(
+        data, mimetype="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="friend_list_template.csv"'},
+    )
 
 
 if __name__ == "__main__":
