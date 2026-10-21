@@ -9,6 +9,7 @@
 库文件默认 wechat_monitor.db（与脚本同目录），可用环境变量 WECHAT_MONITOR_DB 覆盖。
 """
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -304,16 +305,37 @@ def add_sent(conv_id, text, ts=None):
     conn.close()
 
 
+_WS_RE = re.compile(r"\s+")
+
+
+def _norm_sent(text):
+    """比较用的归一：把空白全部压掉。
+
+    为什么需要（2026-10-21）：群聊把 @ 和正文合并成一条后，微信会把 @ 提醒存成
+    `@昵称\\u2005正文`（U+2005 四分之一空格），而我们这边记的是普通空格；严格
+    相等对不上，收消息桥就会把这条**自己发的**消息当成新消息再录一遍，看板同一
+    句出现两条。这里跟「是不是自己发的」无关，只做文本比对前的清洗。
+    """
+    return _WS_RE.sub("", text or "")
+
+
 def was_sent(conv_id, text, within_seconds=120):
-    """最近 within_seconds 秒内程序是否给该会话发过同文本消息。"""
+    """最近 within_seconds 秒内程序是否给该会话发过同文本消息。
+
+    比较前两侧都做 `_norm_sent` 归一（见上）。放宽比较不会漏掉别人的消息——
+    这张表里只有本程序自己发出去的东西。
+    """
     cutoff = int(time.time()) - within_seconds
+    target = _norm_sent(text)
     conn = _conn()
-    row = conn.execute(
-        "SELECT 1 FROM sent_log WHERE conv_id=? AND text=? AND ts>=? LIMIT 1",
-        (conv_id, text, cutoff),
-    ).fetchone()
-    conn.close()
-    return row is not None
+    try:
+        rows = conn.execute(
+            "SELECT text FROM sent_log WHERE conv_id=? AND ts>=?",
+            (conv_id, cutoff),
+        ).fetchall()
+    finally:
+        conn.close()
+    return any(_norm_sent(r["text"]) == target for r in rows)
 
 
 def get_cursor(conv_id):
@@ -417,6 +439,22 @@ def get_switches():
     rows = conn.execute("SELECT conv_id, enabled FROM conv_switch").fetchall()
     conn.close()
     return {r["conv_id"]: bool(r["enabled"]) for r in rows}
+
+
+def set_conversation_name(conv_id, name):
+    """更新会话显示名（微信端改过备注/昵称后，由收消息桥同步过来）。
+
+    为什么单独开一个函数：conversations.name 原来只由 add_message(name=...)
+    在「该会话有新消息」时更新，用户手动改备注不会产生任何消息，看板就会一直
+    显示改名前的旧名字（2026-10-21 用户反馈）。
+    """
+    conn = _conn()
+    try:
+        conn.execute("UPDATE conversations SET name=? WHERE conv_id=?",
+                     (name, conv_id))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def list_conversations():
@@ -850,19 +888,28 @@ def get_friend_sent(limit=5):
 
 
 def get_friend_passed_pending_touch(limit=20, days=7):
-    """已通过、但首条激活**一条都没真正发出去**的名单项（启动补排用）。
+    """已通过、但首条激活**一条都没排过**的名单项（启动补排用）。
 
     为什么要它：首条激活失败（搜索词错、UI 排队超时、AI 生成失败）时任务落
     failed，而 friend_task 早就是 passed 了——没人补排，这个客户就永远不会被
     激活，用户只能删好友重加才能再试一次。
 
-    幂等靠 NOT EXISTS：只要存在一条 kind='first_touch' 且 status='sent' 的任务
-    就不再返回，不会重复打扰。days 限制只补最近通过的那批，避免把一个月前的
-    人突然翻出来打招呼。
+    幂等靠 NOT EXISTS：**只要这个会话存在过任何一条 kind='first_touch' 的任务
+    就不再返回**。days 限制只补最近通过的那批，避免把一个月前的人突然翻出来
+    打招呼。
 
-    **额外排除 reason 含「无法确认」的 failed**：那是「消息可能已经发出去了，
-    只是读库确认不了」，自动补排等于赌它没发出——赌输就是给客户发两遍。
-    这种留给人工核对（看板能看到失败原因）。
+    为什么是「排过就不管」，而不是「发成功才不管」（2026-10-21 改）：
+    旧判据是 `status='sent' OR reason LIKE '%无法确认%'` 才排除，结果 AI 侧失败
+    （finish_reason=length 那类）的客户**每次重启都被重新排一遍**——同一个人
+    10-19 16:59、10-21 09:42、10-21 11:29 排了三次，三次都因同一个原因失败，
+    面板上看起来就像「这个人的首次激活永远在失败」。补排应该只负责「漏掉的
+    那次」，失败了就该停下来交人工——自动无限重试既有重复打扰客户的风险
+    （部分失败其实是发出去了、只是没确认到），也不符合「失败不自动重试」的
+    既定原则。要再试一次，看板上手动发。
+
+    「无法确认」那类（`reason LIKE '%无法确认%'`：消息可能已经发出去了、只是
+    读库确认不了）也一并落在这个 NOT EXISTS 里——那种更不能自动补，赌它没发出
+    就是给客户发两遍，留给人工核对。
     """
     conn = _conn()
     try:
@@ -873,8 +920,7 @@ def get_friend_passed_pending_touch(limit=20, days=7):
             "WHERE f.status='passed' AND f.conv_id IS NOT NULL AND f.conv_id<>'' "
             "  AND COALESCE(f.passed_at, 0) > ? "
             "  AND NOT EXISTS (SELECT 1 FROM reply_task t WHERE t.conv_id=f.conv_id "
-            "                  AND t.kind='first_touch' "
-            "                  AND (t.status='sent' OR t.reason LIKE '%无法确认%')) "
+            "                  AND t.kind='first_touch') "
             "ORDER BY f.passed_at ASC LIMIT ?",
             (cutoff, int(limit))).fetchall()
         return [dict(r) for r in rows]

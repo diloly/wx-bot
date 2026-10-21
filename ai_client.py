@@ -304,6 +304,36 @@ def _clean(text):
     return text
 
 
+def _extract_content(data):
+    """从 chat/completions 响应里取正文，返回 (text, 失败原因)。
+
+    为什么要单独抽出来（2026-10-21 用户反馈「经常 AI 返回空内容，但中转站后台
+    显示成功」）：HTTP 200 只代表网关把请求走完了，**不代表模型吐了字**。中转站
+    在限流/排队/模型空转时会返回 200 + `content: ""` 或 `null`。原来直接
+    `data["choices"][0]["message"]["content"]`，取到空串就判失败，连原因都看不出来。
+    这里顺带兼容多模态分段写法（content 是 [{type:text,text:...}] 的列表）。
+    """
+    choices = data.get("choices") or []
+    if not choices:
+        return "", "choices 为空"
+    msg = choices[0].get("message") or {}
+    c = msg.get("content")
+    if c is None:
+        return "", "content 为 null"
+    if isinstance(c, list):                 # 多模态分段
+        c = "".join(x.get("text", "") for x in c if isinstance(x, dict))
+    c = (c or "").strip()
+    return c, ("" if c else "content 为空串")
+
+
+def _finish_reason(data):
+    """取 finish_reason（取不到时给 '?'，便于日志里看出是网关没给）。"""
+    choices = data.get("choices") or []
+    if not choices:
+        return "?"
+    return choices[0].get("finish_reason") or "?"
+
+
 def generate(cfg, contact, intent, extra_context="", timeout=60):
     """调用大模型生成一条发给客户的微信文案，返回清洗后的纯文本。
 
@@ -337,8 +367,14 @@ def generate(cfg, contact, intent, extra_context="", timeout=60):
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    def _post(override=None):
+        """发一次请求并返回 JSON；404 的 Ollama 诊断逻辑原样保留。
+
+        override：临时覆盖 payload 字段。只用于「预算被 max_tokens 吃光时加
+        预算重试」——那种情况重发一份原样的 body 是没有意义的。
+        """
+        body = payload if not override else {**payload, **override}
+        resp = requests.post(url, headers=headers, json=body, timeout=timeout)
         if resp.status_code == 404:
             # Ollama 对两类情况都返回 404：① 请求了没拉取的模型；② 老版本 Ollama 没有 /v1 兼容层
             body = resp.text or ""
@@ -369,13 +405,52 @@ def generate(cfg, contact, intent, extra_context="", timeout=60):
                 f"或把 ai_secrets.json 的 base_url 改为 Ollama 原生接口 http://localhost:11434/api 另行适配。"
             )
         resp.raise_for_status()
-        data = resp.json()
-        content = data["choices"][0]["message"]["content"]
+        return resp.json()
+
+    try:
+        data = _post()
+        content, why = _extract_content(data)
+        fr = _finish_reason(data)
+        if not content and fr == "length":
+            # 预算被吃光（2026-10-21 定位，首条激活连续三次失败的真凶）：
+            # 这个模型在「新客户首条激活」这种没有上下文、要自己构思开场白的
+            # 场景会进推理模式，而**推理 token 同样计入 max_tokens**。200 的预算
+            # 被思维链吃干净 → finish_reason=length、content 一个字都没有。
+            # 关键点：这种情况**原样重试必然还是空**（预算没变，同样的推理还会
+            # 跑一遍），必须先把预算加上去再试。
+            boosted = min(max(max_tokens * 6, 2000), 16000)
+            log.warning(
+                "AI 正文为空且被 max_tokens 截断（finish_reason=length，"
+                "max_tokens=%s，usage=%s），把预算提到 %s 重试",
+                max_tokens, data.get("usage"), boosted)
+            data = _post({"max_tokens": boosted})
+            content, why = _extract_content(data)
+            fr = _finish_reason(data)
+            if not content and fr == "length":
+                raise RuntimeError(
+                    "AI 生成失败：模型的推理过程耗尽了 max_tokens（已临时提到 %d），"
+                    "正文一个字都没输出。请把 ai_secrets.json 的 max_tokens 调大，"
+                    "或换一个非推理模型。" % boosted)
+        elif not content:
+            # 中转站偶发「200 但没内容」（限流排队/网关丢包/模型空转）。这种情况
+            # 重试一次通常就好——直接判失败等于让客户白等一条回复（2026-10-21）。
+            log.warning("AI 返回空内容（%s，finish_reason=%s，usage=%s），1.5s 后重试",
+                        why, fr, data.get("usage"))
+            time.sleep(1.5)
+            data = _post()
+            content, why = _extract_content(data)
+            fr = _finish_reason(data)
+        if not content:
+            raise RuntimeError(
+                "AI 返回空内容（%s；finish_reason=%s；已重试 1 次仍为空）" % (why, fr))
         return _clean(content)
     except requests.exceptions.ConnectionError:
         raise RuntimeError(
             f"连不上大模型服务（{url}）。本地 Ollama 请先 `ollama serve` 并 `ollama pull {model}`；"
             f"云端请检查 base_url / api_key / 网络。"
         )
+    except RuntimeError:
+        # 上面自己抛的（404 诊断 / 空内容）已经是可读文案，不要再套一层
+        raise
     except Exception as e:  # noqa: BLE001
         raise RuntimeError(f"AI 生成失败：{e}")
