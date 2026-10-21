@@ -54,6 +54,7 @@ auto_reply.py —— 自动回复闭环：实时收消息 -> 大模型生成 -> 
 import argparse
 import queue
 import random
+import re
 import sys
 import threading
 import time
@@ -85,9 +86,10 @@ class ReplyTask:
     排了别人就无限期挂着。
     """
     __slots__ = ("id", "conv_id", "name", "text", "created", "deadline", "reply",
-                 "kind")
+                 "kind", "at_name")
 
-    def __init__(self, conv_id, name, text, timeout, task_id=None, kind="reply"):
+    def __init__(self, conv_id, name, text, timeout, task_id=None, kind="reply",
+                 at_name=None):
         self.id = task_id          # reply_task 表主键（落库后回填；None=未落库）
         self.conv_id = conv_id
         self.name = name
@@ -96,6 +98,8 @@ class ReplyTask:
         self.deadline = self.created + float(timeout)
         self.reply = None           # AI 生成后回填
         self.kind = kind            # 'reply'=正常回复；'first_touch'=通过后的首条激活
+        # 群聊专用：发送前要 @ 的成员显示名（群昵称）。None=私聊/不 @
+        self.at_name = at_name
 
     def remaining(self):
         return self.deadline - time.time()
@@ -195,6 +199,10 @@ class AutoReplier:
         # conv_id -> {due, name, note, source, tid}：通过后待发的首条
         self._first_touch = {}
         self._pass_seen = set()       # 通过事件去重（conv_id|ts）
+        # 群聊：我在每个群的群昵称（@ 匹配用）+ 缓存时间。群昵称是会变的
+        # （用户随时能改），所以缓存 10 分钟过期，不能永久缓存。
+        self._group_nick = {}         # chatroom -> {昵称, ...}
+        self._group_nick_at = {}      # chatroom -> 缓存时刻
         self.db = None                    # 主线程用（收消息轮询）
         self._ai_db_obj = None            # AI 线程用（联系人反查），避免跨线程共享连接
         self._send_db_obj = None          # 发送线程用（发送结果校验回读），同上
@@ -221,6 +229,60 @@ class AutoReplier:
     def _rate_ok(self, now):
         self._hour_window = [t for t in self._hour_window if now - t < 3600]
         return len(self._hour_window) < self.max_per_hour
+
+    # ---------- 群聊：只有 @ 我才回 ----------
+    # 群里的消息默认**不接**：几十条聊天里可能只有一句在问我们，全回就是刷屏，
+    # 而且会把别人之间的对话当成问自己的。判据只有一条——文本里出现
+    # 「@<我在这个群的昵称>」。昵称不是猜的：get_group_members 能拿到自己在该群
+    # 的显示名（实测 8 个群都取得到）。群昵称随时可改，所以缓存 10 分钟。
+    def _my_group_nicks(self, chatroom):
+        now = time.time()
+        cached = self._group_nick.get(chatroom)
+        if cached is not None and now - self._group_nick_at.get(chatroom, 0) < 600:
+            return cached
+        nicks = set()
+        try:
+            me = (self.db.get_self_info() or {}) if self.db else {}
+            me_wxid = str(me.get("username") or "")
+            for m in (self.db.get_group_members(chatroom) or []):
+                if str(m.get("username")) != me_wxid:
+                    continue
+                for k in ("nick_name", "remark"):
+                    v = (m.get(k) or "").strip()
+                    if v:
+                        nicks.add(v)
+        except Exception as e:      # noqa: BLE001
+            print("[auto] 读群昵称失败(%s): %s" % (chatroom, e))
+        if not nicks:               # 群里没设昵称时，微信 @ 用的是全局昵称
+            try:
+                g = (self.db.get_self_info() or {}) if self.db else {}
+                if g.get("nick_name"):
+                    nicks.add(str(g["nick_name"]).strip())
+            except Exception:       # noqa: BLE001
+                pass
+        self._group_nick[chatroom] = nicks
+        self._group_nick_at[chatroom] = now
+        return nicks
+
+    def _at_me(self, text, chatroom):
+        """这条群消息是否 @ 了我。微信 @ 后面跟的是 U+2005（四分之一空格），
+        但不同版本也可能用普通空格，两种都认。「@所有人」不会匹配到昵称。"""
+        if not text or "@" not in text:
+            return False
+        for n in self._my_group_nicks(chatroom):
+            if ("@" + n + "\u2005") in text or ("@" + n + " ") in text:
+                return True
+        return False
+
+    @staticmethod
+    def _group_sender(text):
+        """群消息前缀 → 发送者显示名：'马总: wxid_xxx:\\n正文' → '马总'。
+
+        前缀是 wx_recv_bridge 入库时拼的（群聊消息都带），不用再查库。
+        解析不出就返回空串，调用方按「不 @」处理。
+        """
+        m = re.match(r"^([^:\n]{1,40}):\s*wxid_[^:\n]{1,40}:\s*\n", text or "")
+        return m.group(1).strip() if m else ""
 
     def _contact_of(self, conv_id, name):
         for c in self.cfg.get("contacts", []):
@@ -271,6 +333,13 @@ class AutoReplier:
             ]
             intent = intent + "\n【最近对话（%d小时内，供参考语境）】\n" % self.context_hours \
                      + "\n".join(lines)
+        if conv_id.endswith(GROUP_SUFFIX):
+            # 群聊的上下文天然是多人混在一起的：不点明的话，AI 很容易把别人之间
+            # 的对话当成在问自己，答非所问。这里把场景和边界写死。
+            intent += ("\n【场景】这是微信群聊，群里多人在说话，消息带「发送者: 内容」"
+                       "前缀。只有明确 @ 你的那条是在问你；不要回应其他人之间的话题，"
+                       "也不要在回复里罗列群成员的发言。你的身份是 **AI 助手**，在群里"
+                       "不要冒充真人；必要时可以用半句话自报（例如「我是 AI 助手小光」）。")
         return intent
 
     # ---------- 任务状态账本（内存队列的持久化镜像，仅供看板「看得见」） ----------
@@ -333,14 +402,27 @@ class AutoReplier:
         if not self._is_allowed(conv_id, name):
             print("[auto] 跳过(群/名单外): %s" % name)
             return
+        # 群聊：只有 @ 我才接。没 @ 就静默丢弃，不进缓冲——注意是**静默**，
+        # 群消息量大，每条都打日志会把终端刷满。
+        at_name = None
+        if conv_id.endswith(GROUP_SUFFIX):
+            raw_text = item.get("text") or ""
+            if not self._at_me(raw_text, conv_id):
+                return
+            at_name = self._group_sender(raw_text)
+            print("[auto] 群里 @ 我：%s（提问者 %s）"
+                  % (name, at_name or "未知"))
         # 每会话自动回复开关（默认关；没开的会话静默不进缓冲，不刷屏）
         if not self.switches.get(conv_id, False):
             return
         now = time.time()
         buf = self._pending.get(conv_id)
         if buf is None:
-            buf = {"name": name, "texts": [], "first_ts": now, "last_ts": now}
+            buf = {"name": name, "texts": [], "first_ts": now, "last_ts": now,
+                   "at_name": at_name}
             self._pending[conv_id] = buf
+        if at_name and not buf.get("at_name"):
+            buf["at_name"] = at_name    # 群里多条合并时，记住是谁 @ 的
         buf["name"] = name
         buf["texts"].append(item.get("text", ""))
         buf["last_ts"] = now                    # 每来一条就把窗口往后推
@@ -375,7 +457,8 @@ class AutoReplier:
             return
         self._hour_window.append(now)
         merged = "\n".join(t for t in texts if t)   # 多条按收到顺序拼接，喂给 AI
-        task = ReplyTask(conv_id, name, merged, self.task_timeout)
+        task = ReplyTask(conv_id, name, merged, self.task_timeout,
+                         at_name=buf.get("at_name"))
         task.id = self._task_open(task)        # 状态账本（看板可观测）
         try:
             self._ai_q.put_nowait(task)
@@ -820,7 +903,8 @@ class AutoReplier:
                 self.bot.send_to_contact(task.name, task.reply,
                                          conv_id=task.conv_id, ui_timeout=rem,
                                          by="ai",   # 看板打「AI」标，别和人工发混在一起
-                                         confirm=self._confirm_sent)
+                                         confirm=self._confirm_sent,
+                                         at_name=task.at_name)   # 群聊：发送前先 @ 提问者
             except ui_gate.UITimeoutError as e:
                 print("[auto] 发送排队超时（本条 %.0fs 预算内没排到）: %s —— %s"
                       % (task.name, rem, e))

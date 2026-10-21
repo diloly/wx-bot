@@ -372,6 +372,59 @@ class WeChatPCBot:
         pyautogui.hotkey("ctrl", "v")
         time.sleep(_STEP_GAP)
 
+    def _type_at(self):
+        """敲一个真的「@」键（不经过剪贴板）。
+
+        为什么不能用 `_paste`（2026-10-21 用户报「群里先 @ 发一条、正文再发一条」）：
+        微信 PC 的成员候选弹窗只响应**键盘敲出来的 @**。用剪贴板 Ctrl+V 粘进去的
+        「@」在它看来只是一个普通字符，弹窗根本不弹。弹窗不在的时候，`_at_member`
+        里那个回车就没有「选中成员」的含义了，直接等于发送 —— 这正是原来「@ 单独
+        占一个气泡」的原因。换成真实按键后弹窗正常出现，回车=选中成员（不发送），
+        整条消息由调用方再做一次发送。
+        """
+        if self.dry_run:
+            return
+        pyautogui.write("@", interval=0.05)
+        time.sleep(_STEP_GAP)
+
+    def _at_member(self, name, message):
+        """群聊：把「@昵称 + 正文」合进**同一条消息**发出（2026-10-21 用户口径）。
+
+        做法是「**先写正文，再把 @ 补到最前面**」，而不是「先 @ 再写正文」：
+          · 先 @ 再写正文时，@ 之后那个回车本来是用来**选中**成员的，但微信的
+            成员候选弹窗是 Qt 自绘、读不到也确认不了有没有弹出来。弹窗没弹的
+            时候，这个回车就等于**发送** ——「@昵称」先成一条，正文再成第二条
+            （2026-10-21 用户截图正是这个现象）。
+          · 反过来先粘正文、Ctrl+Home 回行首再敲 @，两种结果都只剩一条：
+            弹窗在 → 回车=选中成员（不发送），再回车才发，消息是「@昵称 正文」；
+            弹窗不在 → 回车直接把「@昵称 正文」整条发出去，紧接着那次回车落在
+            空输入框上，微信不会发空消息。
+        代价：Ctrl+Home 万一不被输入框支持，@ 会落在正文末尾（仍是同一条，
+        内容不丢，只是顺序不对）。
+
+        空格怎么来的：正文是**带一个前导空格**粘进去的，@昵称 补在最前面之后
+        自然就是「@昵称 正文」。昵称自己后面不能加空格——那会一起进候选过滤，
+        微信按完整串匹配，「张三 」匹配不到「张三」，弹窗反而选不中。
+
+        为什么要用真实按键敲 @：微信的成员候选弹窗只认**键盘输入的 @**，用剪贴板
+        Ctrl+V 粘进去的「@」只是个普通字符，弹窗根本不弹（这是原来「@ 单独成一条」
+        的直接原因）。见 `_type_at`。
+        """
+        if self.dry_run:
+            return
+        self._paste(" " + message)      # 正文前预留一个空格：@{昵称} 补进来正好隔开
+        self._hotkey("ctrl", "home")    # 光标回行首：@ 必须加在正文前面
+        time.sleep(0.2)
+        self._type_at()                 # 真实按键才弹成员列表
+        time.sleep(0.9)                 # 等弹窗（异步渲染）
+        # 昵称后面**不能**再加空格：那会一起进候选过滤，微信按完整串匹配，
+        # 「张三 」匹配不到「张三」→ 弹窗反而选不中。空格已经预留在正文前面了。
+        self._paste(name)               # 完整群昵称，让候选收敛到唯一匹配
+        time.sleep(0.9)                 # 等候选过滤收敛
+        self._press("enter")            # 弹窗在=选中成员；不在=整条发出去
+        time.sleep(0.3)
+        self._send_keystroke()          # 弹窗在时这一下才真正发送；不在时输入框已空
+
     def _send_keystroke(self):
         if self.dry_run:
             return
@@ -392,7 +445,7 @@ class WeChatPCBot:
 
     # ---------- 业务动作 ----------
     def send_to_contact(self, name, message, conv_id=None, ui_timeout=None, by="manual",
-                        confirm=None):
+                        confirm=None, at_name=None):
         """对一个联系人：搜索→进会话→发消息。execute 由 dry_run 控制。
         conv_id 传入微信 wxid 时，看板消息库按 wxid 归并会话（与收消息桥一致）；
         省略时按 name 归并（手动 CLI 发送的兼容行为）。
@@ -406,6 +459,9 @@ class WeChatPCBot:
         全程不抛异常）。传了回调就**先校验、通过才写库**；校验不过抛
         SendNotVerified，调用方据此把任务落 failed，而不是记一条假成功。
         回读数据库由调用方负责，本函数不持有连接。
+        at_name：**群聊专用**——把「@昵称 」和正文合进**同一条消息**发出（群里
+        要让人看出在回谁，但用户不想要「先 @ 一条、正文再一条」）。None 表示
+        私聊或不需要 @。两条路径都只产生一个气泡，见 `_at_member` 的说明。
 
         **整个键盘流程在 UI 门内串行执行**（2026-10-16 并发加固）：微信只有
         一份 UI，auto_reply 自动回复与看板手动发送是**两个进程**，不加跨进程
@@ -423,6 +479,10 @@ class WeChatPCBot:
             log.info("[DRY-RUN] 计划发送给 %s : %s", name, message)
             log.info("[DRY-RUN] 按键序列: %s", plan)
             return
+        # 群里 @ 之后真正落屏的那条消息是「@昵称 正文」（同一个气泡）。sent_log
+        # 与看板消息库都按**真实外发文本**记，否则收消息桥认不出来又把这条自己
+        # 发的消息补录一遍，看板同一句出现两条。
+        sent_text = ("@" + at_name + " " + message) if at_name else message
         try:
             # 先在**门外**、且在按发送键**之前**记 sent_log：收消息轮询读到这条
             # 回执时要靠它去重跳过。必须在按键前写——发送后本函数还要 nap(delay)
@@ -432,7 +492,7 @@ class WeChatPCBot:
             # 时间更早，发送那条 id 更大、晚 7s）。写在这里也顺便保证这次 DB 写
             # 不在 UI 门内（不占着微信锁做 IO）。
             try:
-                store_add_sent(conv_id or name, message)
+                store_add_sent(conv_id or name, sent_text)
             except Exception as e:
                 log.warning("预写 sent_log 失败（回执可能重复上屏）: %s", e)
             with ui_gate.hold("发送给 %s" % name, timeout=ui_timeout):
@@ -445,8 +505,12 @@ class WeChatPCBot:
                 self._paste(name)           # 粘贴要搜的名字
                 self._press("enter")        # 打开顶部搜索结果（需名字唯一）
                 time.sleep(0.6)
-                self._paste(message)        # 粘贴消息到会话输入框
-                self._send_keystroke()      # 发送
+                if at_name:
+                    # 群聊：@ + 正文合并成同一条（内部含最后一次发送）
+                    self._at_member(at_name, message)
+                else:
+                    self._paste(message)    # 粘贴消息到会话输入框
+                    self._send_keystroke()  # 发送
             # 注意：这里**不**打「已发送」——键盘动作跑完只代表按了键，
             # 真正算不算发出去要看下面的回读校验。日志必须与真实结果一致，
             # 否则排查时会被一行"已发送"带偏。
@@ -470,7 +534,7 @@ class WeChatPCBot:
             # 写回统一消息库，供网页看板即时上屏（失败不影响已发送；不碰 UI，
             # 放在门外做，别白占 UI 锁）
             try:
-                store_add_message(conv_id or name, "me", message, name=name, sent_by=by)
+                store_add_message(conv_id or name, "me", sent_text, name=name, sent_by=by)
             except Exception as e:
                 log.warning("写入看板消息库失败（不影响已发送）: %s", e)
             # 到这里才是「回读确认过 + 已落库」，日志和账本含义一致

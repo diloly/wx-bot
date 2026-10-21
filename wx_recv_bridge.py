@@ -521,6 +521,42 @@ def is_self(m):
     return sid == 2 or sid == "2"
 
 
+# ---- 会话显示名同步（人工改过备注后，看板要跟着变）----
+# conversations.name 原来只在「该会话有新消息」时由 add_message(name=...) 更新。
+# 用户在微信里改备注/昵称**不会产生任何消息**，于是看板永远显示改名前的旧名字
+# （2026-10-21 用户反馈：把「A站-胡梽彬」改成「A站-空间设计协同平台」，面板不动）。
+# poll_new 每一轮本来就在逐个读 get_nickname，顺手缓存下来，每 60 秒批量比对一次
+# 写回库——不额外查 contact.db，开销只有几十次字符串比较。
+_NAME_SYNC_EVERY = 60.0
+_name_cache = {}            # conv_id -> 本轮读到的备注/昵称
+_last_name_sync = 0.0
+
+
+def _sync_names():
+    """把本轮读到的最新昵称写回 conversations（只写有变化的）。"""
+    global _last_name_sync
+    now = time.time()
+    if now - _last_name_sync < _NAME_SYNC_EVERY:
+        return
+    _last_name_sync = now
+    try:
+        cur = {c["conv_id"]: (c.get("name") or "")
+               for c in monitor_store.list_conversations()}
+    except Exception:               # noqa: BLE001
+        return
+    changed = 0
+    for cid, nm in list(_name_cache.items()):
+        if not nm or cid not in cur or nm == cur[cid]:
+            continue
+        try:
+            monitor_store.set_conversation_name(cid, nm)
+            changed += 1
+        except Exception:           # noqa: BLE001
+            pass
+    if changed:
+        print("[bridge] 已同步 %d 个会话的备注/昵称" % changed)
+
+
 def poll_new(db, progress=False):
     """轮询一轮：新入站消息写入 monitor_store，返回新增消息 dict 列表
     （conv_id/name/text/ts/type/role）。auto_reply.py 复用本函数实现自动回复闭环。
@@ -545,6 +581,7 @@ def poll_new(db, progress=False):
             name = db.get_nickname(user) or user
         except Exception:
             name = user
+        _name_cache[user] = name        # 供 _sync_names 定期回写（改备注后看板要跟着变）
         cursor = monitor_store.get_cursor(user)
         try:
             if cursor and cursor.get("max_seq") and get_new:
@@ -636,6 +673,7 @@ def poll_new(db, progress=False):
             if seq > max_seq:
                 max_seq = seq
         monitor_store.set_cursor(user, s.get("last_time") or 0, max_seq)
+    _sync_names()      # 低频：把改过的备注/昵称同步回看板会话名
     if progress:
         print("[poll] 扫描 %d 会话（基线 %d / 增量 %d），耗时 %.1fs"
               % (total, n_baseline, n_incr, time.time() - t0))
