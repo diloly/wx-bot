@@ -71,6 +71,20 @@
   "ui": {
     "lock_timeout_seconds": 180
   },
+  "outreach": {
+    "enabled": false,
+    "daily_limit": 5,
+    "interval_min_seconds": 1800,
+    "interval_max_seconds": 5400,
+    "work_start_hour": 9,
+    "work_end_hour": 21,
+    "silent_days": 7,
+    "max_days": 60,
+    "min_gap_days": 14,
+    "max_per_contact": 3,
+    "lookback_days": 90,
+    "intent": ""
+  },
   "knowledge": {
     "dir": "knowledge",
     "top_k": 3

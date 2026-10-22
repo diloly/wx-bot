@@ -63,7 +63,7 @@ import monitor_store
 import ui_gate
 from ai_client import generate as ai_generate
 from wechat_ui import (WeChatPCBot, load_config, SendNotVerified,
-                       SendUnconfirmed)
+                       SendUnconfirmed, SendAborted)
 from wx_recv_bridge import poll_new, WeChatDB
 
 GROUP_SUFFIX = "@chatroom"
@@ -75,6 +75,20 @@ FRIEND_PASS_PATTERNS = (
     "我通过了你的朋友验证请求",
     "你已添加了",
     "以上是打招呼的消息",
+)
+
+# 主动触达的默认意图（config.json 的 outreach.intent 非空时整体覆盖）。
+# 三条纪律写死：① 明确这是**主动**发起、不是回复；② 必须承接具体内容，
+# 不许「最近怎么样」这类空话；③ 不推销、不发链接、不提价格。
+OUTREACH_INTENT = (
+    "你正在**主动**给一位沉默了一段时间的老客户发微信。注意：他不是刚发消息给你，"
+    "这是你主动找他，所以不要用「收到」「好的」「您刚才说的」这类回复口吻。\n"
+    "目标是把话重新聊起来，不是推销。必须承接下面「上次聊到」里的**具体内容**"
+    "（他提过的项目/问题/需求，或我们答应帮他确认的事），让对方觉得你记得他。\n"
+    "禁止：泛泛问候（「最近怎么样」「在忙吗」「好久不见」这类一律不许用）、"
+    "产品推销、发链接、报价、群发感。\n"
+    "要求：1~3 句口语化中文，只问一个问题，让对方容易接话。"
+    "只输出消息正文，不要解释。"
 )
 
 
@@ -199,6 +213,25 @@ class AutoReplier:
         # conv_id -> {due, name, note, source, tid}：通过后待发的首条
         self._first_touch = {}
         self._pass_seen = set()       # 通过事件去重（conv_id|ts）
+        # ---------- 主动触达：唤醒长期沉默的客户（2026-10-21） ----------
+        # 用户口径：朋友圈不能当由头（大量是转发/杂讯，容易说错对象）。所以
+        # 由头只从 messages 里取——「对方最后一句我们没接」或「上次聊到的内容」，
+        # 拿不到具体由头就不发（宁可少发，也不发空泛问候）。
+        ou = cfg.get("outreach", {}) or {}
+        self.ou_enabled = bool(ou.get("enabled", False))
+        self.ou_daily_limit = int(ou.get("daily_limit", 5))
+        self.ou_gap_min = float(ou.get("interval_min_seconds", 1800))
+        self.ou_gap_max = float(ou.get("interval_max_seconds", 5400))
+        self.ou_work_start = int(ou.get("work_start_hour", 9))
+        self.ou_work_end = int(ou.get("work_end_hour", 21))
+        self.ou_silent_days = int(ou.get("silent_days", 7))       # 多久没动算沉默
+        self.ou_max_days = int(ou.get("max_days", 60))            # 超过就太久了
+        self.ou_min_gap_days = int(ou.get("min_gap_days", 14))    # 同一人冷却
+        self.ou_max_per_contact = int(ou.get("max_per_contact", 3))
+        self.ou_lookback_days = int(ou.get("lookback_days", 90))  # 取历史对话的窗口
+        self.ou_intent = (ou.get("intent") or "").strip()
+        self._ou_day = ""             # 已提示「今日达上限」的那一天（只打印一次）
+        self._ou_next_at = 0.0        # 下一次允许触达的时刻（间隔在投递时抽一次定死）
         # 群聊：我在每个群的群昵称（@ 匹配用）+ 缓存时间。群昵称是会变的
         # （用户随时能改），所以缓存 10 分钟过期，不能永久缓存。
         self._group_nick = {}         # chatroom -> {昵称, ...}
@@ -784,8 +817,12 @@ class AutoReplier:
         except Exception as e:
             print("[auto] 拟人节流异常（已跳过，不影响发送）: %s" % e)
         try:
-            intent = (self._first_touch_intent() if task.kind == "first_touch"
-                      else self._build_intent(task.conv_id))
+            if task.kind == "first_touch":
+                intent = self._first_touch_intent()
+            elif task.kind == "outreach":
+                intent = self._build_outreach_intent(task.text)
+            else:
+                intent = self._build_intent(task.conv_id)
             reply = ai_generate(
                 self.cfg, self._contact_of(task.conv_id, task.name),
                 intent,
@@ -912,12 +949,15 @@ class AutoReplier:
                                reason="UI 排队超时（%.0fs 预算内没排到）" % rem)
                 continue
             except SendNotVerified as e:
-                # 键盘动作跑完了，但回读微信库没有这条 → 真的没发出去。
+                # 键盘动作跑完了，但回读微信库没有这条 → 目标会话里没出现。
                 # 这种**不重试**：发送不可逆，万一其实发了再补一次就是重复打扰客户。
                 # 落 failed 让看板看得见，交人工决定。
+                # 另外还要提示「可能发到别的会话了」——Ctrl+F 那一环万一失败，
+                # 正文会落到当时打开的那个会话里，光看目标会话是查不到的。
                 print("[auto] 发送未确认，按未发出处理(%s): %s" % (task.name, e))
                 self._task_set(task, "failed",
-                               reason="发送未确认：微信库里没查到，可能没真正发出")
+                               reason="发送未确认：目标会话里没查到这条（可能没发出，"
+                                      "也可能发到了别的会话，请人工核对）")
                 continue
             except SendUnconfirmed as e:
                 # 校验链路本身不可用（读库打不开、微信刚重启）。这条消息**可能
@@ -926,6 +966,14 @@ class AutoReplier:
                 print("[auto] 发送无法确认(%s): %s" % (task.name, e))
                 self._task_set(task, "failed",
                                reason="无法确认：回读微信库不可用，可能已发出")
+                continue
+            except SendAborted as e:
+                # 没进到目标会话就中止了：**确定什么都没发出去**。
+                # 与上面两种不同，这里不存在「可能已发出」的风险，面板上直接写
+                # 清楚卡在哪一环（搜索没进 / 正文没粘进去 / 没切回聊天页）。
+                print("[auto] 发送中止(%s): %s" % (task.name, e))
+                self._task_set(task, "failed",
+                               reason="未发送（按键前已中止）：%s" % str(e)[:110])
                 continue
             except Exception as e:      # noqa: BLE001
                 print("[auto] 发送异常(%s): %s" % (task.name, e))
@@ -1042,17 +1090,151 @@ class AutoReplier:
                       "（大概率被限流/微信改版，继续点只会加重风控）"
                       % self._af_fail_streak)
 
+    # ---------- 主动触达 worker（唤醒沉默客户，2026-10-21） ----------
+    # 与自动回复的关系：**回复优先**。队列里还有活就先不主动发——客户找上来的
+    # 时效性强，主动触达晚半小时没有任何代价。两者共用同一条 AI/发送流水线，
+    # 所以 UI 门、三态确认、任务账本、看板全都是现成的。
+    def _outreach_worker(self):
+        print("[auto] 主动触达线程已启动（enabled=%s，每日上限 %d 条，%02d:00-%02d:00）"
+              % (self._ou_enabled(), self.ou_daily_limit,
+                 self.ou_work_start, self.ou_work_end))
+        while not self._stop.is_set():
+            try:
+                self._outreach_tick()
+            except Exception as e:      # noqa: BLE001 —— worker 绝不能因单条异常退出
+                print("[auto] 主动触达异常（本轮跳过）: %s" % e)
+            # 5 分钟一扫；用 wait 而不是 sleep，退出信号能立刻生效
+            self._stop.wait(300)
+
+    def _ou_enabled(self):
+        """生效开关：看板/接口设置（app_setting）优先，没有则用 config。
+
+        同 `_add_enabled` 的道理：config.json 只在启动时读一次，紧急刹车不能
+        等重启。走库的话下一轮巡检（≤5 分钟）就生效。
+        """
+        try:
+            v = monitor_store.get_setting("outreach_enabled")
+        except Exception:           # noqa: BLE001
+            v = None
+        if v is None or v == "":
+            return self.ou_enabled
+        return (v == "1")
+
+    def _outreach_tick(self):
+        """一轮巡检：闸门全部通过才挑一个人发一条。任何一环不满足就安静退出。"""
+        if not self._ou_enabled():
+            return
+        import datetime
+        now = time.time()
+        d = datetime.datetime.fromtimestamp(now)
+        if not (self.ou_work_start <= d.hour < self.ou_work_end):
+            return                      # 非工作时段（含夜间）一律不发
+        # 回复优先：待生成/待发送队列非空，说明有客户在等，先让它们走完
+        if not self._ai_q.empty() or not self._send_q.empty():
+            return
+        day_start = datetime.datetime(d.year, d.month, d.day).timestamp()
+        try:
+            sent_today = monitor_store.count_outreach_since(day_start)
+        except Exception as e:          # noqa: BLE001
+            print("[auto] 主动触达统计失败（本轮跳过）: %s" % e)
+            return
+        if sent_today >= self.ou_daily_limit:
+            key = d.strftime("%Y-%m-%d")
+            if self._ou_day != key:     # 一天只提示一次，别每 5 分钟刷一条
+                self._ou_day = key
+                print("[auto] 主动触达今日已达上限 %d 条，今天不再发" % self.ou_daily_limit)
+            return
+        if now < self._ou_next_at:
+            return                      # 进程内间隔（投递时抽一次定死，不每轮重抽）
+        try:
+            last_at = monitor_store.last_outreach_ts()
+        except Exception:               # noqa: BLE001
+            last_at = 0
+        # 跨重启也守住最小间隔：库里最近一条（含在途的）不足 gap_min 就不发
+        if last_at and now - last_at < self.ou_gap_min:
+            return
+        try:
+            cands = monitor_store.get_outreach_candidates(
+                silent_days=self.ou_silent_days, max_days=self.ou_max_days,
+                min_gap_days=self.ou_min_gap_days,
+                max_per_contact=self.ou_max_per_contact, limit=3)
+        except Exception as e:          # noqa: BLE001
+            print("[auto] 主动触达取候选失败（本轮跳过）: %s" % e)
+            return
+        for c in cands:
+            conv_id = c.get("conv_id") or ""
+            ctx = self._outreach_context(conv_id)
+            if not ctx:
+                continue                # 没有可承接的具体内容 → 跳过，不发空泛问候
+            name = (c.get("name") or "").strip() or conv_id
+            task = ReplyTask(conv_id, name, ctx, self.task_timeout, kind="outreach")
+            task.id = self._task_open(task)
+            try:
+                self._ai_q.put_nowait(task)
+            except queue.Full:
+                print("[auto] 待生成队列已满，本轮主动触达暂缓")
+                return
+            self._ou_next_at = now + random.uniform(self.ou_gap_min, self.ou_gap_max)
+            days = int((now - (c.get("last_ts") or now)) / 86400)
+            print("[auto] 主动触达 → %s（沉默 %d 天，最后一条是%s；"
+                  "下一条最早 %.0f 分钟后）"
+                  % (name, days,
+                     "对方说的" if c.get("last_role") == "them" else "我方说的",
+                     (self._ou_next_at - now) / 60))
+            return
+
+    def _outreach_context(self, conv_id):
+        """拼「上次聊到哪」：最近几条真实消息 + 距今多少天。
+
+        为什么不用朋友圈（用户 2026-10-21 明确）：朋友圈里大量是转发、行业杂讯，
+        拿它当由头很容易「看到您发的那个…」说错对象。聊天记录是我们自己发的、
+        对方自己说的，语义和归属都确定。
+        """
+        since = int(time.time()) - self.ou_lookback_days * 86400
+        try:
+            msgs = monitor_store.get_messages(conv_id, limit=10, since_ts=since)
+        except Exception as e:          # noqa: BLE001
+            print("[auto] 主动触达取历史失败(%s): %s" % (conv_id, e))
+            return ""
+        lines = []
+        last_ts = 0
+        for m in msgs:
+            t = (m.get("text") or "").strip()
+            if not t:
+                continue
+            if any(p in t for p in FRIEND_PASS_PATTERNS):
+                continue                # 好友通过/打招呼这类系统提示不算聊天内容
+            lines.append("%s：%s"
+                         % ("我" if m.get("role") == "me" else "对方", t[:120]))
+            last_ts = m.get("ts") or last_ts
+        if not lines:
+            return ""
+        days = max(0, int((time.time() - (last_ts or time.time())) / 86400))
+        return "（最后一条距今约 %d 天）\n%s" % (days, "\n".join(lines[-6:]))
+
+    def _build_outreach_intent(self, ctx):
+        """主动触达的意图：把「主动 vs 回复」和「不许空泛问候」写死。
+
+        不写死的话，AI 会把它当成一次普通回复，生成「最近怎么样」「在忙吗」
+        这类废话——那既不像真人，也是最容易被当成营销号的行为。
+        """
+        base = self.ou_intent or OUTREACH_INTENT
+        if ctx:
+            return base + "\n\n【上次聊到（真实聊天记录，供你承接，不要照抄）】\n" + ctx
+        return base
+
     # ---------- worker 启停 ----------
     def _start_workers(self):
         for fn, nm in ((self._ai_worker, "ai-worker"),
                        (self._send_worker, "send-worker"),
                        (self._moment_worker, "moment-worker"),
-                       (self._add_worker, "add-friend-worker")):
+                       (self._add_worker, "add-friend-worker"),
+                       (self._outreach_worker, "outreach-worker")):
             t = threading.Thread(target=self._worker_entry, args=(fn, nm),
                                  name=nm, daemon=True)
             t.start()
             self._threads.append(t)
-        print("[auto] 流水线已启动：AI 生成 / 发送 / 朋友圈 / 加好友 四个线程"
+        print("[auto] 流水线已启动：AI 生成 / 发送 / 朋友圈 / 加好友 / 主动触达 五个线程"
               "（生成与发送互不阻塞，朋友圈刷新也不再卡住收消息）")
 
     def _worker_entry(self, fn, name):
@@ -1135,6 +1317,15 @@ class AutoReplier:
         else:
             print("[auto] 加好友未启用（config.add_friend.enabled=false 或看板已关）："
                   "名单只入库，不会自动发申请")
+        if self._ou_enabled():
+            print("[auto] 主动触达已启用：每日 %d 条、间隔 %.0f~%.0f 分钟、%02d:00-%02d:00、"
+                  "沉默 ≥%d 天、同一人冷却 %d 天/最多 %d 次（看板可随时开关）"
+                  % (self.ou_daily_limit, self.ou_gap_min / 60.0, self.ou_gap_max / 60.0,
+                     self.ou_work_start, self.ou_work_end,
+                     self.ou_silent_days, self.ou_min_gap_days,
+                     self.ou_max_per_contact))
+        else:
+            print("[auto] 主动触达未启用（config.outreach.enabled=false）：不会主动给客户发消息")
         print("[auto] 首轮要全量解密全部数据库，可能数分钟；之后每轮秒级。进度见 [scan] 行")
         # 朋友圈轮询（读路线：MomentDB 解密 sns.db，零 UI；写操作默认手动，
         # 开了客户自动开关（moment_switch）才对新圈自动点赞/评论）

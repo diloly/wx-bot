@@ -77,6 +77,22 @@ class SendNotVerified(Exception):
     """
 
 
+class SendAborted(Exception):
+    """还没到「发送」这一步就主动中止了 —— 一定**没发出任何东西**。
+
+    2026-10-21 用户报的场景：Ctrl+F 之后昵称没真进搜索框，程序却继续往下走，
+    粘了 AI 正文、按了回车，结果**根本没进到目标会话**，正文要么发给了当前
+    打开的那个会话（发错人），要么卡在搜索框里。
+
+    根因是没有一步验证「昵称确实输进去了」。现在 `_open_conversation` 用
+    「Ctrl+A + Ctrl+C 回读焦点框文本」来确认，确认不到就**整条中止**：
+    不粘正文、不按发送键，直接抛这个异常。
+
+    和另外两个的区别：SendNotVerified＝发了但库里查不到；SendUnconfirmed＝
+    发没发不知道；SendAborted＝**确定什么都没发**，可以直接重试或交人工。
+    """
+
+
 class SendUnconfirmed(Exception):
     """消息可能发出去了，但**没法确认**（回读微信库不可用）。
 
@@ -372,6 +388,101 @@ class WeChatPCBot:
         pyautogui.hotkey("ctrl", "v")
         time.sleep(_STEP_GAP)
 
+    # 剪贴板哨兵：不要用 \x00 之类的字符——Windows 剪贴板按 NUL 截断，
+    # 写进去会变成空串，哨兵就失去意义了。
+    _CLIP_SENTINEL = "__wechatbot_clip_sentinel__"
+
+    def _read_edit_text(self):
+        """把**当前焦点输入框**里的文本复制出来读，读不到返回 ""。
+
+        为什么需要（2026-10-21）：微信是 Qt 自绘，控件树读不到，但输入框本身支持
+        标准的 Ctrl+A / Ctrl+C。于是「昵称到底有没有输进去」这件事可以客观验证：
+        先往剪贴板塞一个哨兵值，再全选复制，最后读剪贴板——
+          · 读回哨兵 → 复制没生效（焦点不在可编辑控件上，或框里本来就是空的）；
+          · 读回别的 → 那就是焦点框里的真实内容。
+        哨兵不能省：否则复制失败时读到的是上一轮留在剪贴板里的旧内容（很可能正是
+        要搜的昵称），会把「什么都没输进去」误判成「输进去了」。
+
+        纯只读：Ctrl+A 只是**选中**，不删不写；紧接着的粘贴会整体替换选中内容，
+        这正是我们要的（不让上一次的残留文字混进来）。
+        """
+        if self.dry_run:
+            return ""
+        sentinel = self._CLIP_SENTINEL
+        try:
+            pyperclip.copy(sentinel)
+        except Exception:               # noqa: BLE001
+            return ""
+        pyautogui.hotkey("ctrl", "a")
+        time.sleep(0.15)
+        pyautogui.hotkey("ctrl", "c")
+        time.sleep(0.25)
+        try:
+            got = pyperclip.paste() or ""
+        except Exception:               # noqa: BLE001
+            return ""
+        return "" if got == sentinel else got
+
+    def _open_conversation(self, name, tries=3):
+        """Ctrl+F 搜昵称 → 进会话，并且**每一步都回读验证真的生效**。返回 bool。
+
+        2026-10-21 用户报：「有时候没把昵称输入进去，就粘贴了 AI 内容并回车确认，
+        导致根本没进入会话窗口发送」。原流程 Ctrl+F → Ctrl+A → 粘贴 → 回车 全是
+        「发完就不管」：微信搜索面板是异步渲染的，慢一点那次粘贴就落空，后面
+        回车变成在空搜索框上按回车，AI 正文则粘进了**当前打开的那个会话**——
+        要么发错人，要么卡在搜索框里没发出去。
+
+        现在：
+          1. 最多试 tries 次：Ctrl+F → 全选 → 粘昵称 → **回读焦点框**（见
+             `_read_edit_text`）。读到昵称才算成功，读不到就重来（面板还没起来
+             / 焦点没进搜索框）——用户遇到的就是「这一步悄悄失败」。
+          2. 按 Enter 打开搜索结果，再回读焦点框：
+             · 空 → 已在消息输入框，可以往下发；
+             · 仍**全等**于昵称 → 卡在搜索框（Enter 没打开会话：重名、无结果等），
+               再按一次 Enter 试一次，仍不行就放弃；
+             · 其他内容 → 输入框里有草稿，照发（粘贴会覆盖它，记一条日志）。
+        返回 False 时调用方必须**整条中止**，绝不能继续粘正文。
+        """
+        target = (name or "").strip()
+        if not target:
+            log.error("搜索词为空，拒绝执行 Ctrl+F 流程（避免把正文发到当前会话）")
+            return False
+        for i in range(max(1, tries)):
+            self._hotkey("ctrl", "f")       # 打开搜索
+            time.sleep(0.5)                 # 等面板起来并拿到焦点（异步渲染）
+            self._hotkey("ctrl", "a")       # 全选搜索框旧内容
+            self._paste(target)             # 粘贴要搜的名字
+            time.sleep(0.3)
+            got = self._read_edit_text()
+            if (got or "").strip() == target:
+                break
+            log.warning("Ctrl+F 后昵称没进搜索框（回读到 %r），重试 %d/%d",
+                        (got or "")[:30], i + 1, tries)
+            time.sleep(0.4)
+        else:
+            log.error("Ctrl+F 搜索「%s」连续 %d 次没把昵称输进去，中止本次发送", target, tries)
+            return False
+
+        self._press("enter")                # 打开顶部搜索结果（需名字唯一）
+        time.sleep(0.7)
+        got = (self._read_edit_text() or "").strip()
+        # 判据用**全等**而不是「包含」：搜索框里就是我们刚粘的那串昵称，全等才好认。
+        # 若用包含，输入框里恰好有一句提到该昵称的草稿时会被误判成「还在搜索框」，
+        # 再按一次回车就把草稿发出去了。
+        if got == target:
+            # 还停在搜索框：Enter 没打开会话。再给一次机会（列表项可能还没渲染完）
+            self._press("enter")
+            time.sleep(0.7)
+            got = (self._read_edit_text() or "").strip()
+            if got == target:
+                log.error("Enter 没能打开「%s」的会话（搜索框里仍是昵称），中止本次发送",
+                          target)
+                return False
+        elif got:
+            log.warning("「%s」的会话输入框里已有未发内容（%r），本次发送会覆盖它",
+                        target, got[:30])
+        return True
+
     def _type_at(self):
         """敲一个真的「@」键（不经过剪贴板）。
 
@@ -498,18 +609,35 @@ class WeChatPCBot:
             with ui_gate.hold("发送给 %s" % name, timeout=ui_timeout):
                 hwnd, title = focus_wechat()
                 _require_foreground(hwnd)   # 关键：确保按键只发到微信，发错就中止
-                switch_to_chat_page()       # 关键：Ctrl+F 只在聊天页有效（停在朋友圈页会静默失效）
+                # 关键：Ctrl+F 只在聊天页有效（停在朋友圈页会静默失效）。
+                # 返回 False 只是「会话列表没确认出来」，不代表一定在别的页，
+                # 所以**不中止**（这条判据本身是 best-effort，硬中止会让所有
+                # 回复一起停摆）；但多给它一次机会，切回来了 Ctrl+F 才靠得住。
+                if not switch_to_chat_page():
+                    log.warning("切回聊天页未确认，再试一次（%s）", name)
+                    time.sleep(0.5)
+                    switch_to_chat_page()
                 _require_foreground(hwnd)   # 切页后再确认一次前台（双保险，历史事故教训）
-                self._hotkey("ctrl", "f")   # 打开搜索
-                self._hotkey("ctrl", "a")   # 全选搜索框旧内容
-                self._paste(name)           # 粘贴要搜的名字
-                self._press("enter")        # 打开顶部搜索结果（需名字唯一）
-                time.sleep(0.6)
+                # 搜索并进入会话。**必须验证昵称真的输进去了**——否则后面粘贴的
+                # 正文会落到当前打开的会话里（2026-10-21 用户报的发错会话）。
+                if not self._open_conversation(name):
+                    raise SendAborted(
+                        "没能进入「%s」的会话（Ctrl+F 搜索框里没读到昵称，或 Enter "
+                        "没打开搜索结果）。已在粘贴正文之前中止，本次没有发出任何内容。"
+                        % name)
                 if at_name:
                     # 群聊：@ + 正文合并成同一条（内部含最后一次发送）
                     self._at_member(at_name, message)
                 else:
                     self._paste(message)    # 粘贴消息到会话输入框
+                    # 粘完再回读一次：确认正文**真的进了输入框**才按发送键。
+                    # 用前 16 个字做比对（不是「非空就算过」）——焦点万一跑到聊天
+                    # 记录区，Ctrl+A/Ctrl+C 复制到的是聊天内容，非空判断会放过它。
+                    probe = message.strip()[:16]
+                    if probe and probe not in (self._read_edit_text() or ""):
+                        raise SendAborted(
+                            "正文没粘进「%s」的输入框，未按发送键（本次没有发出任何内容）"
+                            % name)
                     self._send_keystroke()  # 发送
             # 注意：这里**不**打「已发送」——键盘动作跑完只代表按了键，
             # 真正算不算发出去要看下面的回读校验。日志必须与真实结果一致，
@@ -553,6 +681,12 @@ class WeChatPCBot:
         except SendUnconfirmed as e:
             # 同上：必须让调用方看见，且不能写库（真实发出才落库）。
             log.error("发送无法确认(%s): %s", name, e)
+            raise
+        except SendAborted as e:
+            # 没进会话就中止了：**确定没发出任何东西**，和上面两种性质不同
+            # （可以放心重试，不存在重复打扰客户的问题）。抛给调用方落 failed，
+            # 让面板上看得到真实原因，而不是被「发送失败」四个字糊过去。
+            log.error("发送中止(%s): %s", name, e)
             raise
         except Exception as e:
             log.error("发送失败(%s): %s", name, e)

@@ -478,7 +478,7 @@ def get_messages(conv_id, limit=300, since_ts=None):
     """
     conn = _conn()
     sql = ("SELECT * FROM ("
-           "SELECT role, text, ts, media, card, sent_by FROM messages WHERE conv_id=?")
+           "SELECT id, role, text, ts, media, card, sent_by FROM messages WHERE conv_id=?")
     params = [conv_id]
     if since_ts:
         sql += " AND ts>=?"
@@ -488,6 +488,41 @@ def get_messages(conv_id, limit=300, since_ts=None):
     rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
     conn.close()
     return rows
+
+
+def delete_message(msg_id):
+    """删一条消息（看板「删错录的消息」用）。删成功返回 True。
+
+    只动看板自己的库，**不碰微信客户端**——微信里那条还在，下次轮询也不会重读
+    （poll_cursor 水印已经越过它）。真要连客户端一起删，得在微信里手动撤回/删除。
+
+    删完要**重算该会话的预览行**：`conversations.last_msg/last_ts` 是冗余快照，
+    删掉的可能正是最后一条，不重算左侧列表会一直显示已经不存在的那句话。
+    """
+    try:
+        mid = int(msg_id)
+    except (TypeError, ValueError):
+        return False
+    conn = init()
+    try:
+        row = conn.execute("SELECT conv_id FROM messages WHERE id=?", (mid,)).fetchone()
+        if not row:
+            return False
+        conv_id = row["conv_id"]
+        conn.execute("DELETE FROM messages WHERE id=?", (mid,))
+        last = conn.execute(
+            "SELECT text, ts FROM messages WHERE conv_id=? "
+            "ORDER BY ts DESC, id DESC LIMIT 1", (conv_id,)).fetchone()
+        if last:
+            conn.execute("UPDATE conversations SET last_msg=?, last_ts=? WHERE conv_id=?",
+                         (last["text"] or "", last["ts"] or 0, conv_id))
+        else:
+            conn.execute("UPDATE conversations SET last_msg='', last_ts=0 WHERE conv_id=?",
+                         (conv_id,))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
 
 
 def recent_messages_matching(patterns, since_ts, limit=200):
@@ -995,6 +1030,106 @@ def expire_stale_friend_tasks(days=7, reason="超过 %d 天未通过"):
             (reason % int(days), int(time.time()), cutoff))
         conn.commit()
         return cur.rowcount or 0
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 主动触达（唤醒长期沉默的客户，2026-10-21）
+# ---------------------------------------------------------------------------
+# 为什么候选全从**我们自己的库**里算，不看朋友圈（用户 2026-10-21 明确）：
+# 朋友圈里大量是转发、行业杂讯、无关内容，拿它当搭话由头，十有八九会变成
+# 「看到您发的那个…」结果说错对象，比不发更糟。真正可靠的由头只有两类，
+# 都在 messages 里：① 对方最后说了一句、我们没接（欠一个回应）；② 上次聊到
+# 的具体内容（接着聊）。这两条都不依赖朋友圈。
+def get_outreach_candidates(silent_days=7, max_days=60, min_gap_days=14,
+                            max_per_contact=3, limit=5, now=None):
+    """沉默客户候选池（主动触达用）。
+
+    入选条件：
+      · 该会话在看板上**打开了自动回复开关**（conv_switch.enabled=1）——只有
+        用户显式授权过的会话才会被主动碰；
+      · 私聊（群不做主动触达）；
+      · 最后一条消息距今在 [silent_days, max_days] 天：太短不算沉默，太久像骚扰；
+      · 我方至少说过一句（从没聊过的交给首条激活，不归这里管）；
+      · 累计主动触达次数 < max_per_contact；
+      · 距上次主动触达 >= min_gap_days。
+
+    排序：**最后一条是对方说的**排前面——那是「我们欠一个回应」，搭话最自然、
+    最不像营销；其余按最近互动时间从新到旧（越近越容易唤醒）。
+    """
+    now = int(now or time.time())
+    lo = now - int(max_days) * 86400
+    hi = now - int(silent_days) * 86400
+    gap_cutoff = now - int(min_gap_days) * 86400
+    conn = _conn()
+    try:
+        rows = conn.execute(
+            "SELECT c.conv_id, c.name, c.last_ts, "
+            "  (SELECT m.role FROM messages m WHERE m.conv_id=c.conv_id "
+            "     ORDER BY m.ts DESC, m.id DESC LIMIT 1) AS last_role, "
+            "  (SELECT COUNT(*) FROM messages m WHERE m.conv_id=c.conv_id "
+            "     AND m.role='me') AS me_count, "
+            "  (SELECT COUNT(*) FROM reply_task t WHERE t.conv_id=c.conv_id "
+            "     AND t.kind='outreach' AND t.status='sent' "
+            "     AND COALESCE(t.reason,'') NOT LIKE 'dry-run%') AS ou_count, "
+            "  (SELECT MAX(t.created) FROM reply_task t WHERE t.conv_id=c.conv_id "
+            "     AND t.kind='outreach' AND t.status='sent' "
+            "     AND COALESCE(t.reason,'') NOT LIKE 'dry-run%') AS ou_last "
+            "FROM conversations c "
+            "JOIN conv_switch s ON s.conv_id=c.conv_id AND s.enabled=1 "
+            "WHERE c.conv_id NOT LIKE '%@chatroom' "
+            "  AND c.last_ts BETWEEN ? AND ? "
+            "ORDER BY c.last_ts DESC",
+            (lo, hi)).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            if int(d.get("me_count") or 0) <= 0:
+                continue        # 从没说过话 → 归首条激活，不在这里
+            if int(d.get("ou_count") or 0) >= int(max_per_contact):
+                continue        # 碰过太多次了，停手
+            if int(d.get("ou_last") or 0) > gap_cutoff:
+                continue        # 冷却期内
+            out.append(d)
+        out.sort(key=lambda d: (0 if d.get("last_role") == "them" else 1,
+                                -(d.get("last_ts") or 0)))
+        return out[:int(limit)]
+    finally:
+        conn.close()
+
+
+def count_outreach_since(since_ts):
+    """某时刻之后**已真实发出**的主动触达条数（每日预算用）。
+
+    dry-run 的预演不算——否则开着 dry_run 预览几条，等真开了额度已经用光了。
+    预演任务的状态同样是 'sent'，只能靠 reason 里的 'dry-run' 前缀区分。
+    """
+    conn = _conn()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM reply_task WHERE kind='outreach' "
+            "AND status='sent' AND created>=? "
+            "AND COALESCE(reason,'') NOT LIKE 'dry-run%'",
+            (int(since_ts),)).fetchone()
+        return int(row["n"] or 0)
+    finally:
+        conn.close()
+
+
+def last_outreach_ts():
+    """最近一次主动触达任务的创建时刻（全局间隔闸用）；没有返回 0。
+
+    只看 sent 不够：正在生成/发送中的那一条也该把间隔占住，否则连点两次
+    会给同一个人排两条。
+    """
+    conn = _conn()
+    try:
+        row = conn.execute(
+            "SELECT MAX(created) AS t FROM reply_task WHERE kind='outreach' "
+            "AND status IN ('pending','generating','generated','sending','sent')"
+        ).fetchone()
+        return int(row["t"] or 0)
     finally:
         conn.close()
 
