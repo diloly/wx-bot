@@ -217,6 +217,15 @@
     font-size: 11px; color: #b0b0b0; align-self: flex-end; margin: 0 8px;
     white-space: nowrap;
   }
+  /* 删除单条消息：鼠标移到气泡上才出现，避免平时干扰阅读 */
+  .msg .del {
+    align-self: center; margin: 0 4px; width: 20px; height: 20px; padding: 0;
+    border: none; border-radius: 50%; background: transparent; color: #c2c6ca;
+    font-size: 15px; line-height: 20px; cursor: pointer;
+    opacity: 0; transition: opacity .12s, background .12s, color .12s;
+  }
+  .msg:hover .del { opacity: 1; }
+  .msg .del:hover { background: #e8eaec; color: #e64340; }
   /* 「谁发的」小标（仅外发气泡）：AI=蓝，人工=灰，未标记的不显示 */
   .bytag {
     display: inline-block; margin-right: 5px; padding: 0 4px;
@@ -754,8 +763,35 @@ function buildMsgEl(m) {
   div.className = 'msg ' + (m.role === 'me' ? 'me' : 'them');
   const t = fmtTime(m.ts);
   const isMedia = m.media && !m.card;
-  div.innerHTML = `<div class="bubble${isMedia ? ' media-bubble' : ''}">${cardSender(m)}${bubbleContent(m)}</div><div class="time">${byTag(m)}${t}</div>`;
+  // 删除入口只在 hover 时出现（CSS 控制）。只在能拿到 id 时渲染——历史数据
+  // 没有 id 就没法定位要删哪条，宁可不给按钮也不删错。
+  const delBtn = m.id ? '<button class="del" title="从看板删除这一条（不影响微信客户端）">×</button>' : '';
+  div.innerHTML = `<div class="bubble${isMedia ? ' media-bubble' : ''}">${cardSender(m)}${bubbleContent(m)}</div><div class="time">${byTag(m)}${t}</div>${delBtn}`;
+  const b = div.querySelector('.del');
+  if (b) b.addEventListener('click', () => delMessage(m.id));
   return div;
+}
+
+// 删除单条消息（入错库的脏数据）。只删看板库，微信客户端里那条不会动，
+// 下次轮询也不会重新读进来（水印已经越过它）。
+async function delMessage(id) {
+  if (!id) return;
+  if (!confirm('只从看板库删除这一条，微信客户端里的消息不会动。继续？')) return;
+  try {
+    const res = await fetch('/api/messages/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id })
+    });
+    const d = await res.json();
+    if (!d.ok) { showToast('err', d.error || '删除失败'); return; }
+    renderedSigs = [];        // 清掉增量渲染基线，否则旧节点还留在页面上
+    await loadMessages();
+    loadConversations();      // 删的可能是最后一条，左侧预览要跟着重算
+    showToast('ok', '已删除');
+  } catch (e) {
+    showToast('err', '请求失败：' + e);
+  }
 }
 
 async function loadMessages() {
@@ -1208,7 +1244,9 @@ function renderTaskList(tasks) {
     const bad = (t.status === 'failed' || t.status === 'expired');
     // 终态失败/作废展示原因；其余展示 AI 文案（没生成就展示客户原话）
     const body = bad ? (t.reason || '') : (t.reply || t.text || '');
-    const kind = t.kind === 'first_touch' ? ' <span class="muted">首条激活</span>' : '';
+    const kind = t.kind === 'first_touch' ? ' <span class="muted">首条激活</span>'
+               : t.kind === 'outreach'   ? ' <span class="muted">主动触达</span>'
+               : '';
     return `<div class="tr">
       <span class="dotst ${esc(t.status)}"><i></i>${esc(st)}</span>
       <span class="name">${esc(t.name || t.conv_id || '')}${kind}</span>

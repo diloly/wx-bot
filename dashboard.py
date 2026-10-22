@@ -12,6 +12,7 @@
 API：
     GET  /api/conversations       会话列表（每项带 auto_reply 开关状态 + 全局 auto_reply_enabled/allow_groups）
     GET  /api/messages?conv=<id>  某会话消息
+    POST /api/messages/delete    {id} 删除单条消息（脏数据；只删看板库，不动微信）
     POST /api/open  {conv}        标记已读（清未读）
     POST /api/send  {conv,text}   触发键盘发送（需微信在前台；会写回发送记录）
     POST /api/switch {conv,enabled}  设置某会话的AI自动回复开关（看板每会话一个，默认关）
@@ -40,6 +41,7 @@ from monitor_store import (
     get_moments, get_interactions, mark_interactions_read, moment_unread_count,
     get_moment_switches, set_moment_switch, get_tasks, task_counts,
     friend_counts, get_friend_tasks, friend_sent_today, get_setting, set_setting,
+    count_outreach_since, get_outreach_candidates, delete_message,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -83,6 +85,18 @@ def api_conversations():
 def api_messages():
     conv = request.args.get("conv", "")
     return jsonify(get_messages(conv))
+
+
+@app.route("/api/messages/delete", methods=["POST"])
+def api_messages_delete():
+    """删一条消息（入错库的脏数据）。只删看板库，不动微信客户端。"""
+    data = request.get_json(force=True, silent=True) or {}
+    mid = data.get("id")
+    if mid in (None, ""):
+        return jsonify({"ok": False, "error": "缺少 id"}), 400
+    if not delete_message(mid):
+        return jsonify({"ok": False, "error": "消息不存在或已删除"}), 404
+    return jsonify({"ok": True})
 
 
 @app.route("/api/open", methods=["POST"])
@@ -280,6 +294,55 @@ def api_friends_toggle():
         return jsonify({"ok": False, "error": "缺少 enabled"}), 400
     on = bool(body.get("enabled"))
     set_setting("add_friend_enabled", "1" if on else "0")
+    return jsonify({"ok": True, "enabled": on})
+
+
+# ==================== 主动触达（沉默客户唤醒） ====================
+# 同加好友：开关落 app_setting，auto_reply 下一轮巡检（≤5 分钟）就生效，
+# 不用重启。默认关闭，要开得先确认内容和节奏都合适。
+
+def _ou_cfg():
+    """读 config.json 的 outreach 节（拿默认值与展示用的参数）。"""
+    try:
+        import json
+        with open(os.path.join(BASE, "config.json"), "r", encoding="utf-8") as f:
+            return (json.load(f) or {}).get("outreach", {}) or {}
+    except Exception:
+        return {}
+
+
+@app.route("/api/outreach")
+def api_outreach():
+    ou = _ou_cfg()
+    setting = get_setting("outreach_enabled")
+    enabled = (setting == "1") if setting not in (None, "") else bool(ou.get("enabled", False))
+    import datetime
+    d = datetime.datetime.now()
+    day_start = datetime.datetime(d.year, d.month, d.day).timestamp()
+    return jsonify({
+        "enabled": enabled,
+        "daily_limit": int(ou.get("daily_limit", 5)),
+        "sent_today": count_outreach_since(day_start),
+        "silent_days": int(ou.get("silent_days", 7)),
+        "min_gap_days": int(ou.get("min_gap_days", 14)),
+        "max_per_contact": int(ou.get("max_per_contact", 3)),
+        # 只看不改：当前符合条件的候选人（前端暂未展示，接口先留着排查用）
+        "candidates": get_outreach_candidates(
+            silent_days=int(ou.get("silent_days", 7)),
+            max_days=int(ou.get("max_days", 60)),
+            min_gap_days=int(ou.get("min_gap_days", 14)),
+            max_per_contact=int(ou.get("max_per_contact", 3)),
+            limit=5),
+    })
+
+
+@app.route("/api/outreach/toggle", methods=["POST"])
+def api_outreach_toggle():
+    body = request.get_json(silent=True) or {}
+    if "enabled" not in body:
+        return jsonify({"ok": False, "error": "缺少 enabled"}), 400
+    on = bool(body.get("enabled"))
+    set_setting("outreach_enabled", "1" if on else "0")
     return jsonify({"ok": True, "enabled": on})
 
 
