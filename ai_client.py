@@ -30,8 +30,14 @@ log = logging.getLogger("wechat_pc.ai")
 # ==================== 销售化系统提示词 ====================
 # 默认人设：客户激活型销售。{persona}/{product}/{knowledge} 由 build_system() 填充。
 # ai_secrets.json 里显式写 system_prompt 可整体覆盖本模板（完全自管 prompt 时用）。
-SALES_SYSTEM_TEMPLATE = """你是{persona}，{product}的 AI 销售助手（在线顾问），正在微信上和客户一对一沟通。
+SALES_SYSTEM_TEMPLATE = """你是{persona}，{company}的在线顾问，负责核心产品「{product}」。公司做的是{positioning}，你正在微信上和客户一对一沟通。
 你的任务：激活客户——让沉默的客户重新愿意聊，让在用的客户愿意续费/扩购/转介绍。
+
+【定位纪律——身份别搞错】
+- 我们卖的是 **SaaS 平台/工具**，不是设计服务商：卖的是让设计师更快出方案的工具，
+  不接设计项目、不代做方案、不代出图。客户问"能不能帮我把这个项目做了/帮我出套图/接个单"，
+  统一回"我们是给设计师用的工具，具体能不能覆盖您的需求，我让同事看下再回您"——不接活、不报工期。
+- 一句话定位：{positioning}，覆盖照明、建筑、室内、景观设计。
 
 【身份纪律——合规红线，问必答】
 - 你是 AI 销售助手。被问到"你是机器人吗/是AI吗/是不是真人"时**必须坦然承认**，
@@ -166,9 +172,12 @@ def retrieve(units, query, top_k=3):
 
 
 def build_system(ai_cfg, knowledge_units):
-    """组装销售系统提示词：人设 + 产品知识小节。ai_cfg 可覆写 persona/product。"""
-    persona = (ai_cfg.get("persona") or "陈然").strip()
-    product = (ai_cfg.get("product") or "空间设计 SaaS 平台").strip()
+    """组装销售系统提示词：人设 + 定位 + 产品知识小节。
+    ai_cfg 可覆写 persona/company/product/positioning（config.json 的 ai 块）。"""
+    persona = (ai_cfg.get("persona") or "小光").strip()
+    company = (ai_cfg.get("company") or "中照金智（广州）数据科技").strip()
+    product = (ai_cfg.get("product") or "AI照明工作站（A站）").strip()
+    positioning = (ai_cfg.get("positioning") or "为设计提效的 AI SaaS 平台").strip()
     if knowledge_units:
         blocks = ["〔资料：%s / %s〕\n%s" % (u["file"], u["title"], u["text"])
                   for u in knowledge_units]
@@ -176,7 +185,8 @@ def build_system(ai_cfg, knowledge_units):
     else:
         knowledge = "（暂无相关资料。客户问到产品细节就回答'我确认一下再回复你'，不要编造。）"
     return SALES_SYSTEM_TEMPLATE.format(
-        persona=persona, product=product, knowledge=knowledge)
+        persona=persona, company=company, product=product,
+        positioning=positioning, knowledge=knowledge)
 
 # provider -> 默认 base_url / api_key。所有 AI 覆盖项（provider/model/prompt/base_url/
 # api_key）统一写 ai_secrets.json，优先级最高。"custom" 用于自建/中转端点：base_url
