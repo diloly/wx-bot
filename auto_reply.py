@@ -727,21 +727,32 @@ class AutoReplier:
             print("[auto] 取消首条激活（客户已主动说话）：%s" % ft["name"])
 
     def _first_touch_intent(self):
-        """首条激活的专用意图（不复用日常回复的 intent）。"""
+        """首条激活的专用意图（不复用日常回复的 intent）。
+
+        优先用 config.add_friend.first_touch_intent（显式话术，改文案不用动代码）；
+        留空时退到下面这段内置兜底，身份/定位与 config.ai 同步。
+        """
         if self.ft_intent:
             return self.ft_intent
         ai = self.cfg.get("ai") or {}
         persona = ai.get("persona") or "小光"
-        product = (ai.get("product") or "").strip()
-        prod = ("，做" + product) if product else ""
+        company = ai.get("company") or "中照金智（广州）数据科技"
+        product = (ai.get("product") or "AI照明工作站（A站）").strip()
+        positioning = (ai.get("positioning") or "为设计提效的 AI SaaS 平台").strip()
+        prod = ("，核心产品是「%s」" % product) if product else ""
         return (
-            "你正在微信上给一位**刚通过好友验证、还没说过话**的联系人写第一条主动消息。\n"
-            "你的身份：「%s」，代表中照金智%s。\n"
-            "目标：让对方愿意继续聊，不是立刻成交。\n"
-            "要求：①一句话自报身份；②说明来意（结合对方背景/行业）；"
-            "③给一个具体、可感知的价值点，可以说“需要的话我发您看看”；"
-            "④不报价、不催单、不堆产品功能；⑤口语化、80 字以内，只输出正文。"
-            % (persona, prod))
+            "你正在微信上给一位**刚通过好友验证、还没说过话**的联系人写第一条消息"
+            "（自我介绍 + 破冰）。\n"
+            "身份：你是「%s」，%s的在线顾问；公司做的是%s%s——"
+            "帮照明/建筑/室内/景观设计师用 AI 出效果图和方案汇报物料。\n"
+            "红线：① 我们卖的是 SaaS 平台/工具，**不是接设计项目的外包服务商**，"
+            "绝不说“可以帮您做设计/接项目/代出方案”；② 不报价、不承诺效果、不催单；"
+            "③ 不主动说自己是 AI。\n"
+            "要求：①一句话自报身份（不念公司简介）；②说明来意（优先结合给出的"
+            "来源/备注，没有就泛到行业，绝不编造对方信息）；"
+            "③给一个具体、可感知的价值点，可以说“需要的话我发份介绍给您看看”；"
+            "④不堆产品功能；⑤口语化、80 字以内，只输出正文。"
+            % (persona, company, positioning, prod))
 
     def _tick_first_touch(self):
         """每秒检查一次：到点且未被取消的，投递一条 first_touch 任务。"""
