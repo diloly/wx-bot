@@ -1,0 +1,73 @@
+{
+  "_note": "免 API 主路径 = directory（直接爬公开黄页/B2B/行业目录的列表页与站内搜索结果页，零第三方 API key）。web_search 是可选增强，需要自行申请 Bing/SerpAPI key 才生效，不填也能跑（自动跳过）。",
+  "user_agent": "Mozilla/5.0 (compatible; DealerScraper/1.0; +public-collection)",
+  "respect_robots": true,
+  "min_interval_seconds": 3,
+  "max_retries": 3,
+  "backoff_base": 2,
+  "industry_tag": "照明",
+  "llm": {
+    "base_url": "",
+    "api_key": "",
+    "model": "your-model"
+  },
+  "compliance": {
+    "exclude_personal_mobile": false
+  },
+  "sources": {
+    "web_search": {
+      "enabled": false,
+      "provider": "bing",
+      "api_key": "",
+      "endpoint": "https://api.bing.microsoft.com/v7.0/search",
+      "queries": [
+        "照明 经销商 联系方式",
+        "LED照明 代理商 联系方式",
+        "灯饰 批发 厂家 联系",
+        "商业照明 工程照明 代理",
+        "古镇 灯饰 厂家 官网"
+      ],
+      "max_results_per_query": 20,
+      "market": "zh-CN",
+      "blocked_domains": [
+        "weibo.com", "zhihu.com", "douyin.com", "xiaohongshu.com", "toutiao.com",
+        "163.com", "qq.com", "sina.com.cn", "sohu.com", "ifeng.com", "baidu.com",
+        "csdn.net", "cnblogs.com", "jianshu.com", "bilibili.com"
+      ]
+    },
+    "directory": {
+      "enabled": true,
+      "max_pages": 3,
+      "list_pages": [],
+      "use_site_search": true,
+      "keywords": ["照明经销商", "LED照明代理", "灯饰批发", "商业照明", "工程照明", "古镇灯饰厂家"],
+      "site_search_templates": [
+        "https://www.huangye88.com/search?keyword={kw}",
+        "https://www.11467.com/search/?kw={kw}",
+        "https://www.hc360.com/search?keyword={kw}"
+      ]
+    },
+    "official_site": {
+      "enabled": false,
+      "urls": []
+    },
+    "ali1688": {
+      "enabled": false,
+      "shop_urls": [],
+      "keywords": ["照明 经销商"],
+      "cookie": ""
+    },
+    "yellow_page": {
+      "enabled": false,
+      "base_url": "https://www.huangye88.com",
+      "category_path": "zhaoqiu/lighting/",
+      "max_pages": 5
+    },
+    "ic_api": {
+      "enabled": false,
+      "provider": "qcc",
+      "api_key": "",
+      "keyword": "照明 经销商"
+    }
+  }
+}
