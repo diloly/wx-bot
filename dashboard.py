@@ -32,16 +32,18 @@ import os
 import io
 import csv
 import logging
+import threading
+from urllib.parse import quote
 
 from flask import (Flask, render_template, jsonify, request, send_from_directory,
-                   Response)
+                   send_file, Response)
 
 from monitor_store import (
     init, list_conversations, get_messages, add_message, clear_unread, set_switch,
     get_moments, get_interactions, mark_interactions_read, moment_unread_count,
     get_moment_switches, set_moment_switch, get_tasks, task_counts,
     friend_counts, get_friend_tasks, friend_sent_today, get_setting, set_setting,
-    count_outreach_since, get_outreach_candidates, delete_message,
+    count_outreach_since, get_outreach_candidates, delete_message, get_avatar,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -68,16 +70,72 @@ def media_file(rel):
     return send_from_directory(MEDIA_DIR, safe)
 
 
+@app.route("/api/avatar/<conv_id>")
+def api_avatar(conv_id):
+    """会话头像（联系人 small_head_url 下载到 wechat_media/avatars/ 后本地返回）。
+
+    没有头像就 404 —— 前端回退成「名字首字」色块，不留破图。
+    头像很少变，给一天缓存；换头像时前端 URL 带 v=ts，会自然失效。
+    """
+    row = get_avatar(conv_id)
+    rel = (row or {}).get("file") or ""
+    if not rel:
+        return ("", 404)
+    base = os.path.abspath(MEDIA_DIR)
+    full = os.path.abspath(os.path.join(base, rel.replace("\\", "/")))
+    if not full.startswith(base + os.sep) or not os.path.isfile(full):
+        return ("", 404)
+    resp = send_file(full, conditional=True)
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
+def _conv_tags(conv, contacts):
+    """给一个会话挂标签（来源：config.json 的 contacts，人工维护）。
+
+    匹配规则与 auto_reply._contact_of 保持一致：wxid 精确 > 名字精确 > 名字包含
+    （备注改过名时不至于掉标签）。返回去重后的标签列表，没有就返回 []。
+    """
+    cid = (conv.get("conv_id") or "").strip()
+    nm = (conv.get("name") or "").strip()
+    exact = loose = None
+    for c in contacts or []:
+        tags = [str(t).strip() for t in (c.get("tags") or []) if str(t).strip()]
+        if not tags:
+            continue
+        cw = (c.get("wxid") or "").strip()
+        cn = (c.get("name") or "").strip()
+        if cw and cw == cid:
+            return tags
+        if exact is None and cn and cn == nm:
+            exact = tags
+        elif loose is None and len(cn) >= 2 and nm and cn in nm:
+            loose = tags
+    return exact or loose or []
+
+
 @app.route("/api/conversations")
 def api_conversations():
     # 带上自动回复全局状态：总开关(config.auto_reply.enabled)与群开关(allow_groups)，
     # 前端据此提示「为什么会话开关打开了却没反应」。
     import wechat_ui
-    ar = wechat_ui.load_config().get("auto_reply", {}) or {}
+    cfg = wechat_ui.load_config()
+    ar = cfg.get("auto_reply", {}) or {}
+    contacts = cfg.get("contacts") or []
+    convs = list_conversations()
+    for c in convs:                    # 看板「+ 选择托管」按标签筛选用
+        c["tags"] = _conv_tags(c, contacts)
+        # 头像：/api/avatar/<conv_id>?v=<ts>，ts 当缓存键；没有头像给空串，
+        # 前端回退成「名字首字」色块（不留破图）
+        c["avatar_url"] = (
+            "/api/avatar/%s?v=%s" % (quote(c.get("conv_id") or "", safe=""),
+                                     c.get("avatar_ts") or 0)
+        ) if c.get("avatar") else ""
     return jsonify({
-        "conversations": list_conversations(),
+        "conversations": convs,
         "auto_reply_enabled": bool(ar.get("enabled", False)),
         "allow_groups": bool(ar.get("allow_groups", False)),
+        "me": get_setting("me_wxid", "") or "",   # 本机 wxid：给自己的消息配头像
     })
 
 
@@ -397,6 +455,25 @@ def api_friends_template():
     )
 
 
+def _avatar_loop():
+    """后台补头像：启动先同步一次，之后每 10 分钟一次。
+
+    头像来自微信 contact 表的 small_head_url（wx.qlogo.cn，无需登录态），
+    新好友 / 换头像都能跟上。微信没开或读库失败只记一行日志——
+    头像只是显示，不该影响看板本身。
+    """
+    import time as _t
+    while True:
+        try:
+            from wx_recv_bridge import WeChatDB, sync_avatars
+            sync_avatars(WeChatDB())
+        except Exception as e:      # noqa: BLE001
+            log.info("头像同步跳过（微信未运行/读库失败）: %s", e)
+        _t.sleep(600)
+
+
 if __name__ == "__main__":
+    # 用 WSGI（gunicorn/waitress）启动时不会走这里，需要自己起一个 _avatar_loop 线程
+    threading.Thread(target=_avatar_loop, daemon=True, name="avatar-sync").start()
     port = int(os.environ.get("WECHAT_DASHBOARD_PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)

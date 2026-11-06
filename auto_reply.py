@@ -64,7 +64,7 @@ import ui_gate
 from ai_client import generate as ai_generate
 from wechat_ui import (WeChatPCBot, load_config, SendNotVerified,
                        SendUnconfirmed, SendAborted)
-from wx_recv_bridge import poll_new, WeChatDB
+from wx_recv_bridge import poll_new, is_self, me_username, WeChatDB
 
 GROUP_SUFFIX = "@chatroom"
 
@@ -901,6 +901,11 @@ class AutoReplier:
             return None
         budget = self.confirm_timeout if timeout is None else timeout
         deadline = time.time() + max(1.0, budget)
+        # 判定「这条是不是我发的」只认 sender_username == 本机 wxid。
+        # 旧代码用 sender_id == "2"：那是分片内 Name2Id 的 rowid，换设备/换账号
+        # 后不是 2，回读永远找不到自己刚发的那条 → 一律判未发出 → 一直重发
+        # （2026-11-06 换设备事故，与看板左右颠倒同一个根因）。
+        me = me_username(db)
         while True:
             try:
                 msgs = db.get_messages(conv_id, limit=6)
@@ -908,7 +913,7 @@ class AutoReplier:
                 print("[auto] 发送校验读库失败（无法确认，不写库也不重发）: %s" % e)
                 return None
             for m in msgs:
-                if str(m.get("sender_id")) != "2":
+                if not is_self(m, me):
                     continue
                 if probe in str(m.get("content") or ""):
                     return True
@@ -916,7 +921,8 @@ class AutoReplier:
                 # 附上该会话最新几条：能区分「按键没进输入框」（会话尾部没变化）
                 # 和「发到别处去了」（别处会出现这条）——排查时少猜一轮。
                 try:
-                    tail = ["%s:%s" % (m.get("sender_id"), str(m.get("content"))[:16])
+                    tail = ["%s:%s" % (m.get("sender_username") or m.get("sender_id"),
+                                       str(m.get("content"))[:16])
                             for m in (msgs or [])[-3:]]
                     print("[auto] 校验超时，%s 最新 %d 条: %s"
                           % (conv_id, len(tail), " / ".join(tail)))

@@ -99,8 +99,14 @@ python E:\WorkBuddyData\WechatBot\wechat_ui.py --schedule --no-dry
 
 **核心规则：只有开关打开的会话才会触发 AI 自动回复，默认全部关闭。**
 
-- **在哪管**：看板（`dashboard.py`）左侧会话列表，**每一行右侧一个小开关**，点一下即开/关，
-  存 `wechat_monitor.db` 的 `conv_switch` 表，重启不丢。
+- **在哪管**：看板（`dashboard.py`）左侧会话列表——**只列「已开启托管」的会话**，
+  每行右侧一个小开关，点一下即关（关掉就从列表里消失，聊天区不受影响）。
+- **开新的**：点搜索框右侧的 **「+」** 打开选择器 —— 可按**名字/备注/wxid 搜索**、
+  按**群聊 / 私聊**分类筛、或按 `config.json → contacts` 里配的 **tags** 筛
+  （标签跟着 contacts 的 `name`/`wxid` 匹配，与 auto_reply 同一份配置），
+  点一行即开启托管，该会话立刻出现在左侧列表。
+- **为什么只列已开启的**：几百个会话全列出来左栏没法用，也看不出哪些真在托管。
+- 开关存 `wechat_monitor.db` 的 `conv_switch` 表，重启不丢。
 - **何时生效**：`auto_reply.py` 每轮轮询前重读开关表——看板改完，下一轮（默认 10s）生效，不用重启。
 - **判定顺序**（全过才回复）：总开关 `auto_reply.enabled` → 消息类型 → 群开关 `allow_groups`
   → **本会话开关** → 白名单 `contacts`（配了才叠加）→ 同会话冷却 → 每小时上限。
@@ -433,6 +439,16 @@ site-packages、不宜改（重装即丢），所以 `moment_ops._human_cursor()
 - DLL 注入/hook：按老架构设计，本机新版微信无本地消息库，架构性错误，勿再投入。
 - xlog 解密：TEA 密钥推导错，115 块全失败；PyWxDump 路线：`wxdump info` 报 WeChat No Run。
 - UIA 读屏：Qt 自绘层不暴露控件（除非热激活）；读消息最终走 wechatauto-replica 解密本地库。
+- **「sender_id == 2 就是自己发的」是错的**（2026-11-06 换设备事故）：sender_id 取的是
+  `real_sender_id`，只是**消息所在分片 Name2Id 表的 rowid**。同一台机器上自己账号在
+  message_0/1/2.db 的 rowid 分别是 2/4/1，本机实测不同会话里还出现过 1/3/10/24/26。
+  换一台设备/换一个账号，编号一变，整套判定就反转，一次踩出三个症状：
+  ① 看板自己发的消息跑到左边、对方的跑到右边（role 被写反）；
+  ② `collect()` 把自己的消息当成客户新消息 → 无限自动回复（一直重发）；
+  ③ 发送校验永远查不到自己那条 → `SendNotVerified` → 任务一直 failed（"落不了库"）。
+  正确判据：**sender_username == 本机 wxid**（库已按分片解析好，见 `is_self()`）。
+  已写反的历史数据用 `python wx_recv_bridge.py --fix-roles --dry-run` 试算后用
+  `--fix-roles` 校正（只改 role，不删消息）。
 
 ## 十一、风控与合规（始终有效）
 

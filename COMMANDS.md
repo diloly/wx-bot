@@ -288,6 +288,36 @@ pending → already（对方已在通讯录，跳过）/ failed（同一号码�
 
 ---
 
+## 2.11 消息页只列已托管的会话（2026-11-06）
+
+以前左栏把**所有会话**都列出来（几十上百个），既看不出哪些真在托管，也没法用。
+现在：
+
+- **「消息」页只显示已开启托管的会话**，每行右侧开关点一下即关，关掉立刻从列表消失
+  （聊天记录不受影响）。
+- **开新的会话**：点搜索框右侧的 **「+」** → 弹层里挑：
+  - 搜索框输**名字 / 备注 / wxid** 过滤；
+  - 分类 chips：`全部` /`群聊 N` /`私聊 N`（内置，按 conv_id 判定）；
+  - `#标签 N`：来自 `config.json` 的 `contacts`（`name` 或 `wxid` 匹配 + `tags`），
+    和 auto_reply 用的是同一份配置，改完刷新页面即生效；
+  - 点一行 → 开启托管，该会话立刻出现在左侧列表；`Esc` 或点遮罩关闭弹层。
+- 接口：`GET /api/conversations` 每项新增 `tags`（数组）；开关仍走 `POST /api/switch`。
+
+**头像（2026-11-06）**：微信 `contact` 表里有 `small_head_url`（`wx.qlogo.cn` 的 CDN
+地址），实测**不需要登录态就能 GET**，所以走「库取 URL → 下载落地 → 本地返回」，
+不截屏、不调客户端、不碰 UI 锁。
+
+- **落地**：`wechat_media/avatars/<URL 的 md5>.<ext>`，登记在 `wechat_monitor.db` 的
+  `avatars` 表（`conv_id / file / src / ts`）。换头像 URL 就变，天然可更新。
+- **同步时机**：`dashboard.py` 启动同步一次、之后每 10 分钟一轮；`wx_recv_bridge.py`
+  启动时也同步一次。首轮 51 个头像约 13 秒，之后几乎零开销（无变化直接跳过）。
+- **渲染**：左栏列表、`+` 选择器、会话头部；消息气泡**只在私聊**显示双方头像
+  （群聊只有一张群头像，一人一个反而错位）。图片加载失败自动回退「名字首字」色块，不留破图。
+- **接口**：`GET /api/avatar/<conv_id>`（404 = 没头像，前端兜底）；
+  `/api/conversations` 每项带 `avatar_url`（含 `?v=<ts>` 缓存键）和 `me`（本机 wxid）。
+
+---
+
 ## 3. 调试 / 验证
 
 ```
@@ -318,6 +348,7 @@ python -u E:\WorkBuddyData\WechatBot\wx_recv_bridge.py            :: 无缓冲�
 | 日志有 `等待微信 UI 空闲超时` / `本条未发出` | 有操作把微信占了超过 `ui.lock_timeout_seconds`；先查是不是某个操作卡住了（详见 2.7） |
 | 启动时出现 `尚未调用 CoInitialize` / `Can not load UIAutomationCore.dll` | UIAutomation 是 COM，**每个用它的线程都要自己 CoInitialize**。2026-10-16 已在 worker 线程入口统一初始化（`_worker_entry` + `_thread_com_init`）。若仍出现，说明有新的、没走 worker 入口的线程在碰微信 UI——按同样的方式给那个线程初始化即可 |
 | 图片/卡片不显示 | 跑一次 `--media-backfill`；看终端 `[media] 下载失败` 行 |
+| 看板里**自己发的消息在左边、对方的在右边**，同时发送一直失败/一直重发 | 换设备后 `sender_id` 编号变了（它不是固定 2）。先 `python wx_recv_bridge.py --fix-roles --dry-run` 试算，确认后去掉 `--dry-run` 校正历史数据；代码已改为按 `sender_username` 判定，重启 bridge + auto_reply 即生效。详见 RUNBOOK「十、走过的弯路」 |
 | 只看到自己的消息 | 首轮没跑完就被 Ctrl+C 了（自测会话排最前）；重跑等 `[poll]` 汇总行出现 |
 
 ---
