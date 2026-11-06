@@ -4,20 +4,26 @@ wechat_monitor.db
 wechat_monitor.db-journal
 backups/
 
+# ===== 业务资料 / 知识库（公司内部资料，禁止入库）=====
+# 知识库是喂给 AI 的产品与业务资料，不属于开源代码资产
+knowledge/
+
 # ===== Agent 工作记忆（内部笔记，非项目代码）=====
 .workbuddy/
 
 # ===== 保密配置：AI base_url / api_key，不要提交 =====
 ai_secrets.json
 
-# ===== 运行时产物 =====
+# ===== 运行时产物与日志（含客户昵称 / 消息内容）=====
 __pycache__/
 *.pyc
 *.log
+wechat_pc.log
 ui_dump.txt
 recv_raw.log
-.moment_actions.json     # 朋友圈每日动作计数
+# 朋友圈每日动作计数（运行态，别提交）
+.moment_actions.json
 
-# ===== 编译产物 =====
+# ===== 编译产物 / 注入工具二进制 =====
 wechat_hook/*.dll
 wechat_hook/*.exe
