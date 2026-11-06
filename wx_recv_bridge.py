@@ -20,8 +20,12 @@ wx_recv_bridge.py —— 收消息桥：wechatauto-replica 数据库解密路线
   "文件/链接/卡片"/"系统消息"），不是老微信的数字 type。
 - content 库已处理好：文本=正文原文；媒体=[图片 md5=...] 或 [类型] 占位
   （长文本 zstd 压缩内容需 zstandard 库，装 wechatauto-replica 时会带上）。
-- sender_id == 2 表示自己发的：**程序键盘发的**靠 sent_log 去重跳过（send_to_contact
-  已即时写过库，防双渲染）；**用户在 PC 微信手动发的**不在 sent_log，正常补录上屏（role=me）。
+- sender_id 是 `real_sender_id`，**不是固定编号**：它只是消息所在分片 Name2Id 表的
+  rowid（同一账号在 message_0/1/2.db 可能是 2/4/1）。判「谁发的」只认
+  **sender_username == 本机 wxid**（见 is_self）。用 sender_id == 2 硬编码会在
+  换设备/换账号后整体反转——2026-11-06 事故。
+- 自己发的消息：**程序键盘发的**靠 sent_log 去重跳过（send_to_contact 已即时写过库，
+  防双渲染）；**用户在 PC 微信手动发的**不在 sent_log，正常补录上屏（role=me）。
 - sender_username 是发送者 wxid（群消息可反查昵称，标注为「昵称: 内容」）。
 
 增量水印设计（支撑成千上万会话，不会每轮全量遍历）：
@@ -439,6 +443,86 @@ def download_url(url, subdir="misc"):
     return None
 
 
+# ---- 头像同步（2026-11-06）----
+# 微信 contact 表里有 small_head_url（wx.qlogo.cn 的 CDN 地址），实测**不需要登录态**
+# 就能 GET，所以看板头像走「库取 URL → 下载落地 → 本地返回」这条最稳的路线：
+# 不截屏、不调客户端接口、不碰 UI 锁。
+AVATAR_SUBDIR = "avatars"
+
+
+def _contact_head_urls(db):
+    """{wxid: small_head_url}（读 contact.db，空地址不返回）。
+
+    这里用到 WeChatDB 的私有成员 ``_db_files`` / ``_open``——库没有公开的头像接口，
+    而 contact 表是唯一权威来源。升级 wechatauto 后若结构变了，本函数整体被
+    try 兜住即可：头像只是显示，绝不能影响收消息主流程。
+    """
+    out = {}
+    try:
+        for rel, path, _ in getattr(db, "_db_files", None) or []:
+            if os.path.basename(path) != "contact.db":
+                continue
+            conn = db._open(rel)
+            try:
+                for username, url in conn.execute(
+                        "SELECT username, small_head_url FROM contact "
+                        "WHERE small_head_url IS NOT NULL AND small_head_url <> ''"):
+                    if username and url:
+                        out[username] = url
+            finally:
+                conn.close()
+            break
+    except Exception as e:          # noqa: BLE001
+        print("[avatar] 读联系人头像地址失败（跳过同步）: %s" % e)
+    return out
+
+
+def sync_avatars(db, only=None, force=False):
+    """把联系人头像下载到 ``wechat_media/avatars/`` 并登记进 avatars 表。
+
+    只在「本地没记录 / 来源 URL 变了 / force」时才发请求，日常重跑几乎零开销。
+    按 URL 的 md5 命名文件（复用 download_url 的缓存）：换头像 URL 就变，天然可更新。
+
+    Args:
+        only: 只同步这些 wxid（None = 库里有头像地址的全部联系人）
+
+    Returns: (downloaded, cached, failed)
+    """
+    heads = _contact_head_urls(db)
+    if only:
+        want = set(only)
+        heads = {k: v for k, v in heads.items() if k in want}
+    got = cached = failed = 0
+    for uid, url in heads.items():
+        try:
+            old = monitor_store.get_avatar(uid)
+        except Exception:           # noqa: BLE001
+            old = None
+        if old and old.get("src") == url and not force:
+            cached += 1
+            continue
+        rel = download_url(url, AVATAR_SUBDIR)
+        if not rel:
+            failed += 1
+            continue
+        try:
+            monitor_store.set_avatar(uid, rel, url)
+            got += 1
+        except Exception:           # noqa: BLE001
+            failed += 1
+    if got or failed:
+        print("[avatar] 同步完成：新增/更新 %d，跳过 %d，失败 %d"
+              % (got, cached, failed))
+    # 记住本机 wxid：看板要用它给自己的消息配头像（拆进程，只能落库传递）
+    try:
+        me = (db.get_self_info() or {}).get("username") or ""
+        if me:
+            monitor_store.set_setting("me_wxid", me)
+    except Exception:               # noqa: BLE001
+        pass
+    return got, cached, failed
+
+
 def _xml_placeholder(xml):
     """微信 4.x 部分消息（图片/表情等）的 content 是 XML 原文、库未友好化时，解析成占位。"""
     if "<img " in xml or "<img>" in xml:
@@ -515,8 +599,44 @@ def norm_ts(ts):
     return ts
 
 
-def is_self(m):
-    """sender_id == 2 表示自己发的（与我方键盘发送记录重复，跳过）。"""
+_me_username_cache = ""     # 本机账号 wxid（get_self_info 一次后复用）
+
+
+def me_username(db):
+    """本机账号 wxid（懒加载缓存）。取不到返回空串，由 is_self 走旧判据兜底。"""
+    global _me_username_cache
+    if _me_username_cache:
+        return _me_username_cache
+    try:
+        me = db.get_self_info() or {}
+        _me_username_cache = (me.get("username") or "").strip()
+    except Exception:           # noqa: BLE001 读不到就按未知处理，不能因此中断轮询
+        _me_username_cache = ""
+    if not _me_username_cache:
+        print("[!] 读不到本机账号 wxid：自己发的消息可能被判成对方的"
+              "（换设备/换账号后尤其容易踩，见 is_self 注释）")
+    return _me_username_cache
+
+
+def is_self(m, me=None):
+    """这条消息是不是本机账号（自己）发的。
+
+    **判据：sender_username == 本机 wxid**（库里已按消息所在分片的 Name2Id 解析好）。
+
+    为什么不用 ``sender_id == 2``（2026-11-06 换设备事故）：sender_id 取的是
+    ``real_sender_id``——它只是**分片内 Name2Id 表的 rowid**。库作者注释原话：
+    同一台机器上自己账号在 message_0/1/2.db 的 rowid 分别是 2/4/1，而换一台
+    设备/换一个账号就完全不是这个数。硬编码「2 = 自己」会导致整套判定反转：
+      · 看板左右颠倒（自己的消息记成 them）；
+      · collect() 把自己的消息当成客户新消息 → 无限自动回复（一直重发）；
+      · 发送校验永远查不到自己那条 → SendNotVerified → 任务一直 failed。
+    """
+    su = (m.get("sender_username") or "").strip()
+    if me is None:
+        me = _me_username_cache
+    if su and me:
+        return su == me
+    # 解析不到发送者（老库/异常行）才回退旧判据：保持原行为，不引入新的不确定性
     sid = m.get("sender_id")
     return sid == 2 or sid == "2"
 
@@ -569,6 +689,7 @@ def poll_new(db, progress=False):
     """
     new_items = []
     t0 = time.time()
+    me = me_username(db)          # 本机 wxid：判定「谁发的」只认它，不认 sender_id 编号
     sessions = db.get_sessions(limit=SESSION_LIMIT)
     total = len(sessions)
     n_baseline = n_incr = 0
@@ -600,7 +721,7 @@ def poll_new(db, progress=False):
             if not text:
                 continue
             ts = norm_ts(m.get("create_time"))
-            self_msg = is_self(m)
+            self_msg = is_self(m, me)
             role = "me" if self_msg else "them"
             # 自己发的消息分两种：
             #   程序键盘发的 —— sent_log 命中，跳过（send_to_contact 已即时写过库，防双渲染）
@@ -723,7 +844,7 @@ def media_backfill(db, per_session=50, original=False, scroll=True):
                 if card:
                     card = finalize_card(card, media_rel)
                     # 群聊卡片补真实发送者（与 poll_new 一致）
-                    if is_group and m.get("sender_username") and not is_self(m):
+                    if is_group and m.get("sender_username") and not is_self(m, me_username(db)):
                         try:
                             sn = _group_member_name(db, user, m["sender_username"])
                         except Exception:
@@ -774,6 +895,12 @@ def main():
                     help="重置某会话的轮询水印，下一轮会重建基线（重读最近 50 条，"
                          "已入库的按宽松判重跳过）。传 all 重置全部。"
                          "用于「微信重建了会话（删好友重加/清空），新消息入不了库」")
+    ap.add_argument("--fix-roles", action="store_true",
+                    help="校正已入库消息的 role（按 raw 里的真实 sender_username 重算）："
+                         "用于换设备后「自己的消息显示在左边、对方的在右边」。"
+                         "只改 role，不删消息")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="（仅配合 --fix-roles）只统计会改多少条，不写库")
     args = ap.parse_args()
 
     monitor_store.init()
@@ -798,6 +925,25 @@ def main():
                        original=args.original,
                        scroll=not args.no_scroll_original)
         return
+
+    if args.fix_roles:
+        scanned, changed, note = monitor_store.fix_roles(
+            me.get("username"), dry_run=args.dry_run)
+        if note:
+            print("[!] 未执行：%s" % note)
+            return
+        if args.dry_run:
+            print("[*] 试算：可判定 %d 条，其中 role 与真实发送者不符 %d 条"
+                  "（加 --fix-roles 去掉 --dry-run 才写库）" % (scanned, changed))
+        else:
+            print("[*] role 校正完成：检查 %d 条，修正 %d 条" % (scanned, changed))
+        return
+
+    # 启动顺手同步头像（新好友/换头像都能补上）。失败绝不影响收消息。
+    try:
+        sync_avatars(db)
+    except Exception as e:          # noqa: BLE001
+        print("[avatar] 头像同步异常（不影响收消息）: %s" % e)
 
     print("[*] 收消息桥启动，每 %ds 轮询一次（Ctrl+C 停止）" % args.interval)
     print("[*] 首轮要全量解密全部数据库，可能数分钟；之后每轮秒级。进度见 [scan] 行")

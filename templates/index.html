@@ -158,11 +158,18 @@
 
   /* 左侧栏 */
   .sidebar { width: 320px; background: #2e2e2e; color: #e6e6e6; display: flex; flex-direction: column; }
-  .sidebar .search { padding: 12px; }
+  .sidebar .search { padding: 12px; display: flex; align-items: center; gap: 8px; }
   .sidebar .search input {
-    width: 100%; padding: 7px 10px; border: none; border-radius: 4px;
+    flex: 1; min-width: 0; padding: 7px 10px; border: none; border-radius: 4px;
     background: #424242; color: #fff; outline: none;
   }
+  /* 「+」：打开选择器，挑要开启托管的聊天（消息页只列已开启的） */
+  .add-conv {
+    flex-shrink: 0; width: 32px; height: 32px; padding: 0; border: none;
+    border-radius: 4px; background: #07c160; color: #fff; font-size: 20px;
+    line-height: 30px; cursor: pointer; transition: background .15s;
+  }
+  .add-conv:hover { background: #06ad56; }
   .conv-list { flex: 1; overflow-y: auto; }
   .conv {
     display: flex; align-items: center; padding: 12px 14px; cursor: pointer;
@@ -174,6 +181,13 @@
     width: 42px; height: 42px; border-radius: 5px; background: #07c160;
     color: #fff; display: flex; align-items: center; justify-content: center;
     font-size: 16px; margin-right: 12px; flex-shrink: 0;
+    position: relative; overflow: hidden;   /* 真头像盖在首字上，加载失败自然露出首字 */
+  }
+  .conv .avatar img,
+  .pick-row .avatar img,
+  .msg .mavatar img,
+  .chat .header .havatar img {
+    position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover;
   }
   .conv .meta { flex: 1; min-width: 0; }
   .conv .name { font-size: 14px; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -181,6 +195,79 @@
   .conv .badge {
     background: #fa5151; color: #fff; border-radius: 10px; font-size: 11px;
     padding: 1px 6px; margin-left: 8px; min-width: 18px; text-align: center;
+  }
+  /* 消息页空态：没开托管时给一条明确的下一步 */
+  .conv-empty {
+    padding: 26px 18px; color: #8a8a8a; font-size: 13px; line-height: 1.9;
+    text-align: center;
+  }
+  .conv-empty b { color: #07c160; }
+
+  /* ===== 选择器弹层（+ 号）：按名字/标签挑要托管的会话 ===== */
+  .picker-mask {
+    position: fixed; inset: 0; z-index: 60; display: none;
+    align-items: center; justify-content: center;
+    background: rgba(0, 0, 0, .45);
+  }
+  .picker-mask.show { display: flex; }
+  .picker {
+    width: 460px; max-width: 92vw; max-height: 82vh; background: #fff;
+    border-radius: 10px; display: flex; flex-direction: column; overflow: hidden;
+    box-shadow: 0 16px 48px rgba(0, 0, 0, .28);
+  }
+  .picker-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 16px; border-bottom: 1px solid #eee;
+  }
+  .picker-head h3 { margin: 0; font-size: 15px; font-weight: 600; color: #222; }
+  .picker-head .x {
+    border: none; background: transparent; color: #999; font-size: 22px;
+    line-height: 1; cursor: pointer; padding: 0 4px;
+  }
+  .picker-head .x:hover { color: #e64340; }
+  .picker-body {
+    padding: 12px 16px; display: flex; flex-direction: column; gap: 10px;
+    min-height: 0; flex: 1;
+  }
+  .picker input.q {
+    width: 100%; padding: 8px 10px; border: 1px solid #dcdfe3; border-radius: 6px;
+    outline: none; font-size: 13px; color: #333; box-sizing: border-box;
+  }
+  .picker input.q:focus { border-color: #07c160; }
+  .picker-tags { display: flex; flex-wrap: wrap; gap: 6px; }
+  .tagchip {
+    padding: 3px 10px; border-radius: 11px; background: #f2f3f5; color: #5b6068;
+    font-size: 12px; cursor: pointer; border: 1px solid transparent; user-select: none;
+  }
+  .tagchip:hover { background: #e9ebee; }
+  .tagchip.on { background: #e7f9d9; color: #12864a; border-color: #bfe0a8; }
+  .picker-hint { font-size: 11px; color: #9aa0a8; line-height: 1.6; }
+  .picker-list { flex: 1; overflow-y: auto; min-height: 140px; max-height: 46vh; }
+  .pick-row {
+    display: flex; align-items: center; padding: 9px 4px;
+    border-bottom: 1px solid #f2f3f5; cursor: pointer;
+  }
+  .pick-row:hover { background: #f7f8fa; }
+  .pick-row .avatar {
+    width: 30px; height: 30px; border-radius: 4px; background: #07c160; color: #fff;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 13px; margin-right: 10px; flex-shrink: 0;
+    position: relative; overflow: hidden;
+  }
+  .pick-row .nm {
+    flex: 1; min-width: 0; font-size: 13px; color: #333;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .pick-row .tg { font-size: 11px; color: #2196f3; margin-left: 5px; }
+  .pick-row .plus { color: #07c160; font-size: 18px; font-weight: 600; padding: 0 4px; }
+  .pick-row .badge {
+    background: #fa5151; color: #fff; border-radius: 10px; font-size: 11px;
+    padding: 1px 6px; margin-left: 8px; min-width: 18px; text-align: center;
+  }
+  .picker-empty { padding: 30px 10px; text-align: center; color: #9aa0a8; font-size: 13px; }
+  .picker-foot {
+    padding: 10px 16px; border-top: 1px solid #eee;
+    font-size: 12px; color: #9aa0a8; background: #fafbfc;
   }
 
   /* 小toggle开关（每会话AI自动回复 / 朋友圈自动互动共用，默认关） */
@@ -205,6 +292,21 @@
     display: flex; align-items: center; padding: 0 20px; font-size: 16px; font-weight: 500;
   }
   .chat .messages { flex: 1; overflow-y: auto; padding: 20px; }
+  /* 消息旁的头像（仅私聊；群聊不同成员头像一个接一个容易错位，不显示） */
+  .msg .mavatar {
+    position: relative; overflow: hidden; flex-shrink: 0;
+    width: 34px; height: 34px; border-radius: 4px; background: #07c160;
+    color: #fff; display: flex; align-items: center; justify-content: center;
+    font-size: 13px; margin-right: 10px;
+  }
+  .msg.me .mavatar { margin-right: 0; margin-left: 10px; }
+  /* 会话头部头像 */
+  .chat .header .havatar {
+    position: relative; overflow: hidden; flex-shrink: 0;
+    width: 28px; height: 28px; border-radius: 4px; background: #07c160;
+    color: #fff; display: flex; align-items: center; justify-content: center;
+    font-size: 12px; margin-right: 10px;
+  }
   .msg { display: flex; margin-bottom: 16px; }
   .msg.me { flex-direction: row-reverse; }
   .msg .bubble {
@@ -452,7 +554,12 @@
   </header>
   <div class="workspace">
     <div class="sidebar" id="sidebar">
-      <div id="searchWrap"><div class="search"><input id="search" placeholder="搜索会话" /></div></div>
+      <div id="searchWrap">
+        <div class="search">
+          <input id="search" placeholder="搜索已托管的会话" />
+          <button class="add-conv" onclick="openPicker()" title="选择要开启托管的聊天">+</button>
+        </div>
+      </div>
       <div class="conv-list" id="convList"></div>
       <div class="conv-list" id="momentList" style="display:none"></div>
     </div>
@@ -515,6 +622,22 @@
   </div>
 </div>
 
+<!-- 选择要托管的会话：消息页只列已开启的，其余在这里按名字/标签挑 -->
+<div class="picker-mask" id="pickerMask" onclick="if(event.target===this)closePicker()">
+  <div class="picker">
+    <div class="picker-head">
+      <h3>选择要开启托管的聊天</h3>
+      <button class="x" onclick="closePicker()" title="关闭">×</button>
+    </div>
+    <div class="picker-body">
+      <input class="q" id="pickerSearch" placeholder="搜索名字 / 备注 / wxid" oninput="renderPicker()" />
+      <div class="picker-tags" id="pickerTags"></div>
+      <div class="picker-list" id="pickerList"></div>
+    </div>
+    <div class="picker-foot" id="pickerFoot"></div>
+  </div>
+</div>
+
 <script>
 const POLL = 2000;
 let activeConv = null;
@@ -522,10 +645,32 @@ let lastMsgCount = 0;
 let forceBottom = false;   // 刚切换会话时强制滚底一次
 let renderedSigs = [];     // 当前会话已渲染消息的签名（增量渲染比对用）
 
+let allConvs = [];        // /api/conversations 最近一次全量（含 tags / auto_reply / avatar_url）
+let meWxid = '';          // 本机 wxid（给自己的消息配头像，由 /api/conversations 的 me 字段给）
+let selfAvatarUrl = '';
+let pickerOpen = false;   // 选择器弹层是否打开
+let pickerTag = '';       // 选择器当前标签筛选（''=全部）
+let pickerSig = '';       // 选择器列表签名（2s 轮询重绘时避免打断输入/滚动）
+
+// 头像元素：真头像盖在「名字首字」色块上；图片 404/加载失败时 onerror 移除 img，
+// 自然露出首字兜底，不会留破图。
+function avatarHtml(url, name) {
+  const first = esc((name || '?').slice(0, 1));
+  const img = url ? `<img src="${url}" alt="" loading="lazy" onerror="this.remove()">` : '';
+  return `<div class="avatar">${first}${img}</div>`;
+}
+
+function convAvatarUrl(convId) {
+  const c = allConvs.find(x => x.conv_id === convId);
+  return (c && c.avatar_url) || '';
+}
+
 async function loadConversations() {
   const res = await fetch('/api/conversations');
   const data = await res.json();
-  const list = data.conversations || [];
+  allConvs = data.conversations || [];
+  meWxid = data.me || meWxid;
+  selfAvatarUrl = meWxid ? '/api/avatar/' + encodeURIComponent(meWxid) : '';
   // 全局提示：自动回复总开关未开时，说明会话开关暂不生效
   const banner = document.getElementById('arBanner');
   if (data.auto_reply_enabled) {
@@ -535,15 +680,22 @@ async function loadConversations() {
     banner.textContent = '自动回复总开关未开（config.json → auto_reply.enabled=false）：下面的会话开关暂不生效';
   }
   const kw = document.getElementById('search').value.trim();
-  const filtered = kw ? list.filter(c => (c.name||'').includes(kw)) : list;
+  // 消息页**只列已开启托管**的会话；没开的用右上角「+」挑，避免几百个会话糊满左栏
+  let shown = allConvs.filter(c => !!c.auto_reply);
+  if (kw) shown = shown.filter(c => ((c.name || '') + (c.conv_id || '')).includes(kw));
   const box = document.getElementById('convList');
   box.innerHTML = '';
-  for (const c of filtered) {
+  if (!shown.length) {
+    box.innerHTML = kw
+      ? '<div class="conv-empty">没有匹配的已托管会话</div>'
+      : '<div class="conv-empty">还没有开启托管的会话<br>点右上角 <b>+</b> 选择要托管的聊天</div>';
+  }
+  for (const c of shown) {
     const div = document.createElement('div');
     div.className = 'conv' + (c.conv_id === activeConv ? ' active' : '');
     const badge = (c.unread > 0) ? `<span class="badge">${c.unread}</span>` : '';
     div.innerHTML = `
-      <div class="avatar">${(c.name||'?').slice(0,1)}</div>
+      ${avatarHtml(c.avatar_url, c.name)}
       <div class="meta">
         <div class="name">${esc(c.name||c.conv_id)} ${badge}</div>
         <div class="preview">${esc(c.last_msg||'')}</div>
@@ -566,20 +718,139 @@ async function loadConversations() {
     div.onclick = () => openConv(c.conv_id, c.name);
     box.appendChild(div);
   }
+  if (pickerOpen) renderPicker();     // 弹层开着时跟着刷新（内部按签名去重，不打断输入）
 }
 
 async function toggleSwitch(convId, on, swEl) {
   try {
-    await fetch('/api/switch', {
+    const r = await fetch('/api/switch', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({conv: convId, enabled: on})
     });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
     swEl.title = 'AI自动回复：' + (on ? '已开' : '关');
+    // 关掉托管后该会话就不该再留在「消息」列表里
+    if (!on) loadConversations();
   } catch (err) {
     const input = swEl.querySelector('input');
     if (input) input.checked = !on;   // 失败回滚视觉状态
   }
 }
+
+/* ==================== 选择要托管的会话（+ 号） ==================== */
+function openPicker() {
+  pickerOpen = true;
+  pickerTag = '';
+  document.getElementById('pickerSearch').value = '';
+  document.getElementById('pickerMask').classList.add('show');
+  pickerSig = '';                    // 强制先画一次
+  renderPicker();
+  setTimeout(() => document.getElementById('pickerSearch').focus(), 30);
+}
+
+function closePicker() {
+  pickerOpen = false;
+  document.getElementById('pickerMask').classList.remove('show');
+}
+
+function setPickerTag(t) {
+  pickerTag = t;
+  renderPicker();
+}
+
+function renderPicker() {
+  if (!pickerOpen) return;
+  const kw = (document.getElementById('pickerSearch').value || '').trim();
+  // 候选只给「还没开启托管」的：已开启的就在左边列表里，这里不重复列
+  const cands = allConvs.filter(c => !c.auto_reply);
+  const tagSet = [];
+  for (const c of cands) {
+    for (const t of (c.tags || [])) {
+      if (!tagSet.includes(t)) tagSet.push(t);
+    }
+  }
+  // 内置分类（不依赖 config）：群聊 / 私聊，配上 config 里的标签一起做筛选项
+  const isGroup = c => String(c.conv_id).endsWith('@chatroom');
+  const isMp = c => String(c.conv_id).startsWith('gh_') || c.conv_id === 'filehelper';
+  const BUILTIN = [
+    {id: '__group', label: '群聊', test: isGroup},
+    {id: '__private', label: '私聊', test: c => !isGroup(c) && !isMp(c)},
+  ];
+
+  let list = cands;
+  if (pickerTag) {
+    const b = BUILTIN.find(x => x.id === pickerTag);
+    list = b ? cands.filter(b.test) : cands.filter(c => (c.tags || []).includes(pickerTag));
+  }
+  if (kw) list = list.filter(c => ((c.name || '') + (c.conv_id || '')).includes(kw));
+
+  // 2s 轮询会反复调本函数：内容没变就不动 DOM，免得滚动位置被拉回顶部
+  const sig = JSON.stringify([pickerTag, kw, list.map(c => c.conv_id), tagSet]);
+  if (sig === pickerSig) return;
+  pickerSig = sig;
+
+  const tagsBox = document.getElementById('pickerTags');
+  let chips = `<span class="tagchip${pickerTag ? '' : ' on'}" data-t="">全部</span>`;
+  chips += BUILTIN.map(b => {
+    const n = cands.filter(b.test).length;
+    return `<span class="tagchip${pickerTag === b.id ? ' on' : ''}" data-t="${b.id}">${b.label} ${n}</span>`;
+  }).join('');
+  chips += tagSet.map(t => {
+    const n = cands.filter(c => (c.tags || []).includes(t)).length;
+    return `<span class="tagchip${pickerTag === t ? ' on' : ''}" data-t="${esc(t)}">#${esc(t)} ${n}</span>`;
+  }).join('');
+  tagsBox.innerHTML = chips;
+  tagsBox.querySelectorAll('.tagchip').forEach(el => {
+    el.onclick = () => setPickerTag(el.dataset.t || '');
+  });
+  if (!tagSet.length) {
+    tagsBox.insertAdjacentHTML('beforeend',
+      '<span class="picker-hint">想让客户带标签：在 config.json 的 contacts 里配 name/wxid + tags</span>');
+  }
+
+  const box = document.getElementById('pickerList');
+  if (!list.length) {
+    box.innerHTML = `<div class="picker-empty">${(kw || pickerTag) ? '没有匹配的会话' : '所有会话都已开启托管'}</div>`;
+  } else {
+    box.innerHTML = '';
+    for (const c of list) {
+      const row = document.createElement('div');
+      row.className = 'pick-row';
+      const tags = (c.tags || []).map(t => `<span class="tg">#${esc(t)}</span>`).join('');
+      const badge = (c.unread > 0) ? `<span class="badge">${c.unread}</span>` : '';
+      row.innerHTML = `
+        ${avatarHtml(c.avatar_url, c.name)}
+        <div class="nm">${esc(c.name || c.conv_id)}${tags}${badge}</div>
+        <div class="plus">+</div>`;
+      row.onclick = () => enableConv(c.conv_id);
+      box.appendChild(row);
+    }
+  }
+  const onCount = allConvs.filter(c => c.auto_reply).length;
+  document.getElementById('pickerFoot').textContent =
+    `共 ${allConvs.length} 个会话，已托管 ${onCount} 个；点一行即开启托管`;
+}
+
+async function enableConv(convId) {
+  try {
+    const r = await fetch('/api/switch', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({conv: convId, enabled: true})
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const c = allConvs.find(x => x.conv_id === convId);
+    if (c) c.auto_reply = 1;        // 本地先标上，弹层立刻少一行
+    pickerSig = '';
+    renderPicker();
+    loadConversations();
+  } catch (err) {
+    alert('开启失败：' + err.message);
+  }
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && pickerOpen) closePicker();
+});
 
 async function openConv(convId, name) {
   activeConv = convId;
@@ -590,15 +861,18 @@ async function openConv(convId, name) {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({conv: convId})
   });
-  renderChatHeader(name || convId);
+  renderChatHeader(name || convId, convId);
   await loadMessages();
   loadConversations();
 }
 
-function renderChatHeader(name) {
+function renderChatHeader(name, convId) {
   const pane = document.getElementById('chatPane');
+  const c = allConvs.find(x => x.conv_id === convId) || {};
+  const first = esc((name || '?').slice(0, 1));
+  const img = c.avatar_url ? `<img src="${c.avatar_url}" alt="" onerror="this.remove()">` : '';
   pane.innerHTML = `
-    <div class="header">${esc(name)}</div>
+    <div class="header"><div class="havatar">${first}${img}</div>${esc(name)}</div>
     <div class="messages" id="messages"></div>
     <div class="hint">在此发送将调用键盘驱动真实发出（需微信在前台）。也可直接用 wechat_ui.py。</div>
     <div class="composer">
@@ -758,15 +1032,29 @@ function cardSender(m) {
   } catch (e) { return ''; }
 }
 
+// 私聊消息旁的头像。群聊不显示：一条消息一个成员头像，不同人挨在一起极易错位
+// （而我们只有群的统一头像），宁可不放。
+function msgAvatarHtml(mine) {
+  const cid = activeConv || '';
+  if (cid.endsWith('@chatroom')) return '';
+  const c = allConvs.find(x => x.conv_id === cid) || {};
+  const url = mine ? selfAvatarUrl : (c.avatar_url || '');
+  const name = mine ? '我' : (c.name || '他');
+  const first = esc(name.slice(0, 1));
+  const img = url ? `<img src="${url}" alt="" onerror="this.remove()">` : '';
+  return `<div class="mavatar">${first}${img}</div>`;
+}
+
 function buildMsgEl(m) {
   const div = document.createElement('div');
-  div.className = 'msg ' + (m.role === 'me' ? 'me' : 'them');
+  const mine = m.role === 'me';
+  div.className = 'msg ' + (mine ? 'me' : 'them');
   const t = fmtTime(m.ts);
   const isMedia = m.media && !m.card;
   // 删除入口只在 hover 时出现（CSS 控制）。只在能拿到 id 时渲染——历史数据
   // 没有 id 就没法定位要删哪条，宁可不给按钮也不删错。
   const delBtn = m.id ? '<button class="del" title="从看板删除这一条（不影响微信客户端）">×</button>' : '';
-  div.innerHTML = `<div class="bubble${isMedia ? ' media-bubble' : ''}">${cardSender(m)}${bubbleContent(m)}</div><div class="time">${byTag(m)}${t}</div>${delBtn}`;
+  div.innerHTML = `${msgAvatarHtml(mine)}<div class="bubble${isMedia ? ' media-bubble' : ''}">${cardSender(m)}${bubbleContent(m)}</div><div class="time">${byTag(m)}${t}</div>${delBtn}`;
   const b = div.querySelector('.del');
   if (b) b.addEventListener('click', () => delMessage(m.id));
   return div;

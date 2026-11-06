@@ -171,6 +171,15 @@ def _init_schema(path=None):
             k TEXT PRIMARY KEY,
             v TEXT
         );
+        -- 会话头像（2026-11-06）：微信 contact 表的 small_head_url 直接 GET 下来
+        -- 存 wechat_media/avatars/，这里只记「哪张图 + 来源 URL」。src 存原 URL，
+        -- 换了头像 URL 就变，据此判断要不要重下。
+        CREATE TABLE IF NOT EXISTS avatars (
+            conv_id TEXT PRIMARY KEY,
+            file    TEXT,
+            src     TEXT,
+            ts      INTEGER
+        );
         """
     )
     # 老库可能没有 msg_hash / media / card / sent_by 列，补齐（ALTER 不支持 IF NOT EXISTS，用异常吞掉已存在）
@@ -458,16 +467,50 @@ def set_conversation_name(conv_id, name):
 
 
 def list_conversations():
-    """会话列表（按最近活跃倒序），每项带 auto_reply=该会话AI自动回复开关（0/1）。"""
+    """会话列表（按最近活跃倒序）。
+
+    每项带：auto_reply=该会话AI自动回复开关（0/1）；avatar=头像文件的相对路径
+    （wechat_media/ 下，没有则为 None）、avatar_ts=头像落库时间（前端做缓存键）。
+    """
     conn = _conn()
     rows = [dict(r) for r in conn.execute(
-        "SELECT c.*, COALESCE(s.enabled, 0) AS auto_reply "
+        "SELECT c.*, COALESCE(s.enabled, 0) AS auto_reply, "
+        "a.file AS avatar, a.ts AS avatar_ts "
         "FROM conversations c "
         "LEFT JOIN conv_switch s ON s.conv_id = c.conv_id "
+        "LEFT JOIN avatars a ON a.conv_id = c.conv_id "
         "ORDER BY c.last_ts DESC"
     ).fetchall()]
     conn.close()
     return rows
+
+
+def set_avatar(conv_id, file, src=""):
+    """登记某会话的头像（file 是相对 wechat_media/ 的路径，src 是来源 URL）。"""
+    conv_id, file = (conv_id or "").strip(), (file or "").strip()
+    if not conv_id or not file:
+        return False
+    conn = init()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO avatars(conv_id, file, src, ts) VALUES(?,?,?,?)",
+            (conv_id, file, src or "", int(time.time())))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def get_avatar(conv_id):
+    """取某会话的头像记录（{conv_id,file,src,ts}），没有返回 None。"""
+    conn = _conn()
+    try:
+        r = conn.execute(
+            "SELECT conv_id, file, src, ts FROM avatars WHERE conv_id=?",
+            ((conv_id or "").strip(),)).fetchone()
+        return dict(r) if r else None
+    finally:
+        conn.close()
 
 
 def get_messages(conv_id, limit=300, since_ts=None):
@@ -488,6 +531,54 @@ def get_messages(conv_id, limit=300, since_ts=None):
     rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
     conn.close()
     return rows
+
+
+def fix_roles(me_username, dry_run=False):
+    """按消息 raw 里的真实发送者重算 ``role``（一次性校正，不删任何消息）。
+
+    什么时候需要（2026-11-06 换设备事故）：桥接早期判「是不是自己发的」用
+    ``sender_id == 2``，而 sender_id 是**分片内 Name2Id 的 rowid**，换设备/换账号
+    后编号一变，整批消息的 role 就反了——看板左右颠倒、自己的消息被当成客户消息
+    反复回复。每条消息入库时 raw 里存了真实的 ``sender_username``，据此可还原。
+
+    只用 raw 判定，**解析不到发送者的行原样保留**（那些行旧判据可能本来是对的）。
+
+    Returns: (scanned, changed, note) —— note 非空表示没执行。
+    """
+    import ast
+
+    me = (me_username or "").strip()
+    if not me:
+        return 0, 0, "本机 wxid 为空，无法判定"
+
+    conn = init()
+    try:
+        rows = conn.execute(
+            "SELECT id, role, raw FROM messages WHERE raw LIKE '%sender_username%'"
+        ).fetchall()
+        scanned = changed = 0
+        for r in rows:
+            try:
+                raw = ast.literal_eval(r["raw"] or "{}")
+            except (ValueError, SyntaxError):
+                continue
+            if not isinstance(raw, dict):
+                continue
+            su = (raw.get("sender_username") or "").strip()
+            if not su:
+                continue
+            scanned += 1
+            want = "me" if su == me else "them"
+            if want == r["role"]:
+                continue
+            changed += 1
+            if not dry_run:
+                conn.execute("UPDATE messages SET role=? WHERE id=?", (want, r["id"]))
+        if changed and not dry_run:
+            conn.commit()
+        return scanned, changed, ""
+    finally:
+        conn.close()
 
 
 def delete_message(msg_id):
