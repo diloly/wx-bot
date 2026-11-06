@@ -1,3 +1,0 @@
-50032 | Name='微信' | Class='Qt51514QWindowIcon'
-  50033 | Name='Weixin' | Class='Qt51514QWindowIcon'
-  50033 | Name='MMUIRenderSubWindowHW' | Class='MMUIRenderSubWindowHW'
