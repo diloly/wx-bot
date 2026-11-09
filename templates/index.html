@@ -646,6 +646,7 @@ let forceBottom = false;   // 刚切换会话时强制滚底一次
 let renderedSigs = [];     // 当前会话已渲染消息的签名（增量渲染比对用）
 
 let allConvs = [];        // /api/conversations 最近一次全量（含 tags / auto_reply / avatar_url）
+let pickerAll = [];       // /api/contacts 通讯录全量（含从没聊过的好友，选择器用）
 let meWxid = '';          // 本机 wxid（给自己的消息配头像，由 /api/conversations 的 me 字段给）
 let selfAvatarUrl = '';
 let pickerOpen = false;   // 选择器弹层是否打开
@@ -738,14 +739,29 @@ async function toggleSwitch(convId, on, swEl) {
 }
 
 /* ==================== 选择要托管的会话（+ 号） ==================== */
-function openPicker() {
+async function openPicker() {
   pickerOpen = true;
   pickerTag = '';
   document.getElementById('pickerSearch').value = '';
   document.getElementById('pickerMask').classList.add('show');
   pickerSig = '';                    // 强制先画一次
+  pickerAll = allConvs.slice();      // 先把已知会话铺上，再补全量通讯录（避免空白）
   renderPicker();
   setTimeout(() => document.getElementById('pickerSearch').focus(), 30);
+  await loadPickerContacts();
+}
+
+// 拉全量通讯录：会话列表只有「聊过的」，加了好友没聊过的人得从通讯录补进来
+async function loadPickerContacts() {
+  try {
+    const res = await fetch('/api/contacts');
+    const data = await res.json();
+    pickerAll = data.contacts || [];
+  } catch (e) {
+    pickerAll = allConvs.slice();    // 接口挂了就退回会话列表，至少还能用
+  }
+  pickerSig = '';
+  renderPicker();
 }
 
 function closePicker() {
@@ -761,20 +777,22 @@ function setPickerTag(t) {
 function renderPicker() {
   if (!pickerOpen) return;
   const kw = (document.getElementById('pickerSearch').value || '').trim();
-  // 候选只给「还没开启托管」的：已开启的就在左边列表里，这里不重复列
-  const cands = allConvs.filter(c => !c.auto_reply);
+  // 候选只给「还没开启托管」的：已开启的就在左边列表里，这里不重复列。
+  // 数据源是通讯录全量（pickerAll），所以加了好友没聊过的人也能选到。
+  const cands = pickerAll.filter(c => !c.auto_reply && c.kind !== 'system');
   const tagSet = [];
   for (const c of cands) {
     for (const t of (c.tags || [])) {
       if (!tagSet.includes(t)) tagSet.push(t);
     }
   }
-  // 内置分类（不依赖 config）：群聊 / 私聊，配上 config 里的标签一起做筛选项
-  const isGroup = c => String(c.conv_id).endsWith('@chatroom');
-  const isMp = c => String(c.conv_id).startsWith('gh_') || c.conv_id === 'filehelper';
+  // 内置分类（不依赖 config）：群聊 / 好友 / 公众号，配上 config 里的标签一起做筛选项
+  const isGroup = c => c.kind === 'group' || String(c.conv_id).endsWith('@chatroom');
+  const isOfficial = c => c.kind === 'official';
   const BUILTIN = [
+    {id: '__private', label: '好友', test: c => !isGroup(c) && !isOfficial(c)},
     {id: '__group', label: '群聊', test: isGroup},
-    {id: '__private', label: '私聊', test: c => !isGroup(c) && !isMp(c)},
+    {id: '__official', label: '公众号', test: isOfficial},
   ];
 
   let list = cands;
@@ -817,18 +835,20 @@ function renderPicker() {
       const row = document.createElement('div');
       row.className = 'pick-row';
       const tags = (c.tags || []).map(t => `<span class="tg">#${esc(t)}</span>`).join('');
+      const noChat = c.has_conv === false ? '<span class="tg">未聊过</span>' : '';
       const badge = (c.unread > 0) ? `<span class="badge">${c.unread}</span>` : '';
       row.innerHTML = `
         ${avatarHtml(c.avatar_url, c.name)}
-        <div class="nm">${esc(c.name || c.conv_id)}${tags}${badge}</div>
+        <div class="nm">${esc(c.name || c.conv_id)}${tags}${noChat}${badge}</div>
         <div class="plus">+</div>`;
       row.onclick = () => enableConv(c.conv_id);
       box.appendChild(row);
     }
   }
-  const onCount = allConvs.filter(c => c.auto_reply).length;
+  const onCount = pickerAll.filter(c => c.auto_reply).length;
+  const chatCount = pickerAll.filter(c => c.has_conv).length;
   document.getElementById('pickerFoot').textContent =
-    `共 ${allConvs.length} 个会话，已托管 ${onCount} 个；点一行即开启托管`;
+    `通讯录 ${pickerAll.length} 个（${chatCount} 个聊过），已托管 ${onCount} 个；点一行即开启托管`;
 }
 
 async function enableConv(convId) {
@@ -838,8 +858,11 @@ async function enableConv(convId) {
       body: JSON.stringify({conv: convId, enabled: true})
     });
     if (!r.ok) throw new Error('HTTP ' + r.status);
-    const c = allConvs.find(x => x.conv_id === convId);
-    if (c) c.auto_reply = 1;        // 本地先标上，弹层立刻少一行
+    // 两个列表都先本地标上，弹层立刻少一行，不用等下一次轮询
+    [allConvs, pickerAll].forEach(arr => {
+      const it = arr.find(x => x.conv_id === convId);
+      if (it) it.auto_reply = 1;
+    });
     pickerSig = '';
     renderPicker();
     loadConversations();

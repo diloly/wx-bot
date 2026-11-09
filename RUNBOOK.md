@@ -128,6 +128,19 @@ python <项目根目录>\wechat_ui.py --schedule --no-dry
 | `max_replies_per_hour` | 20 | 全局每小时上限（防风控） |
 | FAILSAFE | 开 | 鼠标甩到屏幕左上角立即急停 |
 
+### 5.1 自动回复是 24 小时的（有意如此）
+
+自动回复**没有任何时段限制**，凌晨收到也照回——客户半夜发消息，早上才回就失去意义了。
+全项目只有两处卡时段，都跟"主动找别人"有关，不是回复：
+
+| 行为 | 时段 | config |
+|---|---|---|
+| 自动回复 | 24 小时不限 | —（只有 `max_replies_per_hour` 限速） |
+| 主动触达（主动找人说话） | 8:00–21:00 | `outreach.work_start_hour/end_hour` |
+| 加好友（主动加人） | 9:00–21:00 | `add_friend.work_start_hour/end_hour` |
+
+主动触达的完整配置项与两套入口见 `COMMANDS.md` 2.12。
+
 ## 六、聊天记录备份（export_history.py）
 
 ```

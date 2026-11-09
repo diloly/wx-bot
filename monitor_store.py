@@ -180,6 +180,17 @@ def _init_schema(path=None):
             src     TEXT,
             ts      INTEGER
         );
+        -- 微信通讯录全量（2026-11-09）：conversations 只攒「聊过的会话」，
+        -- 看板的「+ 选择托管」和激活脚本都需要**所有好友**，否则加了好友
+        -- 却从没聊过的人永远选不到、也激活不了。
+        CREATE TABLE IF NOT EXISTS contacts (
+            conv_id TEXT PRIMARY KEY,   -- wxid / 群号 / 公众号 id
+            name    TEXT,               -- 备注优先，其次昵称
+            nick    TEXT,
+            remark  TEXT,
+            kind    TEXT,               -- friend / group / official / system
+            ts      INTEGER
+        );
         """
     )
     # 老库可能没有 msg_hash / media / card / sent_by 列，补齐（ALTER 不支持 IF NOT EXISTS，用异常吞掉已存在）
@@ -509,6 +520,44 @@ def get_avatar(conv_id):
             "SELECT conv_id, file, src, ts FROM avatars WHERE conv_id=?",
             ((conv_id or "").strip(),)).fetchone()
         return dict(r) if r else None
+    finally:
+        conn.close()
+
+
+def upsert_contacts(rows, ts=None):
+    """批量写入通讯录（rows: [{conv_id,name,nick,remark,kind}]），返回条数。
+
+    通讯录是「全量覆盖」语义：同一条按 conv_id 覆盖，不删除已消失的联系人
+    （微信里删好友不影响这里，看板仍能看到历史；真要清理再单独做）。
+    """
+    rows = [r for r in (rows or []) if (r or {}).get("conv_id")]
+    if not rows:
+        return 0
+    now = int(ts or time.time())
+    conn = init()
+    try:
+        conn.executemany(
+            "INSERT OR REPLACE INTO contacts(conv_id, name, nick, remark, kind, ts) "
+            "VALUES(?,?,?,?,?,?)",
+            [(r["conv_id"], r.get("name") or "", r.get("nick") or "",
+              r.get("remark") or "", r.get("kind") or "friend", now) for r in rows])
+        conn.commit()
+        return len(rows)
+    finally:
+        conn.close()
+
+
+def list_contacts(kind=None):
+    """通讯录列表（按名字排序）。kind=friend 只看好友（排除群/公众号/系统号）。"""
+    conn = _conn()
+    try:
+        sql = "SELECT conv_id, name, nick, remark, kind, ts FROM contacts"
+        params = []
+        if kind:
+            sql += " WHERE kind=?"
+            params.append(kind)
+        sql += " ORDER BY name"
+        return [dict(r) for r in conn.execute(sql, params).fetchall()]
     finally:
         conn.close()
 
@@ -1188,6 +1237,123 @@ def get_outreach_candidates(silent_days=7, max_days=60, min_gap_days=14,
         return out[:int(limit)]
     finally:
         conn.close()
+
+
+def get_activation_targets(silent_hours=24, max_days=0, min_gap_days=7,
+                           include_no_chat=False, require_switch=False,
+                           limit=50, now=None, max_per_contact=0):
+    """存量客户「激活」的候选池（activate.py 用，与 get_outreach_candidates 的区别见下）。
+
+    和主动触达的区别：
+      · 沉默门槛按**小时**算（默认 24h），不像触达要 7 天——用户要「从现在开始激活」；
+      · 不要求「我方说过话」，因为可选把**加了好友从没聊过**的人一起算进来（破冰）；
+      · 默认不要求会话开关（脚本本身就是显式的人工指令），require_switch=True 才卡。
+
+    入选条件：私聊 → 最后一条距今 ≥ silent_hours → （可选）不超过 max_days →
+    距上次 outreach 类动作 ≥ min_gap_days → 累计消息数 > 0（revive 类型）→
+    累计触达次数 < max_per_contact（0 = 不限）。
+
+    Returns: [{conv_id, name, kind:'revive'|'icebreak', last_ts, last_role, msg_count}]
+    """
+    now = int(now or time.time())
+    hi = now - int(float(silent_hours) * 3600)
+    lo = (now - int(max_days) * 86400) if max_days else 0
+    gap_cutoff = now - int(min_gap_days) * 86400
+
+    out = []
+    me = (get_setting("me_wxid") or "").strip()   # 通讯录里也有自己，别给自己发消息
+    conn = _conn()
+    try:
+        # 只碰「真正的好友」：conversations 里同时混着文件传输助手、微信团队、
+        # 公众号这些系统会话，给它们发"激活"既没意义也显得很傻。
+        # 通讯录同步过（contacts 非空）就以 kind='friend' 为准；没同步过则退回
+        # 「排除明显的系统号/公众号」的兜底判断，不至于一条候选都没有。
+        has_contacts = conn.execute("SELECT 1 FROM contacts LIMIT 1").fetchone() is not None
+        sql = ("SELECT c.conv_id, c.name, c.last_ts, "
+               "  (SELECT m.role FROM messages m WHERE m.conv_id=c.conv_id "
+               "     ORDER BY m.ts DESC, m.id DESC LIMIT 1) AS last_role, "
+               "  (SELECT COUNT(*) FROM messages m WHERE m.conv_id=c.conv_id) AS msg_count, "
+               "  (SELECT MAX(t.created) FROM reply_task t WHERE t.conv_id=c.conv_id "
+               "     AND t.kind='outreach' AND t.status='sent' "
+               "     AND COALESCE(t.reason,'') NOT LIKE 'dry-run%') AS act_last, "
+               "  (SELECT COUNT(*) FROM reply_task t WHERE t.conv_id=c.conv_id "
+               "     AND t.kind='outreach' AND t.status='sent' "
+               "     AND COALESCE(t.reason,'') NOT LIKE 'dry-run%') AS act_count, "
+               "  COALESCE(s.enabled, 0) AS switched "
+               "FROM conversations c "
+               "LEFT JOIN conv_switch s ON s.conv_id=c.conv_id "
+               "WHERE c.conv_id NOT LIKE '%@chatroom' AND c.last_ts <= ?")
+        params = [hi]
+        if has_contacts:
+            sql += (" AND EXISTS (SELECT 1 FROM contacts ct WHERE ct.conv_id=c.conv_id"
+                    " AND ct.kind='friend')")
+        else:
+            sql += (" AND substr(c.conv_id, 1, 3) <> 'gh_'"
+                    " AND c.conv_id NOT IN ('filehelper','weixin','fmessage','medianote',"
+                    "'floatbottle','newsapp','notifymessage','qqmail','qqsafe')")
+        if lo:
+            sql += " AND c.last_ts >= ?"
+            params.append(lo)
+        if me:
+            sql += " AND c.conv_id <> ?"
+            params.append(me)
+        sql += " ORDER BY c.last_ts DESC"
+        for r in conn.execute(sql, params).fetchall():
+            d = dict(r)
+            if int(d.get("msg_count") or 0) <= 0:
+                continue                    # 没消息的交给 icebreak 分支
+            if int(d.get("act_last") or 0) > gap_cutoff:
+                continue                    # 冷却期内，别反复打扰
+            if max_per_contact and int(d.get("act_count") or 0) >= int(max_per_contact):
+                continue                    # 累计触达次数到顶，这辈子不再自动碰他
+            if require_switch and not int(d.get("switched") or 0):
+                continue
+            out.append({
+                "conv_id": d["conv_id"],
+                "name": (d.get("name") or d["conv_id"]),
+                "kind": "revive",
+                "last_ts": int(d.get("last_ts") or 0),
+                "last_role": d.get("last_role") or "",
+                "msg_count": int(d.get("msg_count") or 0),
+            })
+    finally:
+        conn.close()
+
+    if include_no_chat:
+        conn = _conn()
+        try:
+            sql2 = ("SELECT ct.conv_id, ct.name, "
+                    "  (SELECT MAX(t.created) FROM reply_task t WHERE t.conv_id=ct.conv_id "
+                    "     AND t.kind='outreach' AND t.status='sent' "
+                    "     AND COALESCE(t.reason,'') NOT LIKE 'dry-run%') AS act_last, "
+                    "  (SELECT COUNT(*) FROM reply_task t WHERE t.conv_id=ct.conv_id "
+                    "     AND t.kind='outreach' AND t.status='sent' "
+                    "     AND COALESCE(t.reason,'') NOT LIKE 'dry-run%') AS act_count "
+                    "FROM contacts ct "
+                    "WHERE ct.kind='friend' AND NOT EXISTS ("
+                    "  SELECT 1 FROM conversations c WHERE c.conv_id=ct.conv_id)")
+            p2 = []
+            if me:                          # 通讯录里有自己，别给自己发破冰消息
+                sql2 += " AND ct.conv_id <> ?"
+                p2.append(me)
+            sql2 += " ORDER BY ct.name"
+            rows = conn.execute(sql2, p2).fetchall()
+        finally:
+            conn.close()
+        if not require_switch:              # 没会话就没有开关，「要求开关」时这批直接不要
+            for r in rows:
+                d = dict(r)
+                if int(d.get("act_last") or 0) > gap_cutoff:
+                    continue
+                if max_per_contact and int(d.get("act_count") or 0) >= int(max_per_contact):
+                    continue
+                out.append({
+                    "conv_id": d["conv_id"],
+                    "name": (d.get("name") or d["conv_id"]),
+                    "kind": "icebreak",
+                    "last_ts": 0, "last_role": "", "msg_count": 0,
+                })
+    return out[:int(limit)]
 
 
 def count_outreach_since(since_ts):

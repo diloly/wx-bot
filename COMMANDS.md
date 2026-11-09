@@ -316,6 +316,77 @@ pending → already（对方已在通讯录，跳过）/ failed（同一号码�
 - **接口**：`GET /api/avatar/<conv_id>`（404 = 没头像，前端兜底）；
   `/api/conversations` 每项带 `avatar_url`（含 `?v=<ts>` 缓存键）和 `me`（本机 wxid）。
 
+**通讯录（2026-11-09）**：左栏和选择器原来只看 `conversations`（聊过的会话），
+加了好友却从没聊过的人根本不存在于看板。现在 `wx_recv_bridge.sync_contacts()`
+把微信 `contact.db` 全量同步进 `contacts` 表（`kind` = friend/group/official/system），
+看板用 `GET /api/contacts` 取全量（合并会话状态、托管开关、头像），
+选择器里「未聊过」的会打标记。同步时机与头像相同（启动 + 每 10 分钟）。
+
+---
+
+## 2.12 主动触达 / 存量激活（2026-11-09 重做）
+
+两套入口，**同一份规则、同一份额度**（实现在 `outreach_core.py`，别再各写一份）：
+
+| 入口 | 何时用 | 怎么开 |
+|---|---|---|
+| **常驻触达**（auto_reply 后台线程） | 日常。每 5 分钟巡检一次，命中就发一条 | `config.outreach.enabled=true`（默认已开），**不用敲命令** |
+| **手动激活**（activate.py） | 临时想多发几条、或先看文案 | 敲命令 |
+
+### 常驻触达：全部走 config.json 的 `outreach` 块
+
+```json
+"outreach": {
+  "enabled": true,                 // 总开关（看板也能开关，5 分钟内生效）
+  "daily_limit": 0,                 // 0=不设每日上限（靠下面的间隔节流）
+  "per_run_limit": 10,              // activate.py 单次最多几条，防手滑
+  "interval_min_seconds": 600,     // 两条之间最少隔 10 分钟
+  "interval_max_seconds": 1800,    // 最多隔 30 分钟
+  "work_start_hour": 8,            // 只在 8:00-21:00 发（夜间绝不发）
+  "work_end_hour": 21,
+  "silent_days": 7,                // 多久没聊算「长久没聊」
+  "max_days": 0,                   // 0=不限；设 60 就只碰 60 天内聊过的
+  "min_gap_days": 14,              // 同一个人 14 天内不重复碰
+  "max_per_contact": 3,            // 同一个人累计最多被自动碰 3 次，之后不再碰
+  "lookback_days": 180,            // 拼「上次聊到」时往回看多久
+  "include_new_contacts": false,   // 加了好友从没聊过的，要不要破冰（默认否）
+  "require_switch": false          // true=只碰看板上开了托管的会话
+}
+```
+
+**改完必须重启 auto_reply**（config 只在启动时读；`enabled` 例外，看板开关走库）。
+
+### 手动激活：参数默认全取 config，不用手写
+
+```bash
+python activate.py                        # 只列候选（零成本，不调 AI）
+python activate.py --preview              # 生成话术给你看（会调 AI，不发送）
+python activate.py --send                 # 按 config 的条数真发
+python activate.py --send --limit 3       # 临时改条数
+python activate.py --send --icebreak      # 临时把「没聊过」的一起破冰
+```
+
+取值优先级：**命令行 > config.json > 代码兜底**，所以日常都不用带参数。
+
+### 两类话术（自动判断）
+
+- **唤回（revive）**：聊过、现在沉默 → 承接上次聊到的**具体内容**（提示词禁止
+  「最近怎么样」这类空话）；取不到可承接内容就跳过，不发空泛问候；
+- **破冰（icebreak）**：加了好友从没聊过 → 自我介绍 + 价值点 + 低压钩子。
+
+### 安全闸门（全过才发）
+
+只碰真正的好友（`contacts.kind='friend'`，排除群/公众号/系统号/自己）→ 最后一条
+距今 ≥ `silent_days` → 同一人 `min_gap_days` 内没被碰过 → 累计 < `max_per_contact`
+→（`daily_limit>0` 时）当天 ≤ `daily_limit`，**默认 0 = 不限**
+→ 只在 `work_start_hour~work_end_hour` → 两条之间随机等 `interval_min/max_seconds`。
+
+不设日上限之后，节流全靠「10~30 分钟一条 + 8-21 点窗口 + 每会话 14 天冷却 /
+累计 3 次」这三道闸；13 小时窗口理论最多约 26~78 条，实际候选通常远少于此。
+
+**发完之后**：自动打开该会话的托管开关（否则客户回你没人接），`--no-switch` 可关。
+发送结果三态与自动回复一致：回读确认到才记 `sent`，否则记 `failed` 不重试。
+
 ---
 
 ## 3. 调试 / 验证

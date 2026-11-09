@@ -24,6 +24,9 @@ recv_raw.log
 # 朋友圈每日动作计数（运行态，别提交）
 .moment_actions.json
 
+# ===== 采集产出（真实企业联系信息，跑到本地即可，不入库）=====
+scraper/output/
+
 # ===== 编译产物 / 注入工具二进制 =====
 wechat_hook/*.dll
 wechat_hook/*.exe

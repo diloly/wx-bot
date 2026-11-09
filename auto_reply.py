@@ -60,6 +60,7 @@ import threading
 import time
 
 import monitor_store
+import outreach_core as oc
 import ui_gate
 from ai_client import generate as ai_generate
 from wechat_ui import (WeChatPCBot, load_config, SendNotVerified,
@@ -68,28 +69,10 @@ from wx_recv_bridge import poll_new, is_self, me_username, WeChatDB
 
 GROUP_SUFFIX = "@chatroom"
 
-# 「好友通过」的系统提示措辞（2026-10-19 查库实测存在的三种）。
-# **注意**：其中「我通过了你的朋友验证请求…」在库里 raw type 是「文本」，
-# 与客户真消息同类型——所以只能靠文案识别，不能只靠 type。
-FRIEND_PASS_PATTERNS = (
-    "我通过了你的朋友验证请求",
-    "你已添加了",
-    "以上是打招呼的消息",
-)
-
-# 主动触达的默认意图（config.json 的 outreach.intent 非空时整体覆盖）。
-# 三条纪律写死：① 明确这是**主动**发起、不是回复；② 必须承接具体内容，
-# 不许「最近怎么样」这类空话；③ 不推销、不发链接、不提价格。
-OUTREACH_INTENT = (
-    "你正在**主动**给一位沉默了一段时间的老客户发微信。注意：他不是刚发消息给你，"
-    "这是你主动找他，所以不要用「收到」「好的」「您刚才说的」这类回复口吻。\n"
-    "目标是把话重新聊起来，不是推销。必须承接下面「上次聊到」里的**具体内容**"
-    "（他提过的项目/问题/需求，或我们答应帮他确认的事），让对方觉得你记得他。\n"
-    "禁止：泛泛问候（「最近怎么样」「在忙吗」「好久不见」这类一律不许用）、"
-    "产品推销、发链接、报价、群发感。\n"
-    "要求：1~3 句口语化中文，只问一个问题，让对方容易接话。"
-    "只输出消息正文，不要解释。"
-)
+# 「好友通过」的系统提示措辞与「主动触达」话术都收敛在 outreach_core 里，
+# 因为 activate.py 也要用同一份，两处各存一份改一处必漏一处（踩过）。
+FRIEND_PASS_PATTERNS = oc.FRIEND_PASS_PATTERNS
+OUTREACH_INTENT = oc.REVIVE_INTENT
 
 
 class ReplyTask:
@@ -100,10 +83,10 @@ class ReplyTask:
     排了别人就无限期挂着。
     """
     __slots__ = ("id", "conv_id", "name", "text", "created", "deadline", "reply",
-                 "kind", "at_name")
+                 "kind", "at_name", "variant")
 
     def __init__(self, conv_id, name, text, timeout, task_id=None, kind="reply",
-                 at_name=None):
+                 at_name=None, variant="revive"):
         self.id = task_id          # reply_task 表主键（落库后回填；None=未落库）
         self.conv_id = conv_id
         self.name = name
@@ -114,6 +97,8 @@ class ReplyTask:
         self.kind = kind            # 'reply'=正常回复；'first_touch'=通过后的首条激活
         # 群聊专用：发送前要 @ 的成员显示名（群昵称）。None=私聊/不 @
         self.at_name = at_name
+        # 主动触达子类型：revive=承接旧话题 / icebreak=从没聊过的破冰
+        self.variant = variant
 
     def remaining(self):
         return self.deadline - time.time()
@@ -218,17 +203,22 @@ class AutoReplier:
         # 由头只从 messages 里取——「对方最后一句我们没接」或「上次聊到的内容」，
         # 拿不到具体由头就不发（宁可少发，也不发空泛问候）。
         ou = cfg.get("outreach", {}) or {}
+        self.ou_cfg = ou                # 原样留着：候选规则统一交给 outreach_core
         self.ou_enabled = bool(ou.get("enabled", False))
-        self.ou_daily_limit = int(ou.get("daily_limit", 5))
-        self.ou_gap_min = float(ou.get("interval_min_seconds", 1800))
-        self.ou_gap_max = float(ou.get("interval_max_seconds", 5400))
-        self.ou_work_start = int(ou.get("work_start_hour", 9))
+        # 0 = 不设每日上限（靠条间间隔 + 每会话冷却节流）；想恢复上限填正整数
+        self.ou_daily_limit = int(ou.get("daily_limit", 0) or 0)
+        self.ou_gap_min = float(ou.get("interval_min_seconds", 600))   # 10 分钟
+        self.ou_gap_max = float(ou.get("interval_max_seconds", 1800))  # 30 分钟
+        self.ou_work_start = int(ou.get("work_start_hour", 8))
         self.ou_work_end = int(ou.get("work_end_hour", 21))
         self.ou_silent_days = int(ou.get("silent_days", 7))       # 多久没动算沉默
-        self.ou_max_days = int(ou.get("max_days", 60))            # 超过就太久了
+        self.ou_max_days = int(ou.get("max_days", 0) or 0)        # 0=不限（越久越该激活）
         self.ou_min_gap_days = int(ou.get("min_gap_days", 14))    # 同一人冷却
         self.ou_max_per_contact = int(ou.get("max_per_contact", 3))
-        self.ou_lookback_days = int(ou.get("lookback_days", 90))  # 取历史对话的窗口
+        self.ou_lookback_days = int(ou.get("lookback_days", 180)) # 取历史对话的窗口
+        # 加了好友但从没聊过的人，是否也做破冰（默认**不**：给没说过话的人主动
+        # 发消息观感最像群发营销，要开必须显式写 true）
+        self.ou_include_new = bool(ou.get("include_new_contacts", False))
         self.ou_intent = (ou.get("intent") or "").strip()
         self._ou_day = ""             # 已提示「今日达上限」的那一天（只打印一次）
         self._ou_next_at = 0.0        # 下一次允许触达的时刻（间隔在投递时抽一次定死）
@@ -831,7 +821,7 @@ class AutoReplier:
             if task.kind == "first_touch":
                 intent = self._first_touch_intent()
             elif task.kind == "outreach":
-                intent = self._build_outreach_intent(task.text)
+                intent = self._build_outreach_intent(task.text, task.variant)
             else:
                 intent = self._build_intent(task.conv_id)
             reply = ai_generate(
@@ -999,6 +989,15 @@ class AutoReplier:
             # 发送成功（dry-run 下 send_to_contact 不真发，账本注明，免得看板误判）
             self._task_set(task, "sent", reply=task.reply,
                            reason=("dry-run：未真发" if self.dry_run else None))
+            # 主动触达发出去之后，顺手把该会话的自动回复打开：我们主动找的人
+            # 回话了我们却不接，比不发还糟。dry-run 不真发，也就不该改开关。
+            if task.kind == "outreach" and not self.dry_run:
+                try:
+                    monitor_store.set_switch(task.conv_id, True)
+                    print("[auto] 已开启 %s 的自动回复（客户回话会有人接）" % task.name)
+                except Exception as e:  # noqa: BLE001
+                    print("[auto] 开启 %s 的自动回复失败（客户回话需人工看）: %s"
+                          % (task.name, e))
 
     # ---------- 加好友 worker（名单队列，发完即走） ----------
     # 关键语义：**添加好友是异步的**。点完「确定」这条就结束，worker 立刻处理
@@ -1155,7 +1154,8 @@ class AutoReplier:
         except Exception as e:          # noqa: BLE001
             print("[auto] 主动触达统计失败（本轮跳过）: %s" % e)
             return
-        if sent_today >= self.ou_daily_limit:
+        # daily_limit=0 表示不设每日上限，只靠条间 10~30 分钟 + 每会话冷却节流。
+        if self.ou_daily_limit > 0 and sent_today >= self.ou_daily_limit:
             key = d.strftime("%Y-%m-%d")
             if self._ou_day != key:     # 一天只提示一次，别每 5 分钟刷一条
                 self._ou_day = key
@@ -1171,20 +1171,26 @@ class AutoReplier:
         if last_at and now - last_at < self.ou_gap_min:
             return
         try:
-            cands = monitor_store.get_outreach_candidates(
-                silent_days=self.ou_silent_days, max_days=self.ou_max_days,
-                min_gap_days=self.ou_min_gap_days,
-                max_per_contact=self.ou_max_per_contact, limit=3)
+            # 候选规则统一走 outreach_core（与 activate.py 同一份实现）：
+            # 沉默客户在前、没聊过的破冰在后，冷却/累计次数都在那边卡。
+            cands = oc.pick_targets(self.ou_cfg, limit=3, now=int(now))
         except Exception as e:          # noqa: BLE001
             print("[auto] 主动触达取候选失败（本轮跳过）: %s" % e)
             return
         for c in cands:
             conv_id = c.get("conv_id") or ""
-            ctx = self._outreach_context(conv_id)
-            if not ctx:
-                continue                # 没有可承接的具体内容 → 跳过，不发空泛问候
+            variant = c.get("kind") or "revive"
+            if variant == "icebreak":
+                if not self.ou_include_new:
+                    continue            # 没显式授权，就不给没说过话的人发消息
+                ctx = ""                # 破冰没有旧话题可承接，靠自我介绍开场
+            else:
+                ctx = self._outreach_context(conv_id)
+                if not ctx:
+                    continue            # 没有可承接的具体内容 → 跳过，不发空泛问候
             name = (c.get("name") or "").strip() or conv_id
-            task = ReplyTask(conv_id, name, ctx, self.task_timeout, kind="outreach")
+            task = ReplyTask(conv_id, name, ctx, self.task_timeout, kind="outreach",
+                             variant=variant)
             task.id = self._task_open(task)
             try:
                 self._ai_q.put_nowait(task)
@@ -1192,53 +1198,37 @@ class AutoReplier:
                 print("[auto] 待生成队列已满，本轮主动触达暂缓")
                 return
             self._ou_next_at = now + random.uniform(self.ou_gap_min, self.ou_gap_max)
-            days = int((now - (c.get("last_ts") or now)) / 86400)
-            print("[auto] 主动触达 → %s（沉默 %d 天，最后一条是%s；"
-                  "下一条最早 %.0f 分钟后）"
-                  % (name, days,
-                     "对方说的" if c.get("last_role") == "them" else "我方说的",
-                     (self._ou_next_at - now) / 60))
+            if variant == "icebreak":
+                print("[auto] 主动触达 → %s（加了好友没聊过，破冰；"
+                      "下一条最早 %.0f 分钟后）"
+                      % (name, (self._ou_next_at - now) / 60))
+            else:
+                days = int((now - (c.get("last_ts") or now)) / 86400)
+                print("[auto] 主动触达 → %s（沉默 %d 天，最后一条是%s；"
+                      "下一条最早 %.0f 分钟后）"
+                      % (name, days,
+                         "对方说的" if c.get("last_role") == "them" else "我方说的",
+                         (self._ou_next_at - now) / 60))
             return
 
     def _outreach_context(self, conv_id):
         """拼「上次聊到哪」：最近几条真实消息 + 距今多少天。
 
-        为什么不用朋友圈（用户 2026-10-21 明确）：朋友圈里大量是转发、行业杂讯，
-        拿它当由头很容易「看到您发的那个…」说错对象。聊天记录是我们自己发的、
-        对方自己说的，语义和归属都确定。
+        实现搬去了 outreach_core（activate.py 用的是同一份），这里只是按
+        config 的 lookback_days 转发一下，避免两处规则慢慢走偏。
         """
-        since = int(time.time()) - self.ou_lookback_days * 86400
-        try:
-            msgs = monitor_store.get_messages(conv_id, limit=10, since_ts=since)
-        except Exception as e:          # noqa: BLE001
-            print("[auto] 主动触达取历史失败(%s): %s" % (conv_id, e))
-            return ""
-        lines = []
-        last_ts = 0
-        for m in msgs:
-            t = (m.get("text") or "").strip()
-            if not t:
-                continue
-            if any(p in t for p in FRIEND_PASS_PATTERNS):
-                continue                # 好友通过/打招呼这类系统提示不算聊天内容
-            lines.append("%s：%s"
-                         % ("我" if m.get("role") == "me" else "对方", t[:120]))
-            last_ts = m.get("ts") or last_ts
-        if not lines:
-            return ""
-        days = max(0, int((time.time() - (last_ts or time.time())) / 86400))
-        return "（最后一条距今约 %d 天）\n%s" % (days, "\n".join(lines[-6:]))
+        return oc.build_context(conv_id, lookback_days=self.ou_lookback_days,
+                                max_lines=6)
 
-    def _build_outreach_intent(self, ctx):
+    def _build_outreach_intent(self, ctx, variant="revive"):
         """主动触达的意图：把「主动 vs 回复」和「不许空泛问候」写死。
 
         不写死的话，AI 会把它当成一次普通回复，生成「最近怎么样」「在忙吗」
         这类废话——那既不像真人，也是最容易被当成营销号的行为。
         """
-        base = self.ou_intent or OUTREACH_INTENT
-        if ctx:
-            return base + "\n\n【上次聊到（真实聊天记录，供你承接，不要照抄）】\n" + ctx
-        return base
+        if variant == "icebreak":
+            return oc.icebreak_intent()
+        return oc.revive_intent(ctx, self.ou_intent)
 
     # ---------- worker 启停 ----------
     def _start_workers(self):
@@ -1335,12 +1325,15 @@ class AutoReplier:
             print("[auto] 加好友未启用（config.add_friend.enabled=false 或看板已关）："
                   "名单只入库，不会自动发申请")
         if self._ou_enabled():
-            print("[auto] 主动触达已启用：每日 %d 条、间隔 %.0f~%.0f 分钟、%02d:00-%02d:00、"
-                  "沉默 ≥%d 天、同一人冷却 %d 天/最多 %d 次（看板可随时开关）"
-                  % (self.ou_daily_limit, self.ou_gap_min / 60.0, self.ou_gap_max / 60.0,
+            limit_txt = ("%d 条" % self.ou_daily_limit) if self.ou_daily_limit > 0 else "不限"
+            print("[auto] 主动触达已启用：每日 %s、间隔 %.0f~%.0f 分钟、%02d:00-%02d:00、"
+                  "沉默 ≥%d 天、同一人冷却 %d 天/最多 %d 次；"
+                  "没聊过的破冰=%s（看板可随时开关）"
+                  % (limit_txt, self.ou_gap_min / 60.0, self.ou_gap_max / 60.0,
                      self.ou_work_start, self.ou_work_end,
                      self.ou_silent_days, self.ou_min_gap_days,
-                     self.ou_max_per_contact))
+                     self.ou_max_per_contact,
+                     "开" if self.ou_include_new else "关"))
         else:
             print("[auto] 主动触达未启用（config.outreach.enabled=false）：不会主动给客户发消息")
         print("[auto] 首轮要全量解密全部数据库，可能数分钟；之后每轮秒级。进度见 [scan] 行")

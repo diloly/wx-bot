@@ -43,8 +43,10 @@ from monitor_store import (
     get_moments, get_interactions, mark_interactions_read, moment_unread_count,
     get_moment_switches, set_moment_switch, get_tasks, task_counts,
     friend_counts, get_friend_tasks, friend_sent_today, get_setting, set_setting,
-    count_outreach_since, get_outreach_candidates, delete_message, get_avatar,
+    count_outreach_since, delete_message, get_avatar,
+    list_contacts,
 )
+import outreach_core as oc
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("dashboard")
@@ -143,6 +145,45 @@ def api_conversations():
 def api_messages():
     conv = request.args.get("conv", "")
     return jsonify(get_messages(conv))
+
+
+@app.route("/api/contacts")
+def api_contacts():
+    """通讯录全量（合并会话状态与托管开关），供「+」选择器使用。
+
+    为什么不复用 /api/conversations：那张表只攒「聊过的会话」，加了好友却从没
+    聊过的人根本不在里面——选择器永远选不到，也就没法开托管。
+    数据来自 monitor_store.contacts（由 wx_recv_bridge.sync_contacts 从微信
+    contact.db 同步），再看有没有对应会话、有没有开托管。
+    """
+    import wechat_ui
+    cfg_contacts = wechat_ui.load_config().get("contacts") or []
+    convs = {c["conv_id"]: c for c in list_conversations()}
+    out = []
+    for r in list_contacts():
+        cid = r["conv_id"]
+        cv = convs.get(cid) or {}
+        item = {
+            "conv_id": cid,
+            "name": r.get("name") or r.get("nick") or cid,
+            "kind": r.get("kind") or "friend",
+            "has_conv": bool(cv),
+            "last_msg": cv.get("last_msg") or "",
+            "last_ts": cv.get("last_ts") or 0,
+            "auto_reply": 1 if cv.get("auto_reply") else 0,
+        }
+        item["tags"] = _conv_tags(item, cfg_contacts)
+        if cv.get("avatar_url"):
+            item["avatar_url"] = cv["avatar_url"]
+        else:
+            av = get_avatar(cid)
+            item["avatar_url"] = (
+                "/api/avatar/%s?v=%s" % (quote(cid, safe=""), av.get("ts") or 0)
+            ) if av else ""
+        out.append(item)
+    # 聊过的排前面（按最近活跃），没聊过的按名字兜底
+    out.sort(key=lambda x: (0 if x["has_conv"] else 1, -(x["last_ts"] or 0), x["name"]))
+    return jsonify({"contacts": out})
 
 
 @app.route("/api/messages/delete", methods=["POST"])
@@ -379,18 +420,18 @@ def api_outreach():
     day_start = datetime.datetime(d.year, d.month, d.day).timestamp()
     return jsonify({
         "enabled": enabled,
-        "daily_limit": int(ou.get("daily_limit", 5)),
+        "daily_limit": int(ou.get("daily_limit", 0) or 0),   # 0=不限
+        "daily_unlimited": int(ou.get("daily_limit", 0) or 0) <= 0,
+        "per_run_limit": int(ou.get("per_run_limit", 10)),
         "sent_today": count_outreach_since(day_start),
+        "work_start_hour": int(ou.get("work_start_hour", 8)),
+        "work_end_hour": int(ou.get("work_end_hour", 21)),
         "silent_days": int(ou.get("silent_days", 7)),
         "min_gap_days": int(ou.get("min_gap_days", 14)),
         "max_per_contact": int(ou.get("max_per_contact", 3)),
-        # 只看不改：当前符合条件的候选人（前端暂未展示，接口先留着排查用）
-        "candidates": get_outreach_candidates(
-            silent_days=int(ou.get("silent_days", 7)),
-            max_days=int(ou.get("max_days", 60)),
-            min_gap_days=int(ou.get("min_gap_days", 14)),
-            max_per_contact=int(ou.get("max_per_contact", 3)),
-            limit=5),
+        "include_new_contacts": bool(ou.get("include_new_contacts", False)),
+        # 只看不改：与常驻触达同一套规则算出来的候选（排查用，前端暂未展示）
+        "candidates": oc.pick_targets(ou, limit=5),
     })
 
 
@@ -465,10 +506,12 @@ def _avatar_loop():
     import time as _t
     while True:
         try:
-            from wx_recv_bridge import WeChatDB, sync_avatars
-            sync_avatars(WeChatDB())
+            from wx_recv_bridge import WeChatDB, sync_avatars, sync_contacts
+            db = WeChatDB()
+            sync_avatars(db)
+            sync_contacts(db)      # 通讯录跟着一起刷新：新加的好友选择器里马上能看到
         except Exception as e:      # noqa: BLE001
-            log.info("头像同步跳过（微信未运行/读库失败）: %s", e)
+            log.info("头像/通讯录同步跳过（微信未运行/读库失败）: %s", e)
         _t.sleep(600)
 
 

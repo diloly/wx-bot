@@ -523,6 +523,65 @@ def sync_avatars(db, only=None, force=False):
     return got, cached, failed
 
 
+# ---- 通讯录同步（2026-11-09）----
+# conversations 只记录「有过消息的会话」：加了好友却从没聊过的人在看板上根本
+# 不存在——选择器选不到、激活脚本也发不了。contact.db 的 contact 表是唯一
+# 全量来源，这里整体同步一份到 monitor_store.contacts。
+_SYSTEM_IDS = {
+    "filehelper", "weixin", "fmessage", "medianote", "floatbottle", "newsapp",
+    "notifymessage", "helper_entry", "qqmail", "qqsafe", "brandsessionholder",
+    "brandservicesessionholder", "weixinreminder", "officialaccounts",
+}
+
+
+def _contact_kind(username):
+    """通讯录条目分类：friend / group / official / system。
+
+    按 username 形态判断（稳定），不依赖 local_type（含义随版本变）。
+    """
+    u = (username or "").lower()
+    if u.endswith("@chatroom"):
+        return "group"
+    if u.startswith("gh_"):
+        return "official"
+    if u in _SYSTEM_IDS:
+        return "system"
+    return "friend"
+
+
+def sync_contacts(db):
+    """把微信通讯录同步到 monitor_store.contacts，返回写入条数（失败返回 0）。
+
+    全量覆盖语义：同名 conv_id 直接更新，已消失联系人不主动删（看板仍要能看历史）。
+    """
+    rows = []
+    try:
+        for rel, path, _ in getattr(db, "_db_files", None) or []:
+            if os.path.basename(path) != "contact.db":
+                continue
+            conn = db._open(rel)
+            try:
+                for u, nick, remark in conn.execute(
+                        "SELECT username, nick_name, remark FROM contact "
+                        "WHERE username IS NOT NULL AND username <> ''"):
+                    nick = (nick or "").strip()
+                    remark = (remark or "").strip()
+                    rows.append({
+                        "conv_id": u,
+                        "name": remark or nick or u,
+                        "nick": nick,
+                        "remark": remark,
+                        "kind": _contact_kind(u),
+                    })
+            finally:
+                conn.close()
+            break
+    except Exception as e:          # noqa: BLE001
+        print("[contact] 读通讯录失败（跳过同步）: %s" % e)
+        return 0
+    return monitor_store.upsert_contacts(rows)
+
+
 def _xml_placeholder(xml):
     """微信 4.x 部分消息（图片/表情等）的 content 是 XML 原文、库未友好化时，解析成占位。"""
     if "<img " in xml or "<img>" in xml:
@@ -939,11 +998,14 @@ def main():
             print("[*] role 校正完成：检查 %d 条，修正 %d 条" % (scanned, changed))
         return
 
-    # 启动顺手同步头像（新好友/换头像都能补上）。失败绝不影响收消息。
+    # 启动顺手同步头像与通讯录（新好友/换头像都能补上）。失败绝不影响收消息。
     try:
         sync_avatars(db)
+        n = sync_contacts(db)
+        if n:
+            print("[contact] 通讯录已同步 %d 条" % n)
     except Exception as e:          # noqa: BLE001
-        print("[avatar] 头像同步异常（不影响收消息）: %s" % e)
+        print("[avatar] 头像/通讯录同步异常（不影响收消息）: %s" % e)
 
     print("[*] 收消息桥启动，每 %ds 轮询一次（Ctrl+C 停止）" % args.interval)
     print("[*] 首轮要全量解密全部数据库，可能数分钟；之后每轮秒级。进度见 [scan] 行")

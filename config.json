@@ -74,17 +74,20 @@
     "lock_timeout_seconds": 180
   },
   "outreach": {
-    "enabled": false,
-    "daily_limit": 5,
-    "interval_min_seconds": 1800,
-    "interval_max_seconds": 5400,
-    "work_start_hour": 9,
+    "enabled": true,
+    "daily_limit": 0,
+    "per_run_limit": 10,
+    "interval_min_seconds": 600,
+    "interval_max_seconds": 1800,
+    "work_start_hour": 8,
     "work_end_hour": 21,
     "silent_days": 7,
-    "max_days": 60,
+    "max_days": 0,
     "min_gap_days": 14,
     "max_per_contact": 3,
-    "lookback_days": 90,
+    "lookback_days": 180,
+    "include_new_contacts": false,
+    "require_switch": false,
     "intent": ""
   },
   "knowledge": {
