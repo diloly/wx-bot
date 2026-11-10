@@ -201,7 +201,10 @@ def _init_schema(path=None):
             quote    TEXT,               -- 触发接管的客户原话
             reason   TEXT,               -- 判定依据（AI 结论 / 命中关键词）
             targets  TEXT,               -- JSON：本次通知发给了谁
-            paused   INTEGER DEFAULT 0,  -- 是否同时关掉了该会话自动回复
+            paused   INTEGER DEFAULT 0,  -- 真人接手后是否要正式关掉该会话自动回复
+            state    TEXT DEFAULT 'done',-- waiting 待接手 / taken 已接手 / expired 超时恢复 / done 旧记录
+            deadline INTEGER DEFAULT 0,  -- waiting 的超时时刻（创建时定死）
+            resolved_ts INTEGER,         -- 从 waiting 收口的时刻
             ts       INTEGER
         );
         -- 活动触达（2026-11-10）：人工写死文案 + 指定时间 + 指定对象，到点自动发。
@@ -234,6 +237,15 @@ def _init_schema(path=None):
         conn.execute("ALTER TABLE moment_switch ADD COLUMN nickname TEXT")
     except sqlite3.OperationalError:
         pass
+    # 接管记录改成「待接手 → 已接手 / 超时恢复」状态机后新增的三列，老库补齐。
+    # 旧行保持 state='done'，看板按「已完成」显示，不会被当成待接手去关托管。
+    for col, decl in (("state", "TEXT DEFAULT 'done'"),
+                      ("deadline", "INTEGER DEFAULT 0"),
+                      ("resolved_ts", "INTEGER")):
+        try:
+            conn.execute("ALTER TABLE handoff_log ADD COLUMN %s %s" % (col, decl))
+        except sqlite3.OperationalError:
+            pass
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_hash ON messages(msg_hash)"
     )
@@ -1583,16 +1595,36 @@ def last_handoff_map():
         conn.close()
 
 
-def add_handoff_log(conv_id, customer, quote, reason, targets, paused, ts=None):
+def last_handoff_state_map():
+    """{conv_id: 最近一次接管的状态}，给看板会话列表打正确的状态标签。
+
+    只看最新一条：waiting=待人工接手（托管其实还开着，不能标「已转人工」），
+    taken=真人已回复并正式交出，expired=超时未接手、AI 已恢复。
+    """
+    conn = init()
+    try:
+        rows = conn.execute(
+            "SELECT h.conv_id, COALESCE(h.state,'done') AS state FROM handoff_log h "
+            "JOIN (SELECT MAX(id) AS i FROM handoff_log GROUP BY conv_id) m "
+            "ON m.i = h.id"
+        ).fetchall()
+        return {r["conv_id"]: r["state"] for r in rows if r["conv_id"]}
+    finally:
+        conn.close()
+
+
+def add_handoff_log(conv_id, customer, quote, reason, targets, paused, ts=None,
+                    state="done", deadline=0):
+    """落一条接管记录。state='waiting' 表示已通知、等真人接手，托管仍开着。"""
     import json
     conn = init()
     try:
         cur = conn.execute(
-            "INSERT INTO handoff_log(conv_id, customer, quote, reason, targets, paused, ts) "
-            "VALUES(?,?,?,?,?,?,?)",
+            "INSERT INTO handoff_log(conv_id, customer, quote, reason, targets, "
+            "paused, state, deadline, resolved_ts, ts) VALUES(?,?,?,?,?,?,?,?,?,?)",
             (conv_id, customer, quote, reason,
              json.dumps(targets or [], ensure_ascii=False), 1 if paused else 0,
-             int(ts or time.time())))
+             state, int(deadline or 0), None, int(ts or time.time())))
         conn.commit()
         return cur.lastrowid
     finally:
@@ -1606,6 +1638,53 @@ def list_handoff_log(limit=30):
             "SELECT * FROM handoff_log ORDER BY ts DESC LIMIT ?",
             (int(limit),)).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def list_pending_handoffs():
+    """还没收口的接管（已通知真人、托管仍开着）。"""
+    conn = init()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM handoff_log WHERE state='waiting' ORDER BY ts ASC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def resolve_handoff(log_id, state, resolved_ts=None):
+    """把 waiting 收口成 taken / expired。带 state 条件，重复调用不会覆盖终态。"""
+    conn = init()
+    try:
+        cur = conn.execute(
+            "UPDATE handoff_log SET state=?, resolved_ts=? "
+            "WHERE id=? AND state='waiting'",
+            (state, int(resolved_ts or time.time()), int(log_id)))
+        conn.commit()
+        return cur.rowcount or 0
+    finally:
+        conn.close()
+
+
+def human_replied_since(conv_id, since_ts):
+    """通知发出后，真人有没有在**这个客户会话**里回过话。
+
+    判据是 messages 里 role='me' 且 sent_by 为空或 'manual'：
+      · 机器人发的都带标记 ai / handoff / campaign（send_to_contact 写入时传 by）
+      · 看板手发 = manual，也算人工接手
+      · 真人在 PC 微信或手机端手打的由收消息桥补录，sent_by 保持 NULL
+    通知本身发给的是同事/内部群，不在这个 conv_id 里，不会误判。
+    留 2 秒余量防通知时刻与微信 create_time 的秒级偏差。
+    """
+    conn = init()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM messages WHERE conv_id=? AND role='me' "
+            "AND (sent_by IS NULL OR sent_by='manual') AND ts>=? LIMIT 1",
+            (conv_id, int(since_ts) - 2)).fetchone()
+        return row is not None
     finally:
         conn.close()
 

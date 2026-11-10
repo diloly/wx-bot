@@ -2,8 +2,8 @@
   "dry_run": true,
   "send_delay_seconds": 5,
   "contacts": [
-    { "name": "11时59分[Sun]", "tags": ["new"] },
-    { "name": "黄文业", "tags": ["old", "vip"] }
+    { "name": "示例客户A", "tags": ["new"] },
+    { "name": "示例客户B", "tags": ["old", "vip"] }
   ],
   "templates": {
     "welcome": "您好 {name}，我是小助手，后续有疑问随时找我～",
@@ -74,11 +74,12 @@
     "lock_timeout_seconds": 180
   },
   "outreach": {
-    "enabled": true,
+    "enabled": false,
     "daily_limit": 0,
     "per_run_limit": 10,
     "interval_min_seconds": 600,
     "interval_max_seconds": 1800,
+    "boot_grace_seconds": 600,
     "work_start_hour": 8,
     "work_end_hour": 21,
     "silent_days": 7,

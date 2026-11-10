@@ -126,7 +126,8 @@ async function delMessage(id) {
           <div class="meta">
             <div class="nm">
               <span class="nm-text">{{ c.name }}</span>
-              <span v-if="!c.auto_reply && c.handoff_ts" class="wb-flag handoff">已转人工</span>
+              <span v-if="c.handoff_state === 'waiting'" class="wb-flag handoff">待人工接手</span>
+              <span v-else-if="!c.auto_reply && (c.handoff_state === 'taken' || c.handoff_ts)" class="wb-flag handoff">已转人工</span>
               <span v-else-if="!c.auto_reply && c.switched" class="wb-flag">已关托管</span>
               <span v-else-if="!c.auto_reply" class="wb-flag">未托管</span>
             </div>
@@ -154,7 +155,8 @@ async function delMessage(id) {
             <div class="title">{{ active.name }}</div>
             <div class="sub">
               {{ isGroup ? '群聊' : '通讯录好友' }} ·
-              {{ active.auto_reply ? '托管中' : (active.handoff_ts ? '已转人工' : '未托管') }}
+              {{ active.handoff_state === 'waiting' ? '待人工接手（AI 暂代）'
+                 : (active.auto_reply ? '托管中' : (active.handoff_ts ? '已转人工' : '未托管')) }}
             </div>
           </div>
           <div class="spacer"></div>

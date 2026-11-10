@@ -29,9 +29,13 @@ export const api = {
   tasks: () => json('/api/tasks'),
   friends: () => json('/api/friends'),
 
-  // ---- 切页才拉（不进 2s 轮询，避免冲掉正在编辑的表单）----
+  // ---- 切页才拉（不进 2s 轮询，避免冲掉正在编辑的表单 / 反复算候选）----
   handoffConfig: () => json('/api/handoff/config'),
   campaigns: () => json('/api/campaigns'),
+  outreach: () => json('/api/outreach'),
+
+  // ---- 主动激活（后台常驻触达）----
+  outreachToggle: (enabled) => post('/api/outreach/toggle', { enabled }),
 
   // ---- 消息页 ----
   open: (conv) => post('/api/open', { conv }),

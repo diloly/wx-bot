@@ -61,6 +61,7 @@ from monitor_store import (
     friend_counts, get_friend_tasks, friend_sent_today, get_setting, set_setting,
     count_outreach_since, delete_message, get_avatar,
     list_contacts, get_display_name, list_handoff_log, last_handoff_map,
+    last_handoff_state_map,
     add_campaign, list_campaigns, cancel_campaign, send_campaign_now,
     delete_campaign,
 )
@@ -169,12 +170,16 @@ def api_conversations():
     ensure_switch_conversations()
     convs = list_conversations()
     handoffs = last_handoff_map()
+    handoff_states = last_handoff_state_map()
     for c in convs:                    # 看板「+ 选择托管」按标签筛选用
         c["tags"] = _conv_tags(c, contacts)
         # 关掉托管（含人工接管）的会话仍要显示在左侧，只是开关为关。
-        # switched=托管过，handoff_ts>0=最近转过人工，前端据此打状态标签。
+        # switched=托管过，handoff_ts>0=最近转过人工。
+        # handoff_state 区分「待人工接手」（托管其实还开着）与「已交出」，
+        # 否则 waiting 期间会被误标成「已转人工」但开关却是开的。
         c["switched"] = 1 if c.get("switched") else 0
         c["handoff_ts"] = handoffs.get(c.get("conv_id"), 0)
+        c["handoff_state"] = handoff_states.get(c.get("conv_id"), "")
         # 头像：/api/avatar/<conv_id>?v=<ts>，ts 当缓存键；没有头像给空串，
         # 前端回退成「名字首字」色块（不留破图）
         c["avatar_url"] = (
@@ -497,12 +502,18 @@ def _ou_cfg():
 def api_outreach():
     ou = _ou_cfg()
     setting = get_setting("outreach_enabled")
-    enabled = (setting == "1") if setting not in (None, "") else bool(ou.get("enabled", False))
+    # 库里没设过 → 回退 config 的默认值；设过就以库为准，重启服务也不会变。
+    persisted = setting not in (None, "")
+    config_enabled = bool(ou.get("enabled", False))
+    enabled = (setting == "1") if persisted else config_enabled
     import datetime
     d = datetime.datetime.now()
     day_start = datetime.datetime(d.year, d.month, d.day).timestamp()
     return jsonify({
         "enabled": enabled,
+        "persisted": persisted,
+        "source": "看板设置" if persisted else "配置默认值",
+        "config_enabled": config_enabled,
         "daily_limit": int(ou.get("daily_limit", 0) or 0),   # 0=不限
         "daily_unlimited": int(ou.get("daily_limit", 0) or 0) <= 0,
         "per_run_limit": int(ou.get("per_run_limit", 10)),
@@ -513,8 +524,11 @@ def api_outreach():
         "min_gap_days": int(ou.get("min_gap_days", 7)),
         "cycle_days": int(ou.get("cycle_days", 0) or 0),
         "max_per_contact": int(ou.get("max_per_contact", 3)),
+        "interval_min_seconds": int(ou.get("interval_min_seconds", 600) or 0),
+        "interval_max_seconds": int(ou.get("interval_max_seconds", 1800) or 0),
+        "boot_grace_seconds": int(ou.get("boot_grace_seconds", 600) or 0),
         "include_new_contacts": bool(ou.get("include_new_contacts", False)),
-        # 只看不改：与常驻触达同一套规则算出来的候选（排查用，前端暂未展示）
+        # 只看不改：与常驻触达同一套规则算出来的候选（排查用）
         "candidates": oc.pick_targets(ou, limit=5),
     })
 
@@ -525,8 +539,11 @@ def api_outreach_toggle():
     if "enabled" not in body:
         return jsonify({"ok": False, "error": "缺少 enabled"}), 400
     on = bool(body.get("enabled"))
+    # 落 app_setting 而不是 config.json：主进程每轮巡检都读库，关掉最多 5 分钟
+    # 就停手；而且重启服务后依然保持关闭，不会自己又打开。
     set_setting("outreach_enabled", "1" if on else "0")
-    return jsonify({"ok": True, "enabled": on})
+    return jsonify({"ok": True, "enabled": on, "persisted": True,
+                    "source": "看板设置"})
 
 
 # ---------------------------------------------------------------------------

@@ -8,9 +8,15 @@
 这类信号，机器人继续自动聊容易把线索聊丢。这时应该：
 
     客户意向消息 → 给配置好的**群聊 + 私聊（真人）**各发一条内部通知
-                 → 关掉该客户会话的自动回复（真人在微信里接上）
+                 → **先不关托管**：等待期机器人继续接住客户，别把人晾着
+                 → 真人在该客户会话里真的回了一句话，才正式关掉 AI 托管
+                 → 超时仍没人接手，则解除待接管、恢复常规自动回复并留记录
                  → 本次不生成 AI 回复，避免抢真人的话
                  → 落一条 handoff_log，同一会话冷却期内不重复通知
+
+为什么要「等真人回复才交出」：以前通知还没投出去就先 set_switch(False)，
+collect() 里开关一关就把客户后续消息全部丢掉，中间那段空窗没人应答；
+通知一个都没送出去时更糟——本次放行照常回，下一条照样全丢。
 
 为什么要单独一个模块
 --------------------
@@ -37,9 +43,15 @@ DEFAULTS = {
     "watch_days": 7,               # 激活后多少天内的回复还在观察窗口
     "cooldown_hours": 24,          # 同一会话多久内不重复通知
     "detector": "ai",              # ai=模型二分类 / keywords=纯规则（零成本）
-    "pause_auto_reply": True,      # 通知后关掉该会话自动回复
-    "skip_ai_reply": True,         # 本次不生成 AI 回复，留给真人
+    "pause_auto_reply": True,      # 真人接手后正式关掉该会话 AI 托管
+    "skip_ai_reply": True,         # 触发接管的这一条不生成 AI 回复，留给真人
+    "handoff_timeout_hours": 2,    # 待接管多久没人接手就恢复 AI 并留记录
 }
+
+# 接管记录状态
+S_WAITING = "waiting"   # 已通知，等真人接手，托管仍开着
+S_TAKEN = "taken"       # 真人已回复，已正式关托管
+S_EXPIRED = "expired"   # 超时没人接手，已恢复常规 AI
 
 # 关键词兜底：AI 调不通、或用户关掉 AI 判定时用。宁可漏判，也别把「不需要」
 # 误报成意向，让真人白跑一趟。
@@ -86,6 +98,11 @@ def load(cfg=None):
     out["targets"] = resolve_targets(out.get("targets"))
     out["watch_days"] = int(out.get("watch_days", 7))
     out["cooldown_hours"] = float(out.get("cooldown_hours", 24))
+    try:
+        out["handoff_timeout_hours"] = max(
+            0.0, float(out.get("handoff_timeout_hours") or 2))
+    except (TypeError, ValueError):
+        out["handoff_timeout_hours"] = 2.0
     out["enabled"] = bool(out.get("enabled", True))
     out["pause_auto_reply"] = bool(out.get("pause_auto_reply", True))
     out["skip_ai_reply"] = bool(out.get("skip_ai_reply", True))
@@ -95,7 +112,8 @@ def load(cfg=None):
 def save(conf):
     """看板保存：只存可编辑字段，其余走 config.json 默认。"""
     allowed = ("enabled", "targets", "watch_scope", "watch_days",
-               "cooldown_hours", "detector", "pause_auto_reply", "skip_ai_reply")
+               "cooldown_hours", "detector", "pause_auto_reply", "skip_ai_reply",
+               "handoff_timeout_hours")
     data = {k: conf.get(k) for k in allowed if k in conf}
     data["targets"] = resolve_targets(data.get("targets"))
     monitor_store.set_setting(SETTING_KEY, json.dumps(data, ensure_ascii=False))
@@ -199,11 +217,14 @@ def _by_keywords(text):
 
 # ==================== 通知 ====================
 
-def notice(customer, quote, reason, paused):
+def notice(customer, quote, reason, paused, timeout_hours=0):
+    """内部通知正文。paused 现在表示「真人接手后是否会正式交出会话」。"""
     now = datetime.datetime.now().strftime("%m-%d %H:%M")
     q = (quote or "").strip().replace("\n", " ")[:100]
-    tail = ("已暂停该会话的自动回复，请真人直接接上。"
-            if paused else "该会话自动回复仍在运行，请留意别和机器人抢话。")
+    tail = ("机器人会先接着陪聊，真人在这个会话回复后，AI 托管会自动关闭并交出。"
+            if paused else "AI 托管保持开启，请留意别和机器人抢话。")
+    if timeout_hours and timeout_hours > 0:
+        tail += " 若 %g 小时内无人接手，将恢复常规自动回复。" % timeout_hours
     return ("【客户有意向 · 请人工接管】\n"
             "客户：%s\n"
             "原话：%s\n"
@@ -214,9 +235,40 @@ def notice(customer, quote, reason, paused):
             % (customer, q or "（无文字内容）", reason or "明确意向", now, tail, customer))
 
 
-def log(conv_id, customer, quote, reason, targets, paused):
+def log(conv_id, customer, quote, reason, targets, paused,
+        state=S_WAITING, deadline=0):
+    """落一条 state='waiting' 的接管记录，返回 id（失败返回 0）。"""
     try:
-        monitor_store.add_handoff_log(conv_id, customer, quote, reason,
-                                     targets, paused)
+        return monitor_store.add_handoff_log(
+            conv_id, customer, quote, reason, targets, paused,
+            state=state, deadline=deadline)
     except Exception as e:          # noqa: BLE001
         print("[handoff] 接管记录写库失败（不影响通知）: %s" % e)
+        return 0
+
+
+def pending():
+    """还没收口的接管记录（已通知、托管仍开着）。"""
+    try:
+        return monitor_store.list_pending_handoffs()
+    except Exception as e:          # noqa: BLE001
+        print("[handoff] 读待接管列表失败: %s" % e)
+        return []
+
+
+def human_replied(conv_id, since_ts):
+    """真人是否在这个客户会话里回过话（机器人发的带 sent_by 标记，不算）。"""
+    try:
+        return monitor_store.human_replied_since(conv_id, since_ts)
+    except Exception as e:          # noqa: BLE001
+        print("[handoff] 人工回复检测失败（按未回复处理）: %s" % e)
+        return False
+
+
+def finish(log_id, state):
+    """把 waiting 收口成 taken / expired。带状态条件，重复调用不会覆盖终态。"""
+    try:
+        return monitor_store.resolve_handoff(log_id, state)
+    except Exception as e:          # noqa: BLE001
+        print("[handoff] 接管状态收口失败: %s" % e)
+        return 0

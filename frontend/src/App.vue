@@ -7,6 +7,7 @@ import ChatView from './views/ChatView.vue'
 import MomentView from './views/MomentView.vue'
 import FriendsView from './views/FriendsView.vue'
 import TasksView from './views/TasksView.vue'
+import OutreachView from './views/OutreachView.vue'
 import HandoffView from './views/HandoffView.vue'
 import CampaignView from './views/CampaignView.vue'
 import KnowledgeView from './views/KnowledgeView.vue'
@@ -16,6 +17,7 @@ const NAV = [
   { id: 'moment', label: '朋友圈' },
   { id: 'friends', label: '加好友' },
   { id: 'tasks', label: '维护任务' },
+  { id: 'outreach', label: '主动激活' },
   { id: 'handoff', label: '人工接管' },
   { id: 'campaign', label: '活动触达' },
   { id: 'knowledge', label: '知识库' },
@@ -39,6 +41,10 @@ const store = reactive({
   moments: { moments: [], interactions: [], unread_inter: 0, dry_run: true, max_actions: 0, switches: {} },
   tasks: { counts: {}, tasks: [] },
   friends: { enabled: false, daily_limit: 0, sent_today: 0, counts: {}, tasks: [] },
+  outreach: {
+    enabled: false, persisted: false, source: '', config_enabled: false,
+    sent_today: 0, daily_limit: 0, daily_unlimited: true, candidates: [],
+  },
   handoff: { ok: false, config: {}, contacts: [], recent: [] },
   campaigns: { ok: false, campaigns: [], contacts: [] },
   knowledge: { items: [], config: {}, modes: {}, capabilities: {}, stats: {} },
@@ -81,7 +87,8 @@ async function poll() {
   await Promise.allSettled(jobs)
 }
 
-// 接管页 / 活动页 / 知识库页不进轮询：表单正在编辑时被覆盖会丢输入。
+// 接管页 / 活动页 / 知识库页 / 主动激活页不进轮询：表单正在编辑时被覆盖会丢输入，
+// 而且 /api/outreach 每次都会算一遍候选（查库），没必要 2 秒跑一次。
 async function loadPage(id) {
   try {
     if (id === 'chat') {
@@ -90,6 +97,7 @@ async function loadPage(id) {
     }
     else if (id === 'handoff') Object.assign(store.handoff, await api.handoffConfig())
     else if (id === 'campaign') Object.assign(store.campaigns, await api.campaigns())
+    else if (id === 'outreach') Object.assign(store.outreach, await api.outreach())
     else if (id === 'knowledge') Object.assign(store.knowledge, await api.knowledgeList())
   } catch (e) {
     console.warn('[page]', id, e)
@@ -147,6 +155,7 @@ onUnmounted(() => clearInterval(timer))
       <MomentView v-show="active === 'moment'" />
       <FriendsView v-show="active === 'friends'" />
       <TasksView v-show="active === 'tasks'" />
+      <OutreachView v-show="active === 'outreach'" />
       <HandoffView v-show="active === 'handoff'" />
       <CampaignView v-show="active === 'campaign'" />
       <KnowledgeView v-show="active === 'knowledge'" />

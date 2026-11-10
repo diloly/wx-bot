@@ -16,6 +16,14 @@ const DEFAULTS = {
   cooldown_hours: 24,
   pause_auto_reply: true,
   skip_ai_reply: true,
+  handoff_timeout_hours: 2,
+}
+
+const STATE_LABEL = {
+  waiting: '待人工接手', taken: '真人已接手', expired: '超时·AI 已恢复', done: '已完成',
+}
+const STATE_TYPE = {
+  waiting: 'warning', taken: 'success', expired: 'info', done: 'info',
 }
 
 const form = reactive({ ...DEFAULTS })
@@ -49,12 +57,19 @@ async function save() {
     <div class="wb-page-head">
       <div>
         <h2>人工接管</h2>
-        <div class="sub">客户表现出意向时通知真人，并暂停该会话的自动回复</div>
+        <div class="sub">客户表现出意向时先通知真人；真人真正回复后才交出会话</div>
       </div>
       <div style="display: flex; align-items: center; gap: 10px">
         <span class="wb-hint">启用</span>
         <el-switch v-model="form.enabled" />
       </div>
+    </div>
+
+    <div class="ho-flow">
+      <b>交出会话的时机</b>：检测到意向 → 通知真人（<b>托管保持开启</b>，等待期客户再发消息由 AI 正常接住）
+      → 真人在该客户会话里回了一句话 → 才正式关闭 AI 托管。
+      若 {{ form.handoff_timeout_hours }} 小时内无人接手，自动解除待接管、恢复常规自动回复并留一条记录。
+      通知一条都没投出去时不进入待接管，也不动托管开关。
     </div>
 
     <div class="wb-grid2">
@@ -75,7 +90,8 @@ async function save() {
             </el-select>
           </el-form-item>
           <el-form-item label="同会话冷却(小时)"><el-input-number v-model="form.cooldown_hours" :min="1" :max="720" /></el-form-item>
-          <el-form-item label="暂停自动回复"><el-switch v-model="form.pause_auto_reply" /></el-form-item>
+          <el-form-item label="等待接手(小时)"><el-input-number v-model="form.handoff_timeout_hours" :min="0" :max="72" /></el-form-item>
+          <el-form-item label="接手后关托管"><el-switch v-model="form.pause_auto_reply" /></el-form-item>
           <el-form-item label="跳过本次 AI 回复"><el-switch v-model="form.skip_ai_reply" /></el-form-item>
         </el-form>
       </div>
@@ -95,17 +111,31 @@ async function save() {
     <div class="wb-card">
       <h3>接管记录 {{ recent.length }}</h3>
       <div v-for="r in recent" :key="r.id" style="padding: 9px 0; border-bottom: 1px solid var(--wb-border); font-size: 14px">
-        <div style="display: flex; gap: 10px; align-items: center">
+        <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap">
           <b>{{ r.customer || r.conv_id }}</b>
-          <el-tag v-if="r.paused" size="small" type="warning" effect="plain">已暂停回复</el-tag>
+          <el-tag size="small" effect="plain" :type="STATE_TYPE[r.state || 'done']">
+            {{ STATE_LABEL[r.state || 'done'] }}
+          </el-tag>
+          <el-tag v-if="r.state === 'taken' && r.paused" size="small" type="warning" effect="plain">AI 托管已关</el-tag>
           <span style="margin-left: auto; color: var(--wb-muted)">{{ fmtTime(r.ts) }}</span>
         </div>
         <div style="color: var(--wb-muted); margin-top: 4px">「{{ r.quote || '' }}」</div>
         <div style="color: var(--wb-muted); margin-top: 2px">
           {{ r.reason || '' }} · 通知 {{ parseJson(r.targets, []).length }} 个对象
+          <template v-if="r.resolved_ts"> · 收口 {{ fmtTime(r.resolved_ts) }}</template>
         </div>
       </div>
       <div v-if="!recent.length" class="wb-empty">还没有接管记录</div>
     </div>
   </div>
 </template>
+
+<style scoped>
+.ho-flow {
+  font-size: 14px; line-height: 1.8; color: var(--wb-text);
+  background: var(--wb-surface-2); border: 1px solid var(--wb-border);
+  border-left: 3px solid var(--wb-accent);
+  border-radius: 8px; padding: 10px 14px; margin-bottom: 14px;
+}
+.ho-flow b { font-weight: 500; }
+</style>

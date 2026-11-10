@@ -373,18 +373,26 @@ friend 13 / group 11 / official 16 / stranger 11 / system 5。
 
 | 入口 | 何时用 | 怎么开 |
 |---|---|---|
-| **常驻触达**（auto_reply 后台线程） | 日常。每 5 分钟巡检一次，命中就发一条 | `config.outreach.enabled=true`（默认已开），**不用敲命令** |
-| **手动激活**（activate.py） | 临时想多发几条、或先看文案 | 敲命令 |
+| **常驻触达**（auto_reply 后台线程） | 日常。每 5 分钟巡检一次，命中就发一条 | **默认关闭**。看板「主动激活」tab 把开关打开；状态存数据库，重启服务不会自动打开 |
+| **手动激活**（activate.py） | 临时想多发几条、或先看文案 | 敲命令，不看上面那个开关 |
 
-### 常驻触达：全部走 config.json 的 `outreach` 块
+### 常驻触达：开关在看板，节奏参数在 config.json
+
+**总开关**不靠改文件：看板「主动激活」tab（旧版在「维护任务」页顶部）点一下，
+写入 `app_setting.outreach_enabled`，主进程每轮巡检都读库，最多 5 分钟生效。
+库里没设过才回退 `config.json` 的 `outreach.enabled`，而配置默认值是 **false**。
+所以新装好、刚重启、刚清过库，都不会自己开始给客户发消息。
+
+`config.json` 的 `outreach` 块负责节奏与范围（改完要重启 auto_reply 才生效）：
 
 ```json
 "outreach": {
-  "enabled": true,                 // 总开关（看板也能开关，5 分钟内生效）
+  "enabled": false,                // 仅「还没在看板设过开关」时的默认值；默认关闭
   "daily_limit": 0,                 // 0=不设每日上限（靠下面的间隔节流）
   "per_run_limit": 10,              // activate.py 单次最多几条，防手滑
   "interval_min_seconds": 600,     // 两条之间最少隔 10 分钟
   "interval_max_seconds": 1800,    // 最多隔 30 分钟
+  "boot_grace_seconds": 600,       // 进程启动后 10 分钟内不主动发（防「重启就发一条」）
   "work_start_hour": 8,            // 只在 8:00-21:00 发（夜间绝不发）
   "work_end_hour": 21,
   "silent_days": 7,                // 多久没聊算「长久没聊」
@@ -398,7 +406,13 @@ friend 13 / group 11 / official 16 / stranger 11 / system 5。
 }
 ```
 
-**改完必须重启 auto_reply**（config 只在启动时读；`enabled` 例外，看板开关走库）。
+**为什么加了 `boot_grace_seconds`**：worker 一起来就巡检一轮，以前
+`_ou_next_at=0`，只要上次触达超过 `interval_min_seconds`，每重启一次服务就会
+紧接着补发一条主动消息。现在第一次允许触达的时刻被推到「启动 + 宽限期」，
+重启不再自带一条。看板开关关掉时，主进程下一轮就停手，不受这个宽限影响。
+
+**合规口径不变**：候选只认通讯录好友（`contacts.kind='friend'`），
+禁止无差别加陌生人或骚扰营销；没具体话题可承接的直接跳过，不发空泛问候。
 
 ### 手动激活：参数默认全取 config，不用手写
 
@@ -446,12 +460,19 @@ python activate.py --send --icebreak      # 临时把「没聊过」的一起破
 
 ```
 客户有意向 → 给选定的【群聊 + 私聊（真人）】各发一条内部通知
-           → 关掉该客户会话的自动回复（真人在微信里接上）
-           → 本次不生成 AI 回复，不抢真人的话
-           → 落 handoff_log，同一会话冷却期内不重复通知
+           → 记 handoff_log（state=waiting，托管**保持开启**）
+           → 等待期客户再发消息，AI 正常接住，不把人晾着
+           → 真人在该客户会话里回了一句话，才正式关掉 AI 托管（state=taken）
+           → 超时没人接手则解除待接管、AI 继续托管（state=expired，留记录）
+           → 触发接管的这一条按 skip_ai_reply 跳过，不抢真人的第一句
 ```
 
-**去哪配**：看板第 5 个 tab 「人工接管」。勾选通知对象（通讯录里的好友 + 群聊，
+**为什么要等真人回复才交出**：以前通知还没投出去就先 `set_switch(False)`，
+`collect()` 里开关一关，客户后续消息全部被丢掉；通知一个都没送出去时更糟
+（本次放行照常回，下一条全丢）。现在一条通知都没投出去就直接不进入待接管、
+也不碰托管开关。
+
+**去哪配**：看板「人工接管」tab。勾选通知对象（通讯录里的好友 + 群聊，
 可多选、可搜索、可按群聊/私聊过滤），调好参数点「保存配置」——配置写进
 `app_setting.handoff_config`，主进程每条消息都重读，**不用重启**。
 
@@ -465,8 +486,17 @@ python activate.py --send --icebreak      # 临时把「没聊过」的一起破
 | `watch_days` | 7 | 激活后多少天内的回复还在观察窗口 |
 | `detector` | ai | `ai`=独立轻量二分类 / `keywords`=纯规则零成本 |
 | `cooldown_hours` | 24 | 同一客户多久内只通知一次 |
-| `pause_auto_reply` | true | 通知后关掉该会话自动回复 |
-| `skip_ai_reply` | true | 本次不自动回客户，留给真人 |
+| `pause_auto_reply` | true | 真人接手后正式关掉该会话 AI 托管 |
+| `skip_ai_reply` | true | 触发接管的这一条不自动回客户，留给真人 |
+| `handoff_timeout_hours` | 2 | 待接手多久没人回就恢复常规 AI；0 = 一直等 |
+
+**「真人已回复」怎么判定**：`handoff-worker` 每 10 秒巡检 `state='waiting'` 的记录，
+查 `messages` 里该客户会话有没有 `role='me' AND (sent_by IS NULL OR sent_by='manual')`
+且时间晚于通知的新消息。机器人发的都带 `ai` / `handoff` / `campaign` 标记，
+看板手发是 `manual`，真人在 PC 微信或手机端手打的由收消息桥补录、保持 `NULL`。
+查库而不只看本轮新消息，主进程重启期间真人回的那条也不会漏。
+`handoff_log` 的 `state / deadline / resolved_ts` 三列对老库自动 ALTER 补齐，
+历史行保持 `done`，不会被当成待接手。
 
 **判定**：`ai` 走 `ai_client.classify()`——不套销售话术、不查知识库、`temperature=0`，
 只要一行 `YES|原因`；模型调不通自动降级关键词，绝不把异常抛给回复主流程。

@@ -656,6 +656,23 @@
           </div>
           <div class="chips" id="taskChips"></div>
         </div>
+        <!-- 主动激活总开关：状态存库，重启服务不会自动打开；主进程下一轮巡检生效 -->
+        <section class="pcard" style="margin-bottom:14px">
+          <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+            <div style="flex:1;min-width:260px">
+              <h3 style="margin:0 0 4px">主动激活（后台主动触达）</h3>
+              <p class="muted" style="margin:0">
+                工作时段内按节奏给长期沉默的客户主动发一条。关掉后不会主动发消息；
+                回复客户来消息、人工接管通知、活动触达不受影响。
+              </p>
+              <p class="muted" id="ouTip" style="margin:6px 0 0">读取状态中…</p>
+            </div>
+            <label class="switch-lg">
+              <input type="checkbox" id="ouSwitch" onchange="toggleOutreachSwitch(this.checked)">
+              <span id="ouSwitchLabel">已暂停</span>
+            </label>
+          </div>
+        </section>
         <section class="pcard"><div class="tbl" id="taskList"></div></section>
       </div>
 
@@ -839,8 +856,11 @@ async function loadConversations() {
     const div = document.createElement('div');
     div.className = 'conv' + (c.conv_id === activeConv ? ' active' : '');
     const badge = (c.unread > 0) ? `<span class="badge">${c.unread}</span>` : '';
-    const flag = c.auto_reply ? ''
-      : `<span style="font-size:11px;color:#e6a23c;margin-left:5px">${c.handoff_ts ? '已转人工' : '已关托管'}</span>`;
+    // waiting 期间托管其实还开着，别标成「已转人工」，否则开关为开、标签却说已交出。
+    const flag = c.handoff_state === 'waiting'
+      ? '<span style="font-size:11px;color:#e6a23c;margin-left:5px">待人工接手</span>'
+      : (c.auto_reply ? ''
+        : `<span style="font-size:11px;color:#e6a23c;margin-left:5px">${c.handoff_ts ? '已转人工' : '已关托管'}</span>`);
     div.innerHTML = `
       ${avatarHtml(c.avatar_url, c.name)}
       <div class="meta">
@@ -1364,6 +1384,7 @@ function navTo(view) {
     loadFriends();
   } else if (view === 'tasks') {
     loadTasks();
+    loadOutreach();
   } else if (view === 'handoff') {
     loadHoConfig();
   } else if (view === 'campaign') {
@@ -1782,6 +1803,44 @@ async function toggleFriendSwitch(on) {
     setAfMsg(on ? '已开启（20 秒内开始执行）' : '已关闭（当前这条发完就停）', true);
     loadFriends();
   } catch (e) { setAfMsg('切换失败: ' + e, false); }
+}
+
+// 主动激活总开关（与新版「主动激活」tab 用同一组接口）。
+// 只在切到维护任务页时拉一次：/api/outreach 会算一遍候选（查库），别塞进 2s 轮询。
+async function loadOutreach() {
+  const tip = document.getElementById('ouTip');
+  try {
+    const d = await (await fetch('/api/outreach')).json();
+    const sw = document.getElementById('ouSwitch');
+    const lb = document.getElementById('ouSwitchLabel');
+    if (!sw || !lb || !tip) return;
+    sw.checked = !!d.enabled;
+    lb.textContent = d.enabled ? '运行中' : '已暂停';
+    tip.textContent = d.persisted
+      ? '开关已存入数据库，重启服务不会自动打开或关闭；切换后主进程下一轮巡检（最多 5 分钟）生效。'
+        + ' 今日已发 ' + (d.sent_today || 0) + ' 条；服务启动后 '
+        + Math.round((d.boot_grace_seconds || 0) / 60) + ' 分钟内不主动发消息。'
+      : '当前用的是配置默认值（config.json 的 outreach.enabled='
+        + (d.config_enabled ? 'true' : 'false')
+        + '）；点一次开关就会固定到数据库。';
+  } catch (e) {
+    if (tip) tip.textContent = '状态读取失败：' + e;
+  }
+}
+
+async function toggleOutreachSwitch(on) {
+  try {
+    const res = await fetch('/api/outreach/toggle', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: on })
+    });
+    const d = await res.json();
+    if (!d.ok) throw new Error(d.error || '接口返回失败');
+    await loadOutreach();
+  } catch (e) {
+    alert('切换失败：' + e);
+    await loadOutreach();     // 失败时把开关拨回真实状态
+  }
 }
 
 async function importFriendFile() {
