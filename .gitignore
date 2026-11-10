@@ -30,3 +30,8 @@ scraper/output/
 # ===== 编译产物 / 注入工具二进制 =====
 wechat_hook/*.dll
 wechat_hook/*.exe
+
+# ===== 前端工程：只提交 dist 构建产物，不提交依赖 =====
+# static/dist/ 需要入库：看板是本机 python dashboard.py 一把梭启动的，
+# 运行时不装 node 也必须有页面可开。改前端源码后跑 npm run build 覆盖 dist。
+frontend/node_modules/

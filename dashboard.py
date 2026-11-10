@@ -9,6 +9,11 @@
     python dashboard.py
 然后浏览器打开 http://localhost:5000
 
+前端是 Vue 3 + Element Plus，源码在 frontend/，构建产物在 static/dist/（已入库，
+所以不装 node 也能直接开）。改前端样式/组件后需要重新构建：
+    cd frontend && npm install && npm run build
+旧版单文件看板保留在 /legacy，前端出问题时可一键回退。
+
 API：
     GET  /api/conversations       会话列表（每项带 auto_reply 开关状态 + 全局 auto_reply_enabled/allow_groups）
     GET  /api/messages?conv=<id>  某会话消息
@@ -59,11 +64,29 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 app = Flask(__name__, template_folder=os.path.join(BASE, "templates"))
 MEDIA_DIR = os.path.join(BASE, "wechat_media")
 os.makedirs(MEDIA_DIR, exist_ok=True)
+# Vue 3 + Element Plus 前端的构建产物（frontend/ 下 npm run build 生成）。
+# 产物随仓库提交，所以本机「python dashboard.py」一把梭就能用，不装 node 也行。
+DIST_DIR = os.path.join(BASE, "static", "dist")
 
 
 @app.route("/")
 def index():
+    """新版 Vue 看板；构建产物不在时自动回退到旧版单文件页面。"""
+    if os.path.isfile(os.path.join(DIST_DIR, "index.html")):
+        return send_from_directory(DIST_DIR, "index.html")
     return render_template("index.html")
+
+
+@app.route("/legacy")
+def legacy_index():
+    """旧版单文件看板（templates/index.html），前端出问题时的一键回退入口。"""
+    return render_template("index.html")
+
+
+@app.route("/assets/<path:filename>")
+def frontend_assets(filename):
+    """Vite 构建产物：app.js / app.css / 字体与图标资源。"""
+    return send_from_directory(os.path.join(DIST_DIR, "assets"), filename)
 
 
 @app.route("/media/<path:rel>")

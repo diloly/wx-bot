@@ -506,6 +506,35 @@ python activate.py --send --icebreak      # 临时把「没聊过」的一起破
 
 ---
 
+## 2.16 前端工程：Vue 3 + Element Plus（2026-11-10）
+
+看板从「单文件 HTML + 手写 CSS + 原生 JS」换成前后端源码分离：
+
+| 位置 | 作用 |
+|---|---|
+| `frontend/` | Vue 3 + Element Plus 源码（Vite，`<script setup>`） |
+| `frontend/src/api.js` | 所有 `/api/*` 调用集中封装 |
+| `frontend/src/App.vue` | 导航、亮暗主题、2 秒轮询中枢 |
+| `frontend/src/views/` | 6 个页面：Chat / Moment / Friends / Tasks / Handoff / Campaign |
+| `static/dist/` | 构建产物（app.js / app.css / index.html），**已入库** |
+| `templates/index.html` | 旧版单文件看板，保留作回退 |
+
+- **运行时不依赖 node / CDN**：`python dashboard.py` 直接托管 `static/dist/`；
+  产物文件名固定不带 hash，每次 build 覆盖同名文件。
+- **改前端**：`cd frontend && npm install && npm run build`，不用重启 Flask
+  （静态文件实时读盘，浏览器强刷一次即可）。开发模式 `npm run dev` 会把
+  `/api`、`/media` 代理到 5000 端口，支持热更新。
+- **回退**：访问 `/legacy` 就是旧看板；`static/dist/index.html` 不存在时
+  根路由也会自动回退到旧页面。
+- **亮暗主题**：右上角开关，偏好存 localStorage；Element Plus dark css-vars
+  加自定义 `--wb-*` 设计变量。
+- 原生版那些 `pickerSig` / `convSig` / `momentSigs` 手搓 diff 全部删除：
+  轮询只改响应式数据，Vue 自己更新 DOM，不会打断输入和滚动位置。
+- 接口**一个都没改**：`/api/messages` 仍返回裸数组、`card` 仍是 JSON 字符串、
+  `/api/friends/import` 仍同时支持 multipart 与 JSON。
+
+---
+
 ## 3. 调试 / 验证
 
 ```

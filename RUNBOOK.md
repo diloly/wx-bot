@@ -95,6 +95,30 @@ python <项目根目录>\wechat_ui.py --schedule --no-dry
 - 已知限制：语音（SILK）浏览器不能播，仍显示占位；`.wxgf` 动画表情容器
   不能直接渲染（下载成功也显示占位）；卡片封面/app 图标走 CDN 下载，失败则用类型图标/首字母占位。
 
+### 前端构建与一键回退（2026-11-10）
+
+看板前端已从「单文件 HTML + 手写 CSS + 原生 JS」迁到 Vue 3 + Element Plus + Vite，
+但**部署形态没变**：Flask 仍是唯一进程，既提供 `/api/*` 又托管 `static/dist/`。
+
+- 源码 `frontend/`，产物 `static/dist/`（app.js ≈1.2MB、app.css ≈370KB，
+  全量引入 Element Plus 的体积，本机 localhost 无感）。产物**入库**，
+  所以 clone 下来 `python dashboard.py` 直接有页面，不需要 node。
+- 改前端：`cd frontend && npm install && npm run build`。产物文件名固定不带 hash，
+  每次覆盖同名文件，git diff 不会堆旧版本；Flask 不用重启，浏览器强刷即可。
+  开发期 `npm run dev` 起 5173，Vite 把 `/api` 与 `/media` 代理到 5000。
+- **回退有两条**：访问 `/legacy` 直接回旧看板；把 `static/dist/index.html`
+  移走，根路由也会自动 `render_template("index.html")`。旧页面一直保留在
+  `templates/index.html`，所有 `/api/*` 一个都没改，回退后功能完整。
+- 主题：右上角开关切亮/暗，偏好写 localStorage；Element Plus 的
+  `dark/css-vars.css` 负责组件，自定义 `--wb-*` 变量负责自有布局。
+- 迁移收益：原生版为了「2 秒轮询别把用户正在输入的表单重绘掉」手搓的
+  `pickerSig` / `convSig` / `momentSigs` 签名 diff 全部删除，Vue 响应式更新
+  天然不重建 DOM。这是上独立前端最实在的一条，其余（TS、HMR、组件单测、
+  静态托管扩容）对单机单用户看板只是顺带。
+- 验收记录：`npm run build` 通过；Flask test_client 下 `/`、`/legacy`、
+  `/assets/app.js`、`/assets/app.css` 与 7 个读接口全部 200；无头 Chrome
+  渲染后 DOM 含 `data-v-app`、6 个导航齐全、控制台零报错。
+
 ## 四、每会话自动回复开关（默认全关）
 
 **核心规则：只有开关打开的会话才会触发 AI 自动回复，默认全部关闭。**

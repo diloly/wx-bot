@@ -56,6 +56,9 @@
 - **只有通讯录好友算客户**：微信 `contact` 表里混着「只在群聊里出现、没加好友的
   陌生人」（`local_type=3`）。同步时标为 `stranger`，选择器、接管通知对象、活动
   对象和主动触达候选都只认 `friend`，不把群成员当已知客户（详见 `RUNBOOK.md`）。
+- **前后端源码分离、部署不分家**：看板前端是 Vue 3 + Element Plus + Vite，
+  构建产物由 Flask 直接托管，跑起来仍然只有 `python dashboard.py` 一个进程，
+  不装 node、不连 CDN 也能用。
 - **发出去才算发**：键盘动作跑完不等于消息真的发出，每次发送后回读数据库确认，
   确认失败落 `failed` 而不是记一条假成功。
 - **发送前判定"谁发的"**：只能靠发送者标识，不能靠编号（编号是分片内的行号，
@@ -71,7 +74,9 @@ handoff.py           人工接管（意向判定 / 通知目标 / 接管记录�
 progress_bar.py      终端单行进度条（TTY 原地重绘，日志只留一行汇总）
 wx_recv_bridge.py    收消息桥：解密本地库 → 增量入库 → 媒体落地
 wechat_ui.py         键盘驱动发送层（搜索/进会话/粘贴/发送/回读校验）
-dashboard.py         网页看板（Flask，2 秒轮询）
+dashboard.py         看板后端（Flask：/api/* + 托管前端构建产物 + /legacy 回退）
+frontend/            Vue 3 + Element Plus 前端源码（Vite 构建）
+static/dist/         前端构建产物（app.js / app.css，已入库，运行时不需要 node）
 monitor_store.py     统一消息库（SQLite）读写
 ui_gate.py           微信 UI 独占锁（跨进程）
 db_gate.py           微信解密库隔离门（一进程一份副本 + 进程内单例）
@@ -96,6 +101,8 @@ COMMANDS.md          命令与接口速查
   可以同时运行，各自使用独立的解密副本目录
 - 报 `[WinError 5] 拒绝访问` 时先确认所有 python 进程都用上了新版 `db_gate`；
   旧进程残留可作废后清理：`python -c "import db_gate; print(db_gate.cleanup_stale())"`
+- 只跑看板**不需要 node**（`static/dist/` 已入库）；改前端才需要
+  `cd frontend && npm install && npm run build`。旧版页面在 `/legacy`
 
 ## 六、明确的合规边界
 
