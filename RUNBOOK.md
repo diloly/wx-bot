@@ -572,6 +572,15 @@ site-packages、不宜改（重装即丢），所以 `moment_ops._human_cursor()
   **升级后必须重启 dashboard.py** —— 旧进程每 10 分钟同步一次会用旧判据把
   kind 覆盖回 friend。
 
+- **`POST /api/send` 不能把 wxid 当搜索词**（2026-11-10 看板手发事故）：
+  `conv` 是看板会话 id（wxid / 群号），原来直接喂给 `send_to_contact(name, ...)`
+  当 Ctrl+F 搜索词，而微信只认界面上显示的**备注/昵称**，结果搜不到人、正文
+  卡在搜索框；顺带没传 `conv_id`，还会把 `conversations.name` 覆盖成一串 wxid。
+  现在由 `monitor_store.get_display_name()` 解析（contacts.remark > name > nick
+  > conversations.name > 解密库 `get_nickname`），查不到就明确报 400，**绝不退回
+  用 wxid 硬搜**；写库始终用真实 wxid（`conv_id=conv`）。首条激活 2026-10-19
+  栽在同一个坑，三级回退见 `auto_reply._nick_of()`。
+
 ## 十一、风控与合规（始终有效）
 
 - 键盘驱动仍违反微信 ToS，有封号风险；频率闸 + 冷仅是软防护，不是豁免。

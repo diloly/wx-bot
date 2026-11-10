@@ -50,7 +50,7 @@ from monitor_store import (
     get_moment_switches, set_moment_switch, get_tasks, task_counts,
     friend_counts, get_friend_tasks, friend_sent_today, get_setting, set_setting,
     count_outreach_since, delete_message, get_avatar,
-    list_contacts, list_handoff_log,
+    list_contacts, get_display_name, list_handoff_log,
     add_campaign, list_campaigns, cancel_campaign, send_campaign_now,
     delete_campaign,
 )
@@ -261,18 +261,43 @@ def api_switch():
 
 @app.route("/api/send", methods=["POST"])
 def api_send():
-    """通过键盘驱动把消息发给指定联系人（需微信在前台）。"""
+    """通过键盘驱动把消息发给指定联系人（需微信在前台）。
+
+    **conv 是看板的会话 id（wxid / 群号），只用来写库归并会话，绝不能拿去搜人**：
+    微信 Ctrl+F 认的是界面上显示的备注/昵称，喂 wxid 搜不到，正文会卡在搜索框
+    或落进当前打开的会话。搜索词由 get_display_name() 解析（备注优先）。
+    """
     data = request.get_json(force=True, silent=True) or {}
     conv, text = data.get("conv", "").strip(), data.get("text", "").strip()
     if not conv or not text:
         return jsonify({"ok": False, "error": "conv 和 text 不能为空"}), 400
+
+    name = get_display_name(conv)
+    if not name:
+        # 通讯录还没同步过时，最后试一次解密库（get_nickname 通常也是备注优先）
+        try:
+            import db_gate
+            nm = (db_gate.get_db().get_nickname(conv) or "").strip()
+            if nm and nm != conv:
+                name = nm
+        except Exception as e:  # noqa: BLE001
+            log.warning("解密库反查昵称失败: %s", e)
+    if not name:
+        return jsonify({
+            "ok": False,
+            "error": "找不到该联系人的备注/昵称，无法在微信里定位会话（Ctrl+F 不认 wxid）。"
+                     "请等通讯录同步完成，或先在微信里给对方设个备注。",
+            "conv": conv,
+        }), 400
     try:
         import wechat_ui
         cfg = wechat_ui.load_config()
         cfg["dry_run"] = False
         bot = wechat_ui.WeChatPCBot(cfg)
-        bot.send_to_contact(conv, text)   # 内部按键盘流程真发，并写回 store
-        return jsonify({"ok": True, "conv": conv})
+        # 搜索用显示名，写库用真实 wxid；不传 conv_id 会把 conversations.name
+        # 覆盖成一串 wxid（看板上客户名字就废了）。
+        bot.send_to_contact(name, text, conv_id=conv)
+        return jsonify({"ok": True, "conv": conv, "name": name})
     except Exception as e:  # noqa: BLE001
         log.exception("发送失败")
         return jsonify({"ok": False, "error": str(e)}), 500

@@ -640,6 +640,40 @@ def list_contacts(kind=None):
         conn.close()
 
 
+def get_display_name(conv_id):
+    """wxid → 微信 Ctrl+F 用的搜索词（**备注优先，其次昵称**）。
+
+    Ctrl+F 只认微信界面上显示的名字，喂 wxid / 群号搜不到（2026-10-19 首条
+    激活事故、2026-11-10 看板手动发送都栽在这里）。contacts.name 由
+    sync_contacts 按 `remark or nick` 落库；会话表里的显示名作二级兜底。
+
+    找不到就返回空串 —— 调用方**绝不能**退回去用 wxid 硬搜，那只会把正文
+    留在错误的会话里或卡在搜索框，宁可报清楚的错误让人去补备注。
+    """
+    conn = _conn()
+    try:
+        r = conn.execute(
+            "SELECT name, nick, remark FROM contacts WHERE conv_id=?", (conv_id,)
+        ).fetchone()
+        if r:
+            d = dict(r)
+            cand = ((d.get("remark") or "").strip()
+                    or (d.get("name") or "").strip()
+                    or (d.get("nick") or "").strip())
+            if cand and cand != conv_id:
+                return cand
+        r = conn.execute(
+            "SELECT name FROM conversations WHERE conv_id=?", (conv_id,)
+        ).fetchone()
+        if r:
+            cand = (r["name"] or "").strip()
+            if cand and cand != conv_id:
+                return cand
+        return ""
+    finally:
+        conn.close()
+
+
 def get_messages(conv_id, limit=300, since_ts=None):
     """取某会话的消息，按时间正序返回。
     - limit 限制的是**最近**多少条（子查询先 DESC 截取再 ASC 排回来）——
