@@ -15,8 +15,87 @@ const creating = ref(false)
 const contacts = computed(() => store.campaigns.contacts || [])
 const campaigns = computed(() => store.campaigns.campaigns || [])
 
+// 详情弹窗：数据本来就在 /api/campaigns 里，不需要新接口。
+// 用 id 从 store 里实时取，操作（立即发送/取消）刷新后弹窗内容会跟着更新。
+const detailId = ref(null)
+const detailVisible = ref(false)
+const detail = computed(() => campaigns.value.find((c) => c.id === detailId.value) || null)
+
+const STATUS_NOTE = {
+  scheduled: '尚未到计划时间，等待主进程巡检触发。',
+  running: '正在逐个发送，结果陆续回写。',
+  sent: '全部对象发送成功。',
+  partial: '部分对象发送失败或未送达，请看下面的逐条结果。',
+  expired: '超过计划时间 + 宽限期仍未发送，已作废（防止隔夜群发）。',
+  canceled: '已人工取消，不会发送。',
+}
+
 function statusType(s) {
   return { sent: 'success', running: 'warning', scheduled: 'primary', partial: 'warning' }[s] || 'info'
+}
+
+// 列表摘要：结果表里可能少于对象数（还在发 / 没投出去），「未发送」要单独算。
+function cstat(c) {
+  const rs = c.result || []
+  const total = (c.targets || []).length
+  const ok = rs.filter((r) => r.ok).length
+  const fail = rs.filter((r) => !r.ok).length
+  return { total, ok, fail, none: Math.max(0, total - ok - fail) }
+}
+
+// 把「发送对象」和「逐条结果」按 conv_id 合并成一张表；结果里有但名单里
+// 没有的异常记录也列出来，绝不把失败藏掉。
+const detailRows = computed(() => {
+  const c = detail.value
+  if (!c) return []
+  const rs = c.result || []
+  const targets = c.targets || []
+  const byId = new Map(rs.map((r) => [r.conv_id || r.name, r]))
+  const rows = targets.map((t) => {
+    const r = byId.get(t.conv_id)
+    return {
+      key: t.conv_id || t.name,
+      name: t.name || t.conv_id,
+      kind: t.kind === 'group' ? '群聊' : '好友',
+      state: r ? (r.ok ? 'ok' : 'fail') : 'none',
+      reason: (r && r.reason) || '',
+      ts: (r && r.ts) || 0,
+    }
+  })
+  const known = new Set(targets.map((t) => t.conv_id))
+  for (const r of rs) {
+    const key = r.conv_id || r.name
+    if (!known.has(r.conv_id) && key) {
+      rows.push({ key, name: r.name || key, kind: '—',
+                  state: r.ok ? 'ok' : 'fail', reason: r.reason || '', ts: r.ts || 0 })
+    }
+  }
+  return rows
+})
+
+const detailStats = computed(() => {
+  const rows = detailRows.value
+  return {
+    total: rows.length,
+    ok: rows.filter((r) => r.state === 'ok').length,
+    fail: rows.filter((r) => r.state === 'fail').length,
+    none: rows.filter((r) => r.state === 'none').length,
+  }
+})
+
+function openDetail(c) {
+  detailId.value = c.id
+  detailVisible.value = true
+}
+
+async function copyContent() {
+  const text = (detail.value && detail.value.content) || ''
+  try {
+    await navigator.clipboard.writeText(text)
+    toast('正文已复制')
+  } catch (e) {
+    toast('浏览器不允许自动复制，请手动选中正文：' + e.message, 'warning')
+  }
 }
 
 async function create() {
@@ -48,6 +127,10 @@ async function action(c, act) {
     else if (act === 'cancel') await api.campaignCancel(c.id)
     else await api.campaignDelete(c.id)
     toast('操作完成')
+    if (act === 'del' && detailId.value === c.id) {
+      detailVisible.value = false
+      detailId.value = null
+    }
     await refreshPage('campaign')
   } catch (e) { toast('操作失败：' + e.message, 'error') }
 }
@@ -94,23 +177,113 @@ async function action(c, act) {
 
     <div class="wb-card">
       <h3>活动列表 {{ campaigns.length }}</h3>
-      <div v-for="c in campaigns" :key="c.id" style="padding: 12px 0; border-bottom: 1px solid var(--wb-border)">
+      <div v-for="c in campaigns" :key="c.id" class="cd-row">
         <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
           <b style="font-size: 15px">{{ c.name || '未命名活动' }}</b>
           <el-tag size="small" effect="plain" :type="statusType(c.status)">{{ CAMPAIGN_STATUS[c.status] || c.status }}</el-tag>
-          <span style="font-size: 13px; color: var(--wb-muted)">计划 {{ fmtTime(c.send_at) }} · {{ (c.targets || []).length }} 个对象</span>
+          <span class="wb-hint">计划 {{ fmtTime(c.send_at) }} · {{ cstat(c).total }} 个对象</span>
           <div style="margin-left: auto; display: flex; gap: 6px">
+            <el-button size="small" type="primary" plain @click="openDetail(c)">详情</el-button>
             <el-button v-if="c.status === 'scheduled'" size="small" @click="action(c, 'now')">立即发送</el-button>
             <el-button v-if="c.status === 'scheduled'" size="small" @click="action(c, 'cancel')">取消</el-button>
             <el-button v-if="c.status !== 'scheduled'" size="small" type="danger" plain @click="action(c, 'del')">删除</el-button>
           </div>
         </div>
-        <div style="font-size: 14px; color: var(--wb-muted); margin-top: 6px; white-space: pre-wrap">{{ c.content }}</div>
-        <div v-if="(c.result || []).length" style="font-size: 13px; color: var(--wb-muted); margin-top: 6px">
-          结果：成功 {{ c.result.filter((r) => r.ok).length }} / 失败 {{ c.result.filter((r) => !r.ok).length }}
+        <div class="cd-content-clamp">{{ c.content }}</div>
+        <div class="cd-summary">
+          成功 <b class="ok">{{ cstat(c).ok }}</b> ·
+          失败 <b :class="cstat(c).fail ? 'bad' : ''">{{ cstat(c).fail }}</b> ·
+          未发送 {{ cstat(c).none }}
+          <span class="wb-hint">（点「详情」看正文全文与逐条结果）</span>
         </div>
       </div>
       <div v-if="!campaigns.length" class="wb-empty">还没有活动</div>
     </div>
+
+    <el-dialog v-model="detailVisible" width="780px" top="6vh"
+               :title="'活动详情 · ' + ((detail && detail.name) || '未命名活动')">
+      <template v-if="detail">
+        <div class="cd-meta">
+          <div><span>当前状态</span>
+            <el-tag size="small" effect="plain" :type="statusType(detail.status)">
+              {{ CAMPAIGN_STATUS[detail.status] || detail.status }}
+            </el-tag>
+          </div>
+          <div><span>活动编号</span><b>#{{ detail.id }}</b></div>
+          <div><span>计划发送</span><b>{{ fmtTime(detail.send_at) }}</b></div>
+          <div><span>创建时间</span><b>{{ fmtTime(detail.created) || '—' }}</b></div>
+          <div><span>最后更新</span><b>{{ fmtTime(detail.updated) || '—' }}</b></div>
+          <div><span>过点宽限</span><b>{{ detail.grace_minutes || 0 }} 分钟</b></div>
+          <div class="cd-note">{{ STATUS_NOTE[detail.status] || '' }}</div>
+        </div>
+
+        <div class="cd-section">
+          发送正文
+          <el-button link type="primary" size="small" @click="copyContent">复制正文</el-button>
+        </div>
+        <pre class="cd-content">{{ detail.content }}</pre>
+
+        <div class="cd-section">
+          发送对象与逐条结果
+          <span class="wb-hint">
+            共 {{ detailStats.total }} · 成功 {{ detailStats.ok }} /
+            失败 {{ detailStats.fail }} / 未发送 {{ detailStats.none }}
+          </span>
+        </div>
+        <el-table :data="detailRows" size="small" max-height="300" empty-text="没有发送对象">
+          <el-table-column prop="name" label="对象" min-width="140" show-overflow-tooltip />
+          <el-table-column prop="kind" label="类型" width="72" />
+          <el-table-column label="结果" width="90">
+            <template #default="{ row }">
+              <el-tag size="small" effect="plain"
+                      :type="row.state === 'ok' ? 'success' : (row.state === 'fail' ? 'danger' : 'info')">
+                {{ row.state === 'ok' ? '成功' : (row.state === 'fail' ? '失败' : '未发送') }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column prop="reason" label="说明" min-width="170" show-overflow-tooltip />
+          <el-table-column label="时间" width="110">
+            <template #default="{ row }">{{ row.ts ? fmtTime(row.ts) : '—' }}</template>
+          </el-table-column>
+        </el-table>
+      </template>
+      <template #footer>
+        <el-button @click="detailVisible = false">关闭</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
+
+<style scoped>
+.cd-row { padding: 12px 0; border-bottom: 1px solid var(--wb-border); }
+.cd-content-clamp {
+  font-size: 14px; color: var(--wb-muted); margin-top: 6px; white-space: pre-wrap;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.cd-summary { font-size: 13px; color: var(--wb-muted); margin-top: 6px; }
+.cd-summary b { font-weight: 500; }
+.cd-summary b.ok { color: var(--wb-accent); }
+.cd-summary b.bad { color: #f56c6c; }
+.cd-meta {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px 16px;
+  background: var(--wb-surface-2); border-radius: 10px; padding: 12px 14px; margin-bottom: 14px;
+}
+.cd-meta > div { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+.cd-meta span { color: var(--wb-muted); min-width: 68px; }
+.cd-meta b { font-weight: 500; }
+.cd-meta .cd-note {
+  grid-column: 1 / -1; color: var(--wb-muted); font-size: 13px; line-height: 1.6;
+  border-top: 1px solid var(--wb-border); padding-top: 8px;
+}
+.cd-section {
+  display: flex; align-items: center; gap: 12px;
+  font-size: 15px; font-weight: 500; margin: 14px 0 8px;
+}
+.cd-content {
+  font-family: inherit; font-size: 14px; line-height: 1.75; color: var(--wb-text);
+  white-space: pre-wrap; word-break: break-word; margin: 0;
+  background: var(--wb-surface-2); border: 1px solid var(--wb-border);
+  border-radius: 8px; padding: 12px 14px; max-height: 200px; overflow-y: auto;
+}
+@media (max-width: 720px) { .cd-meta { grid-template-columns: 1fr; } }
+</style>
