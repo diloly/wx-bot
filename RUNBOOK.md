@@ -547,6 +547,21 @@ site-packages、不宜改（重装即丢），所以 `moment_ops._human_cursor()
 
 ## 十、走过的弯路（结论备忘，防回头）
 
+- **多行通知「复制到聊天里却没发送」**（2026-11-10）：人工接管通知是**多行**文案，
+  `message.strip()[:16]` 恰好切在换行符上；Windows 剪贴板 Ctrl+A/Ctrl+C 回读
+  会把 LF 变成 CRLF，于是「正文有没有粘进输入框」的子串比对失败 → 抛
+  `SendAborted` → **不按发送键**，文案一直留在输入框里。单行 AI 回复从不触发。
+  修复：`wechat_ui.normalize_probe()` 抹掉全部空白，粘贴回读校验、
+  `auto_reply._confirm_sent`、`activate.make_confirm` 三处统一用它。
+  安全闸不能顺手拆掉：正文确实没粘进去时仍必须中止、不按键。
+  `sent_log` 去重早就有 `_norm_sent` 抹空白，不受影响。
+- **接管/取消托管后客户从左侧消失**（2026-11-10）：两半原因 ——
+  ① 前端 `ChatView` / 旧版页写死 `filter(c => c.auto_reply)`，只列开着托管的；
+  ② `ensure_switch_conversations()` 原来只补 `conv_switch.enabled=1` 的项，
+  关闭后就不再兜底会话行。现在后端 `list_conversations()` 返回 `switched`
+  （托管过，无论开关）/ `handoff_ts`，占位补齐覆盖关掉的开关并排除 `__` 伪会话
+  （朋友圈模拟开关）；前端默认列「托管过的会话」，关掉的仍显示且开关为关，
+  带「已转人工 / 已关托管」标签，另有「显示全部会话」可放开。
 - **「接管/活动页头像没同步」其实是显示链路断了**（2026-11-10）：`avatars` 表里
   23/23 个候选都有记录、本地也有图片文件，但 `_handoff_candidates()` 只返回
   `conv_id/name/kind`，`ContactPicker` 的 `WbAvatar` 也只传 `name` 不传 `url` →

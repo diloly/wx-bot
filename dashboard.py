@@ -60,7 +60,7 @@ from monitor_store import (
     get_moment_switches, set_moment_switch, get_tasks, task_counts,
     friend_counts, get_friend_tasks, friend_sent_today, get_setting, set_setting,
     count_outreach_since, delete_message, get_avatar,
-    list_contacts, get_display_name, list_handoff_log,
+    list_contacts, get_display_name, list_handoff_log, last_handoff_map,
     add_campaign, list_campaigns, cancel_campaign, send_campaign_now,
     delete_campaign,
 )
@@ -168,8 +168,13 @@ def api_conversations():
     # 就永远看不到他。这里幂等补占位，也顺带修好历史上遗留的「幽灵开关」。
     ensure_switch_conversations()
     convs = list_conversations()
+    handoffs = last_handoff_map()
     for c in convs:                    # 看板「+ 选择托管」按标签筛选用
         c["tags"] = _conv_tags(c, contacts)
+        # 关掉托管（含人工接管）的会话仍要显示在左侧，只是开关为关。
+        # switched=托管过，handoff_ts>0=最近转过人工，前端据此打状态标签。
+        c["switched"] = 1 if c.get("switched") else 0
+        c["handoff_ts"] = handoffs.get(c.get("conv_id"), 0)
         # 头像：/api/avatar/<conv_id>?v=<ts>，ts 当缓存键；没有头像给空串，
         # 前端回退成「名字首字」色块（不留破图）
         c["avatar_url"] = (

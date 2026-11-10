@@ -37,6 +37,7 @@
 import argparse
 import json
 import logging
+import re
 import time
 import ctypes
 from ctypes import wintypes
@@ -65,6 +66,20 @@ CONFIG_PATH = "config.json"
 
 # 发消息用的「发送键」。默认 Enter；若微信设成 Ctrl+Enter 发送，改成 ("ctrl", "enter")
 _SEND_KEY = "enter"
+
+
+def normalize_probe(text):
+    """比对输入框内容 / 微信库消息时用的归一化：抹掉所有空白字符。
+
+    为什么必须有这一步（2026-11-10「人工接管通知只粘贴、不发送」事故）：
+    接管通知、活动文案是**多行**的，`message.strip()[:16]` 往往正好切在
+    换行符上；而 Windows 剪贴板 Ctrl+A / Ctrl+C 回读会把换行变成 CRLF，
+    微信本地库里存的又可能是另一种换行。直接拿原始 probe 做子串比对，
+    会把「正文明明已经粘进输入框」误判成「没粘进去」→ 抛 SendAborted →
+    **不按发送键**，文案就一直留在聊天输入框里。
+    两边都抹掉空白（空格/制表/LF/CR）后再比对，就与换行形态无关了。
+    """
+    return re.sub(r"\s+", "", text or "")
 
 
 class SendNotVerified(Exception):
@@ -633,8 +648,10 @@ class WeChatPCBot:
                     # 粘完再回读一次：确认正文**真的进了输入框**才按发送键。
                     # 用前 16 个字做比对（不是「非空就算过」）——焦点万一跑到聊天
                     # 记录区，Ctrl+A/Ctrl+C 复制到的是聊天内容，非空判断会放过它。
-                    probe = message.strip()[:16]
-                    if probe and probe not in (self._read_edit_text() or ""):
+                    # 两边都走 normalize_probe：多行通知的 LF / 剪贴板回读的 CRLF
+                    # 必须算同一份文本，否则会误判成「没粘进去」而不敢按发送键。
+                    probe = normalize_probe(message)[:16]
+                    if probe and probe not in normalize_probe(self._read_edit_text()):
                         raise SendAborted(
                             "正文没粘进「%s」的输入框，未按发送键（本次没有发出任何内容）"
                             % name)

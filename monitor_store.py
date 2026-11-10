@@ -474,8 +474,9 @@ def set_switch(conv_id, enabled):
     """设置某会话的 AI 自动回复开关（看板每个会话一个，默认关）。
     upsert：不存在则插入，存在则更新。
 
-    开启时顺带补一条会话占位（见 ensure_switch_conversations），否则一个
-    「加了好友但从没聊过天」的客户开了托管后，左侧列表里不会出现。
+    开关开或关都顺带补一条会话占位（见 ensure_switch_conversations）：
+    开启时是为了让「加了好友但从没聊过天」的客户出现在左侧；
+    **关闭时同样要补**——人工接管会关掉托管，这个客户不能因此从看板消失。
     """
     conn = init()
     conn.execute(
@@ -485,21 +486,26 @@ def set_switch(conv_id, enabled):
     )
     conn.commit()
     conn.close()
-    if enabled:
-        ensure_switch_conversations()
+    ensure_switch_conversations()
 
 
 def ensure_switch_conversations():
-    """让「已开 AI 托管但从没聊过天」的会话在列表里也有一条占位记录（幂等）。
+    """让「托管过」的会话在列表里一定有一条记录（幂等）。
 
     conversations 表原本只由 add_message() 在收到消息时创建，所以从「+」
     选择器里给一个从没聊过的客户开托管后，开关写进了 conv_switch，列表却
-    查不到这条会话 —— 看板上表现为「托管开了，左侧却没出现」。这里按
-    conv_switch 里 enabled=1 的项补占位，顺带把历史上遗留的「幽灵开关」
-    一起补上；已有会话一律不覆盖（INSERT OR IGNORE）。
+    查不到这条会话 —— 看板上表现为「托管开了，左侧却没出现」。
 
-    占位行 last_msg 为空、last_ts 取开关打开时刻：刚开启的会话排在列表最前，
-    用户立刻能看到反馈；前端对空 last_msg 的会话不显示时间。主动触达候选靠
+    这里按 **conv_switch 的全部记录**（enabled 0 或 1）补占位：
+    2026-11-10 用户反馈「客户表达意向 → 通知人工并关掉托管后，会话从左侧
+    消失」，前端过滤是一半原因，另一半是这里原来只补 enabled=1 的项，
+    关闭后就再也不兜底了。托管过的客户无论开关状态都该留在列表里。
+
+    `__` 开头的是伪会话开关（例如朋友圈模拟开关 `__moment_dry__`），
+    不是真聊天，必须排除，否则会被补成一条莫名其妙的「会话」。
+
+    占位行 last_msg 为空、last_ts 取开关变更时刻：刚接管的会话会排到列表
+    最前，用户立刻能看到；前端对空 last_msg 的会话不显示时间。主动触达候选靠
     messages 表判断「有没有聊过」，不会被占位行骗到。
     """
     conn = init()
@@ -508,7 +514,8 @@ def ensure_switch_conversations():
         missing = conn.execute(
             "SELECT 1 FROM conv_switch s "
             "LEFT JOIN conversations c ON c.conv_id = s.conv_id "
-            "WHERE s.enabled = 1 AND c.conv_id IS NULL LIMIT 1"
+            "WHERE c.conv_id IS NULL AND s.conv_id IS NOT NULL "
+            "  AND substr(s.conv_id, 1, 2) <> '__' LIMIT 1"
         ).fetchone()
         if not missing:
             return 0
@@ -522,7 +529,7 @@ def ensure_switch_conversations():
             "          THEN s.updated_at ELSE ? END, 0 "
             "FROM conv_switch s "
             "LEFT JOIN contacts ct ON ct.conv_id = s.conv_id "
-            "WHERE s.enabled = 1",
+            "WHERE s.conv_id IS NOT NULL AND substr(s.conv_id, 1, 2) <> '__'",
             (int(time.time()),),
         )
         conn.commit()
@@ -558,12 +565,15 @@ def set_conversation_name(conv_id, name):
 def list_conversations():
     """会话列表（按最近活跃倒序）。
 
-    每项带：auto_reply=该会话AI自动回复开关（0/1）；avatar=头像文件的相对路径
+    每项带：auto_reply=该会话AI自动回复开关（0/1）；switched=是否在 conv_switch
+    里有记录（**托管过**，哪怕现在关了）；avatar=头像文件的相对路径
     （wechat_media/ 下，没有则为 None）、avatar_ts=头像落库时间（前端做缓存键）。
+    switched 用来区分「托管过但已转人工」和「从没托管过的普通聊天」。
     """
     conn = _conn()
     rows = [dict(r) for r in conn.execute(
         "SELECT c.*, COALESCE(s.enabled, 0) AS auto_reply, "
+        "(s.conv_id IS NOT NULL) AS switched, "
         "a.file AS avatar, a.ts AS avatar_ts "
         "FROM conversations c "
         "LEFT JOIN conv_switch s ON s.conv_id = c.conv_id "
@@ -1554,6 +1564,21 @@ def last_handoff_ts(conv_id):
         row = conn.execute("SELECT MAX(ts) AS t FROM handoff_log WHERE conv_id=?",
                            (conv_id,)).fetchone()
         return int(row["t"] or 0)
+    finally:
+        conn.close()
+
+
+def last_handoff_map():
+    """{conv_id: 最近一次人工接管时间戳}，给看板会话列表打「已转人工」标记。
+
+    一次批量查完，别在 /api/conversations 里对每个会话各查一次。
+    """
+    conn = init()
+    try:
+        rows = conn.execute(
+            "SELECT conv_id, MAX(ts) AS t FROM handoff_log GROUP BY conv_id"
+        ).fetchall()
+        return {r["conv_id"]: int(r["t"] or 0) for r in rows if r["conv_id"]}
     finally:
         conn.close()
 

@@ -67,7 +67,7 @@ import ui_gate
 import db_gate
 from ai_client import generate as ai_generate
 from wechat_ui import (WeChatPCBot, load_config, SendNotVerified,
-                       SendUnconfirmed, SendAborted)
+                       SendUnconfirmed, SendAborted, normalize_probe)
 from wx_recv_bridge import poll_new, is_self, me_username
 
 GROUP_SUFFIX = "@chatroom"
@@ -966,7 +966,9 @@ class AutoReplier:
                   （发送不可逆，重复比漏记更糟）。交人工核对。
         """
         conv_id = conv_id or ""
-        probe = (text or "").strip()[:24]
+        # 与粘贴回读校验同一套归一化：接管通知是多行文案，微信库里的换行形态
+        # 未必和原文一致；不归一化会把「确实发出去了」误判成 SendNotVerified。
+        probe = normalize_probe(text)[:24]
         if not conv_id or not probe:
             return True
         db = self._send_db()
@@ -988,7 +990,7 @@ class AutoReplier:
             for m in msgs:
                 if not is_self(m, me):
                     continue
-                if probe in str(m.get("content") or ""):
+                if probe in normalize_probe(str(m.get("content") or "")):
                     return True
             if time.time() >= deadline:
                 # 附上该会话最新几条：能区分「按键没进输入框」（会话尾部没变化）

@@ -10,6 +10,7 @@ const toast = inject('toast')
 const refreshPage = inject('refreshPage')
 
 const kw = ref('')
+const showAll = ref(false)   // 默认只列「托管过」的会话；勾选后才显示全部聊天
 const pickerOpen = ref(false)
 const pickerKw = ref('')
 const pickerKind = ref('all')
@@ -17,8 +18,14 @@ const draft = ref('')
 const sending = ref(false)
 const scroller = ref(null)
 
-const convs = computed(() => (store.conversations || []).filter((c) =>
-  c.auto_reply && (!kw.value || (String(c.name) + String(c.conv_id)).includes(kw.value))))
+// 不再按 auto_reply 过滤：人工接管会关掉托管，那个客户不能因此从看板消失。
+// 默认只列「托管过」的会话（switched=1，含已关闭），避免几百个普通聊天糊满左栏；
+// 勾「显示全部会话」才放开。保持后端 last_ts DESC 顺序 —— 刚表达意向的客户
+// 排最前，一眼看得到。
+const convs = computed(() => (store.conversations || []).filter((c) => {
+  if (!showAll.value && !c.auto_reply && !c.switched) return false
+  return !kw.value || (String(c.name) + String(c.conv_id)).includes(kw.value)
+}))
 
 const active = computed(() => (store.conversations || []).find((c) => c.conv_id === store.activeConv) || null)
 const meAvatar = computed(() => avatarUrl(store.me))
@@ -53,7 +60,10 @@ async function toggleConv(c, v) {
   try {
     await api.switch(c.conv_id, v)
     c.auto_reply = v ? 1 : 0
-    if (!v && store.activeConv === c.conv_id) { store.activeConv = ''; store.messages = [] }
+    if (v) c.switched = 1           // 数据库已写入 conv_switch，本地也同步，
+                                    // 否则下次关掉时会被默认筛选误藏
+    // 关掉托管 ≠ 删掉会话：转人工后仍留在左侧，且不清空当前打开的聊天，
+    // 真人要能接着看上下文。
   } catch (e) { toast('切换失败：' + e.message, 'error') }
 }
 
@@ -61,6 +71,7 @@ async function enableConv(c) {
   try {
     await api.switch(c.conv_id, true)
     c.auto_reply = 1
+    c.switched = 1
     pickerOpen.value = false
     toast('已开启托管：' + c.name)
     refreshPage('chat')
@@ -105,11 +116,20 @@ async function delMessage(id) {
         <el-input v-model="kw" size="small" clearable placeholder="搜索名字 / 备注 / wxid" />
         <el-button size="small" type="primary" circle title="开启新的托管会话" @click="openPicker">+</el-button>
       </div>
+      <div class="wb-side-filter">
+        <el-checkbox v-model="showAll" size="small">显示全部会话</el-checkbox>
+        <span class="wb-hint">{{ convs.length }} 个会话</span>
+      </div>
       <div class="wb-list">
         <div v-for="c in convs" :key="c.conv_id" class="wb-row" :class="{ on: store.activeConv === c.conv_id }" @click="openConv(c.conv_id)">
           <WbAvatar :url="c.avatar_url" :name="c.name" />
           <div class="meta">
-            <div class="nm">{{ c.name }}</div>
+            <div class="nm">
+              <span class="nm-text">{{ c.name }}</span>
+              <span v-if="!c.auto_reply && c.handoff_ts" class="wb-flag handoff">已转人工</span>
+              <span v-else-if="!c.auto_reply && c.switched" class="wb-flag">已关托管</span>
+              <span v-else-if="!c.auto_reply" class="wb-flag">未托管</span>
+            </div>
             <div class="sub">{{ c.last_msg || '暂无消息' }}</div>
           </div>
           <div style="display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex-shrink: 0">
@@ -121,7 +141,7 @@ async function delMessage(id) {
           </div>
         </div>
         <div v-if="!convs.length" class="wb-empty">
-          还没有开启托管的会话<br />点右上角 <b>+</b> 从通讯录里挑
+          没有匹配的会话<br />点右上角 <b>+</b> 从通讯录里挑要托管的对象
         </div>
       </div>
     </aside>
@@ -132,7 +152,10 @@ async function delMessage(id) {
           <WbAvatar :url="active.avatar_url" :name="active.name" size="sm" />
           <div>
             <div class="title">{{ active.name }}</div>
-            <div class="sub">{{ isGroup ? '群聊' : '通讯录好友' }} · 托管中</div>
+            <div class="sub">
+              {{ isGroup ? '群聊' : '通讯录好友' }} ·
+              {{ active.auto_reply ? '托管中' : (active.handoff_ts ? '已转人工' : '未托管') }}
+            </div>
           </div>
           <div class="spacer"></div>
           <span class="wb-hint">AI 自动回复</span>
@@ -189,3 +212,23 @@ async function delMessage(id) {
     </el-dialog>
   </div>
 </template>
+
+<style scoped>
+.wb-side-filter {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; padding: 0 12px 8px;
+}
+.wb-row .nm { display: flex; align-items: center; gap: 5px; }
+.nm-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wb-flag {
+  flex-shrink: 0; padding: 0 5px; border-radius: 4px;
+  font-size: 11px; line-height: 16px; font-weight: 400; white-space: nowrap;
+  color: var(--wb-muted); background: var(--wb-surface-2);
+  border: 1px solid var(--wb-border);
+}
+.wb-flag.handoff {
+  color: #e6a23c; background: rgba(230, 162, 60, .12);
+  border-color: rgba(230, 162, 60, .38);
+}
+html.dark .wb-flag.handoff { color: #f0b862; }
+</style>

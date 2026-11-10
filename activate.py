@@ -66,7 +66,9 @@ def make_confirm(db, timeout=6.0):
     me = me_username(db)
 
     def confirm(conv_id, text):
-        probe = (text or "").strip()[:24]
+        # 与 wechat_ui 的粘贴回读校验同一套归一化：多行文案的换行形态在
+        # 微信库里未必和原文一致，严格子串比对会把已发出的误判成没发出。
+        probe = wechat_ui.normalize_probe(text)[:24]
         if not probe:
             return True
         deadline = time.time() + timeout
@@ -76,7 +78,7 @@ def make_confirm(db, timeout=6.0):
             except Exception:           # noqa: BLE001
                 return None
             for m in msgs:
-                if is_self(m, me) and probe in str(m.get("content") or ""):
+                if is_self(m, me) and probe in wechat_ui.normalize_probe(str(m.get("content") or "")):
                     return True
             if time.time() >= deadline:
                 return False

@@ -824,24 +824,27 @@ async function loadConversations() {
     banner.textContent = '自动回复总开关未开（config.json → auto_reply.enabled=false）：下面的会话开关暂不生效';
   }
   const kw = document.getElementById('search').value.trim();
-  // 消息页**只列已开启托管**的会话；没开的用右上角「+」挑，避免几百个会话糊满左栏
-  let shown = allConvs.filter(c => !!c.auto_reply);
+  // 只列「托管过」的会话（含已关闭的）：人工接管关掉托管后也要留在左侧，
+  // 但不用把从没托管过的普通聊天全糊上来（原设计意图）。
+  let shown = allConvs.filter(c => !!c.switched || !!c.auto_reply);
   if (kw) shown = shown.filter(c => ((c.name || '') + (c.conv_id || '')).includes(kw));
   const box = document.getElementById('convList');
   box.innerHTML = '';
   if (!shown.length) {
     box.innerHTML = kw
-      ? '<div class="conv-empty">没有匹配的已托管会话</div>'
-      : '<div class="conv-empty">还没有开启托管的会话<br>点右上角 <b>+</b> 选择要托管的聊天</div>';
+      ? '<div class="conv-empty">没有匹配的会话</div>'
+      : '<div class="conv-empty">还没有托管过的会话<br>点右上角 <b>+</b> 选择要托管的聊天</div>';
   }
   for (const c of shown) {
     const div = document.createElement('div');
     div.className = 'conv' + (c.conv_id === activeConv ? ' active' : '');
     const badge = (c.unread > 0) ? `<span class="badge">${c.unread}</span>` : '';
+    const flag = c.auto_reply ? ''
+      : `<span style="font-size:11px;color:#e6a23c;margin-left:5px">${c.handoff_ts ? '已转人工' : '已关托管'}</span>`;
     div.innerHTML = `
       ${avatarHtml(c.avatar_url, c.name)}
       <div class="meta">
-        <div class="name">${esc(c.name||c.conv_id)} ${badge}</div>
+        <div class="name">${esc(c.name||c.conv_id)} ${badge}${flag}</div>
         <div class="preview">${esc(c.last_msg||'')}</div>
       </div>`;
     // 每会话AI自动回复开关：默认关，只有打开才会触发ai自动回复
@@ -873,8 +876,9 @@ async function toggleSwitch(convId, on, swEl) {
     });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     swEl.title = 'AI自动回复：' + (on ? '已开' : '关');
-    // 关掉托管后该会话就不该再留在「消息」列表里
-    if (!on) loadConversations();
+    // 重新拉一次列表：关掉托管不等于从左侧消失（转人工后会话仍要留着，
+    // 只是开关为关），同时让 switched / handoff_ts 状态跟上后端。
+    loadConversations();
   } catch (err) {
     const input = swEl.querySelector('input');
     if (input) input.checked = !on;   // 失败回滚视觉状态
