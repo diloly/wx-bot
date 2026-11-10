@@ -1,12 +1,13 @@
 # WechatBot 命令速查卡
 
 > 全部命令在 Windows 本机执行；键盘发送期间微信需已登录、保持前台、不锁屏。
-> 工作目录：`<项目根目录>`（下面都用绝对路径，任意目录可直接粘贴运行）。
+> 工作目录：`<项目根目录>`。第 1 节先 `cd` 进去再跑，其余章节沿用绝对路径简写。
 >
 > ⚠️ **解释器必须用 `python`**：依赖（requests / wechatauto-replica /
 > flask 等）都装在这个 conda 环境里。直接敲 `python` 会落到系统 Python，报
-> `ModuleNotFoundError: No module named 'requests'`。下文所有 `python` 均指该解释器，
-> PowerShell 里可先 `Set-Alias python python`。
+> `ModuleNotFoundError: No module named 'requests'`。第 1 节用 `$PY` 显式指向它；
+> 其余章节的 `python` 是同一解释器的简写，PowerShell 里可先执行
+> `Set-Alias python python`（每个新窗口一次）。
 >
 > **最简启动（只看看板，只读、不碰微信 UI）**：
 > ```
@@ -22,40 +23,59 @@
 
 ```
 pip install wechatauto-replica
-wechatauto 体检
-ollama serve                  :: 确认本地大模型在跑
-ollama list                   :: 确认列表里有 gemma（须与 ai_secrets.json 的 model 一致）
+wechatauto 体检                  # 数据库密钥 / 图片密钥通过即可
 ```
+AI 走 `ai_secrets.json` 的 OpenAI 兼容端点（当前 `provider=custom` /
+`model=your-model`），**不需要本地 Ollama**；只看看板时连 AI 都不需要。
 
 ---
 
-## 1. 日常运行（三个终端）
+## 1. 日常运行（最多三个终端）
 
-### 终端 A —— 看板（常开）
-```
-python <项目根目录>\dashboard.py
-```
-浏览器打开 http://localhost:5000
+**每个新开的 PowerShell 窗口，先粘这两行**（工作目录 + 解释器）：
 
-### 终端 B —— 收消息（二选一）
-
-B1 只收不发（监控模式）：
-```
-python <项目根目录>\wx_recv_bridge.py
+```powershell
+cd <项目根目录>
+$PY = "python"
 ```
 
-B2 收消息 + AI 自动回复（当前 `config.json` 的 `auto_reply.enabled=false`：只监控上屏、不回复任何人；单聊测满意后把它改 `true` 再跑）：
+### 终端 A —— 看板（常开，最小启动）
+
+```powershell
+& $PY dashboard.py
 ```
-python <项目根目录>\auto_reply.py
-python <项目根目录>\auto_reply.py --no-dry      :: 真发（会抢占键鼠焦点，慎用）
+浏览器打开 http://localhost:5000（新版 Vue 看板），`/legacy` 是旧版回退。
+看板只读、不抢微信焦点；**不用装 node、不用 npm run build**（`static/dist/` 已入库）。
+
+### 终端 B —— 收消息 + AI 自动回复（需要自动动作时才开）
+
+当前 `config.json`：`auto_reply.enabled=true`、`dry_run=true` → 收消息、生成 AI
+文案、写任务账本，但**不会真发**；真发必须显式加 `--no-dry`。
+
+```powershell
+& $PY auto_reply.py                 # 演练：AI 生成但不发送
+& $PY auto_reply.py --no-dry        # 真发：抢键鼠焦点，运行时别碰电脑
 ```
 
-### 终端 C —— 主动外发（按需）
+只收不发（纯监控上屏，不调 AI、不碰 UI）：
+
+```powershell
+& $PY wx_recv_bridge.py
 ```
-python <项目根目录>\wechat_ui.py --inspect                                       :: 确认微信窗口可被定位
-python <项目根目录>\wechat_ui.py --send --template followup --tag old --no-dry   :: 模板群发（按标签）
-python <项目根目录>\wechat_ui.py --send --ai --intent "周末问候" --tag vip --no-dry  :: AI 文案外发
-python <项目根目录>\wechat_ui.py --schedule --no-dry                             :: 定时任务常驻（config.tasks）
+
+> 终端 A 和终端 B **不要同时用旧版 dashboard**：两者都会初始化 WeChatDB，
+> 需都是带 `db_gate` 的新版（进程私有解密副本）。升级后先重启 dashboard。
+
+### 终端 C —— 主动外发 / 存量激活（按需，不必常开）
+
+```powershell
+& $PY wechat_ui.py --inspect                                        # 确认微信窗口可定位
+& $PY wechat_ui.py --send --template followup --tag old --no-dry     # 模板群发（按标签）
+& $PY wechat_ui.py --send --ai --intent "周末问候" --tag vip --no-dry # AI 文案外发
+& $PY wechat_ui.py --schedule --no-dry                              # 定时任务常驻
+& $PY activate.py                     # 只列候选（零 AI 成本，条数取 config.outreach）
+& $PY activate.py --preview           # 调 AI 出文案，不发送
+& $PY activate.py --send              # 真发：条数/间隔/时段全部读 config
 ```
 
 ---
@@ -63,11 +83,11 @@ python <项目根目录>\wechat_ui.py --schedule --no-dry                       
 ## 2. 媒体渲染（图片/表情/视频/文件/卡片）
 
 ```
-:: 历史消息补渲染（一次性，幂等可重跑；旧卡片记录升级也靠它）
+# 历史消息补渲染（一次性，幂等可重跑；旧卡片记录升级也靠它）
 python <项目根目录>\wx_recv_bridge.py --media-backfill --depth 50
 
-:: 原图模式：图片强制下载 _h.dat 真原件（清晰，但会驱动微信界面点开气泡/滚动列表）
-:: ⚠️ 运行时请勿操作电脑；不想滚界面就加 --no-scroll-original
+# 原图模式：图片强制下载 _h.dat 真原件（清晰，但会驱动微信界面点开气泡/滚动列表）
+# ⚠️ 运行时请勿操作电脑；不想滚界面就加 --no-scroll-original
 python <项目根目录>\wx_recv_bridge.py --media-backfill --depth 50 --original
 ```
 新收到的媒体消息由 bridge/auto_reply 自动下载渲染（普通档，不碰界面），无需手动。
@@ -77,11 +97,11 @@ python <项目根目录>\wx_recv_bridge.py --media-backfill --depth 50 --origina
 ## 2.5 聊天记录备份（export_history.py）
 
 ```
-:: 全量导出 JSON 到 backups/history_时间戳.json
+# 全量导出 JSON 到 backups/history_时间戳.json
 python <项目根目录>\export_history.py
 
-python <项目根目录>\export_history.py --user wxid_xxx        :: 只导指定会话（可重复 --user）
-python <项目根目录>\export_history.py --limit 500            :: 每会话最多 500 条
+python <项目根目录>\export_history.py --user wxid_xxx        # 只导指定会话（可重复 --user）
+python <项目根目录>\export_history.py --limit 500            # 每会话最多 500 条
 ```
 导出文件含客户聊天内容，属敏感数据：`backups/` 已在 .gitignore，不要外发/截图/传公网。
 
@@ -90,17 +110,17 @@ python <项目根目录>\export_history.py --limit 500            :: 每会话�
 ## 2.6 朋友圈（读自动 / 写按开关）
 
 ```
-:: 读——新圈 + 未读赞/评论通知，自动落库，看板「朋友圈」页展示（左栏列表，点开看详情）
-:: 自动：终端 B 跑着 auto_reply.py 就会每约 60s 拉一次，无需额外命令
-python <项目根目录>\moment_ops.py --poll      :: 手动立刻拉一轮
-python <项目根目录>\moment_ops.py --refresh   :: 手动 UI 刷新（切到朋友圈页并点工具栏「刷新」按钮逼客户端同步，刷完就停在朋友圈页）
-python <项目根目录>\moment_ops.py --list      :: 看库里的最近新圈 + 互动通知（拿 tid 用）
+# 读——新圈 + 未读赞/评论通知，自动落库，看板「朋友圈」页展示（左栏列表，点开看详情）
+# 自动：终端 B 跑着 auto_reply.py 就会每约 60s 拉一次，无需额外命令
+python <项目根目录>\moment_ops.py --poll      # 手动立刻拉一轮
+python <项目根目录>\moment_ops.py --refresh   # 手动 UI 刷新（切到朋友圈页并点工具栏「刷新」按钮逼客户端同步，刷完就停在朋友圈页）
+python <项目根目录>\moment_ops.py --list      # 看库里的最近新圈 + 互动通知（拿 tid 用）
 
-:: 写——点赞/评论（默认 dry 只验证「能定位到」，绝不误点；真执行必须 --no-dry）
-python <项目根目录>\moment_ops.py --like <tid> --no-dry           :: 真点赞
-python <项目根目录>\moment_ops.py --unlike <tid> --no-dry         :: 取消点赞
-python <项目根目录>\moment_ops.py --comment <tid> "评论内容" --no-dry  :: 真评论（不可逆）
-python <项目根目录>\moment_ops.py --ai-comment <tid>              :: 小光按销售人设生成评论文案（只生成不发送）
+# 写——点赞/评论（默认 dry 只验证「能定位到」，绝不误点；真执行必须 --no-dry）
+python <项目根目录>\moment_ops.py --like <tid> --no-dry           # 真点赞
+python <项目根目录>\moment_ops.py --unlike <tid> --no-dry         # 取消点赞
+python <项目根目录>\moment_ops.py --comment <tid> "评论内容" --no-dry  # 真评论（不可逆）
+python <项目根目录>\moment_ops.py --ai-comment <tid>              # 小光按销售人设生成评论文案（只生成不发送）
 ```
 写操作也可以在看板「朋友圈」页点按钮触发。
 
@@ -237,8 +257,8 @@ pending（已受理）→ generating（AI 生成中）→ generated（待发送�
 命令行只留两个用途：
 
 ```
-python friend_add.py --list               :: 终端看队列与统计
-python friend_add.py --one 13800138000    :: 手工加一个（调试，不受限速）
+python friend_add.py --list               # 终端看队列与统计
+python friend_add.py --one 13800138000    # 手工加一个（调试，不受限速）
 ```
 
 **CSV 列**：`keyword`（必填，手机号或微信号）、`name`、`note`、`source`。
@@ -551,11 +571,11 @@ python activate.py --send --icebreak      # 临时把「没聊过」的一起破
 ## 3. 调试 / 验证
 
 ```
-python <项目根目录>\wx_recv_bridge.py --once        :: 只轮询一轮后退出（快速看全量结果）
-python <项目根目录>\auto_reply.py --interval 5      :: 自定义轮询间隔（秒）
-python -u <项目根目录>\wx_recv_bridge.py            :: 无缓冲输出（排查"终端卡住"观感）
-python -c "import db_gate; d=db_gate.get_db(); print(d.workdir)"  :: 只读验证解密库能否初始化，打印本进程私有副本目录
-python -c "import db_gate; print(db_gate.cleanup_stale())"       :: 清理其他进程遗留 48h+ 的解密副本目录
+python <项目根目录>\wx_recv_bridge.py --once        # 只轮询一轮后退出（快速看全量结果）
+python <项目根目录>\auto_reply.py --interval 5      # 自定义轮询间隔（秒）
+python -u <项目根目录>\wx_recv_bridge.py            # 无缓冲输出（排查"终端卡住"观感）
+python -c "import db_gate; d=db_gate.get_db(); print(d.workdir)"  # 只读验证解密库能否初始化，打印本进程私有副本目录
+python -c "import db_gate; print(db_gate.cleanup_stale())"       # 清理其他进程遗留 48h+ 的解密副本目录
 ```
 
 ---

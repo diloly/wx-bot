@@ -1,7 +1,7 @@
 # 微信客户维护机器人 — 完整运行路径
 
 > 2026-10-13 整理。环境：Weixin 4.1.13.65（RadiumWMPF 架构）+ Python 3.13。
-> 路线：收 = 本地数据库解密（只读）；发 = 键盘驱动（非注入）；AI = Ollama 本地模型。
+> 路线：收 = 本地数据库解密（只读）；发 = 键盘驱动（非注入）；AI = OpenAI 兼容云端模型。
 
 ## 一、系统全景（数据流）
 
@@ -32,13 +32,14 @@
 1. `pip install wechatauto-replica`（已完成）
 2. `wechatauto 体检`（已完成：数据库密钥 20/20、图片密钥 OK；控件树缺失只影响 GUI 发送，不影响本路径）
 3. 编辑 `ai_secrets.json`（**AI 配置统一在这一个文件**，含 api_key，不要外发/截图；已加入 .gitignore）：
-   - `provider` / `model`：默认 `ollama` + `gemma`（须与 `ollama list` 输出一致）
+   - `provider` / `model`：当前为 `custom` + `your-model`（`base_url` 自带 `/v1`，代码不拼）
    - 接自定义/云端大模型时：`provider` 设 `custom`，`base_url` 写全端点（**自带 `/v1`，代码不拼**），`model` 写该服务实际支持的模型名
    - `system_prompt` / `temperature` / `max_tokens`：可选，不填用代码内置默认
    编辑 `config.json`：
    - `auto_reply` 块：白名单 `contacts`、合并窗口 `merge_window_seconds` / 频率闸 `max_replies_per_hour`
    - `contacts` 可加 `"wxid"` 字段做精确匹配（可选）
-4. 确认 Ollama 在跑：`ollama serve` + `ollama list` 里有 gemma
+4. 确认 `ai_secrets.json` 里的 OpenAI 兼容端点可达（**不需要本地 Ollama**）；
+   只看看板时连 AI 都不需要
 
 ## 三、日常运行（三个终端）
 
@@ -53,29 +54,37 @@
 > 前端构建产物 `static/dist/` 已入库，**不需要装 node、不需要 npm run build**；
 > 打开 http://localhost:5000 是 Vue 新版，`/legacy` 是旧版回退。
 
-**终端 A — 看板（常开）**
-```
-python <项目根目录>\dashboard.py
+**终端 A — 看板（常开，最小启动）**
+```powershell
+cd <项目根目录>
+$PY = "python"
+& $PY dashboard.py
 ```
 
 **终端 B — 收消息 + AI 自动回复（二选一）**
-```
-# B1 只收不发（监控模式）
-python <项目根目录>\wx_recv_bridge.py
+```powershell
+cd <项目根目录>
+$PY = "python"
 
-# B2 自动回复闭环。当前 config auto_reply.enabled=false：
-#     只收消息监控上屏，不回复任何人。单聊测满意、群控确认后，
-#     再把 config.json 的 auto_reply.enabled 改 true：
-python <项目根目录>\auto_reply.py                # dry-run 观察
-python <项目根目录>\auto_reply.py --no-dry       # 真发（抢焦点，慎用）
+& $PY wx_recv_bridge.py          # B1 只收不发（纯监控上屏，不调 AI、不碰 UI）
+& $PY auto_reply.py              # B2 演练：当前 dry_run=true，AI 生成但不发送
+& $PY auto_reply.py --no-dry     # B2 真发：抢键鼠焦点，运行时别碰电脑
 ```
 
-**终端 C — 主动外发（按需）**
-```
-python <项目根目录>\wechat_ui.py --inspect
-python <项目根目录>\wechat_ui.py --send --template followup --tag old --no-dry
-python <项目根目录>\wechat_ui.py --send --ai --intent "周末问候" --tag vip --no-dry
-python <项目根目录>\wechat_ui.py --schedule --no-dry
+> 当前 `config.json` 是 `auto_reply.enabled=true` + `dry_run=true`：
+> 会收消息、生成回复、写任务账本，**不会真发**。真发只能靠显式 `--no-dry`。
+> 终端 A / B 都必须是带 `db_gate` 的新版（WeChatDB 解密副本按进程隔离）。
+
+**终端 C — 主动外发 / 存量激活（按需）**
+```powershell
+cd <项目根目录>
+$PY = "python"
+
+& $PY wechat_ui.py --inspect
+& $PY wechat_ui.py --send --template followup --tag old --no-dry
+& $PY wechat_ui.py --send --ai --intent "周末问候" --tag vip --no-dry
+& $PY wechat_ui.py --schedule --no-dry
+& $PY activate.py                 # 只列候选；--preview 出文案；--send 才真发
 ```
 
 > **首次运行注意**：首轮要全量解密全部数据库 + 为每个新会话建基线（分钟级、一次性，之后每轮秒级）。
@@ -216,9 +225,9 @@ python <项目根目录>\wechat_ui.py --schedule --no-dry
 ## 六、聊天记录备份（export_history.py）
 
 ```
-python <项目根目录>\export_history.py                    :: 全量导出 backups/history_时间戳.json
-python <项目根目录>\export_history.py --user wxid_xxx    :: 只导指定会话
-python <项目根目录>\export_history.py --limit 500        :: 每会话上限
+python <项目根目录>\export_history.py                    # 全量导出 backups/history_时间戳.json
+python <项目根目录>\export_history.py --user wxid_xxx    # 只导指定会话
+python <项目根目录>\export_history.py --limit 500        # 每会话上限
 ```
 
 - wechatauto 的 `export_history` 封装；输出含**客户聊天内容**，属敏感数据：
@@ -475,11 +484,13 @@ site-packages、不宜改（重装即丢），所以 `moment_ops._human_cursor()
 ## 九、验收清单（按顺序过）
 
 1. `dashboard.py` 起来，浏览器开 http://localhost:5000
-2. 跑 `auto_reply.py`（当前 enabled=false），日志应显示「仅收消息监控上屏，不回复任何人」
+2. 跑 `auto_reply.py`（当前 `enabled=true` + `dry_run=true`），日志应显示已开启自动回复的会话数，
+   且生成文案但**不真发**；确认无误才用 `--no-dry`
 3. 用另一个号给微信发一条消息 → 10 秒内看板出现**对方气泡 + 正文**（`[store] +`）；群消息带「昵称: 」前缀
 4. 自己在 PC 微信**手动发**的消息同样上屏（右侧「我」气泡）；程序发的不会双渲染；图片/表情/语音等显示 `[图片 md5=...]` 等占位，不露 XML
    - 不双渲染靠 `send_to_contact` **在按发送键之前**预写 `sent_log`（`monitor_store.add_sent`）：收消息轮询读到这条回执时命中 `was_sent` 即跳过。发送后还要 nap(delay)≈5s 才写看板库，而轮询在另一线程并发跑——若等发送后再写 sent_log，轮询会在这 5s 空窗里把回执当新消息补录一条（2026-10-16 修复）
-5. 单聊确认无误后，把 `config.json` 的 `auto_reply.enabled` 改 `true`，重跑 → dry-run 日志出现「已开启自动回复的会话 N 个」；在看板把目标会话行右侧开关打开 → 该会话来消息时 dry-run 日志出现 `[auto] 生成回复 → ...`
+5. 在看板把目标会话行右侧开关打开（`auto_reply.enabled` 当前已是 `true`，无需改）→
+   该会话来消息时 dry-run 日志出现 `[auto] 生成回复 → ...`；一个开关都没开时日志会提示去看板开
 6. `--no-dry` 真发成功，看板出现「我」的气泡
 7. 合并窗口（2026-10-16 起）：同一客户在 8 秒内连发 3 条 → 日志出现 3 行
    `收到 X 第 N 条（8s 无新消息后合并提交）`，停手 8s 后出现 1 行
