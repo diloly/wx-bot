@@ -50,6 +50,9 @@
   解密读取（依赖 `wechatauto-replica`）。
 - **UI 独占门**：客户端只有一份焦点，所有会抢占前台的操作（发送、刷新朋友圈、导航）
   必须经同一把锁串行，避免互相打断。
+- **解密缓存按进程隔离**：`wechatauto` 默认把解密副本写进一个全进程共享的临时目录，
+  多进程同时重建会触发 Windows `[WinError 5] 拒绝访问`。项目统一经 `db_gate.get_db()`
+  取库：每个进程一份私有副本目录 + 一个实例，互不干扰（详见 `RUNBOOK.md`）。
 - **发出去才算发**：键盘动作跑完不等于消息真的发出，每次发送后回读数据库确认，
   确认失败落 `failed` 而不是记一条假成功。
 - **发送前判定"谁发的"**：只能靠发送者标识，不能靠编号（编号是分片内的行号，
@@ -68,6 +71,7 @@ wechat_ui.py         键盘驱动发送层（搜索/进会话/粘贴/发送/回�
 dashboard.py         网页看板（Flask，2 秒轮询）
 monitor_store.py     统一消息库（SQLite）读写
 ui_gate.py           微信 UI 独占锁（跨进程）
+db_gate.py           微信解密库隔离门（一进程一份副本 + 进程内单例）
 ai_client.py         AI 调用与系统提示词（OpenAI 兼容接口）
 friend_add.py        批量加好友
 moment_ops.py        朋友圈读取与互动
@@ -85,7 +89,10 @@ COMMANDS.md          命令与接口速查
 - Windows 10/11，微信 PC 客户端已登录（保持在前台可用）
 - Python 3.10+，`pip install -r requirements.txt`
 - 需要自行准备 `ai_secrets.json`（模型地址与密钥），**不要提交到公开仓库**
-- 首次运行需全量解密本地库，可能耗时数分钟
+- 首次运行需全量解密本地库，可能耗时数分钟；`dashboard.py` 与 `auto_reply.py`
+  可以同时运行，各自使用独立的解密副本目录
+- 报 `[WinError 5] 拒绝访问` 时先确认所有 python 进程都用上了新版 `db_gate`；
+  旧进程残留可作废后清理：`python -c "import db_gate; print(db_gate.cleanup_stale())"`
 
 ## 六、明确的合规边界
 

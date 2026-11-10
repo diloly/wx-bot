@@ -977,7 +977,8 @@ def main():
               % (n, "全部" if target is None else target))
         return
     try:
-        db = WeChatDB()
+        import db_gate
+        db = db_gate.get_db()
         me = db.get_self_info()
         print("[*] 当前账号: %s (%s)" % (me.get("nick_name"), me.get("username")))
     except Exception as e:

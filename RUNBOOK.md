@@ -499,6 +499,24 @@ site-packages、不宜改（重装即丢），所以 `moment_ops._human_cursor()
   正确判据：**sender_username == 本机 wxid**（库已按分片解析好，见 `is_self()`）。
   已写反的历史数据用 `python wx_recv_bridge.py --fix-roles --dry-run` 试算后用
   `--fix-roles` 校正（只改 role，不删消息）。
+- **多个 `WeChatDB()` 实例 = `[WinError 5] 拒绝访问`**（2026-11-10 启动事故）：
+  `python auto_reply.py` 启动时报
+  `os.replace('...contact__contact.db.<pid>.<tid>.tmp', '...contact__contact.db')`
+  被拒绝，看 `wechatauto_db/` 里成堆的 `.tmp / -shm / -wal` 残留。两层根因：
+  ① `wechatauto` 的解密副本目录 `%TEMP%/wechatauto_db/<账号>/` 是**全进程共享**的，
+  微信 WAL 一变就重建并 `os.replace` 覆盖；Windows 下该文件只要被**另一个进程**
+  的只读 SQLite 连接持有（`dashboard.py` 后台头像同步线程常驻持有），覆盖必失败。
+  ② `_build_lock_for()` 是**实例级**锁，而 `auto_reply.py` 原本给主线程 / AI 线程 /
+  发送线程各建了一个实例，同进程内也会并发重建同一份副本、互踩中间产物。
+  修复：新增 `db_gate.py`，所有 `WeChatDB()` 收口到 `db_gate.get_db()`——
+  **一进程一份私有副本目录**（`proc_<pid>/`，含 stamp / tmp / shm / wal / keys.json）
+  + **一进程一个实例**（单例，构建锁统一）+ 命名 Mutex 只保护构造期共享
+  `keys.json` 写入 + 预热 `get_self_info()` 时 WinError 5 自愈重试 2 次。
+  实测：旧 dashboard 仍占用共享目录时，两个新进程并发启动 + 单进程 8 线程并发
+  均成功，各自 workdir 独立、单例唯一。代价仅是每个进程首轮自行解密一遍（秒级）。
+  运维注意：**旧代码的 dashboard 必须重启**才会走 `db_gate`；
+  遗留的 `proc_*` 目录用 `python -c "import db_gate; print(db_gate.cleanup_stale())"`
+  清理（只删 48 小时未修改且非本进程的目录）。
 
 ## 十一、风控与合规（始终有效）
 

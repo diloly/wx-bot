@@ -45,6 +45,7 @@ import time
 
 import monitor_store
 import ui_gate
+import db_gate
 
 # wechatauto 装在 your-env 环境；本模块被 dashboard/auto_reply  import 时同理
 try:
@@ -210,7 +211,7 @@ class MomentOps:
     @property
     def db(self):
         if self._db is None:
-            self._db = WeChatDB()
+            self._db = db_gate.get_db()
         return self._db
 
     @property

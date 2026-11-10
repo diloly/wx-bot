@@ -51,8 +51,9 @@ import time
 import monitor_store
 import outreach_core as oc
 import wechat_ui
+import db_gate
 from ai_client import generate as ai_generate
-from wx_recv_bridge import WeChatDB, is_self, me_username
+from wx_recv_bridge import is_self, me_username
 
 
 def make_confirm(db, timeout=6.0):
@@ -218,7 +219,7 @@ def main():
         return
     quota = min(limit, budget)
 
-    db = WeChatDB()
+    db = db_gate.get_db()
     bot = wechat_ui.WeChatPCBot(cfg)
     bot.dry_run = not args.send          # 只有 --send 才解除演练
     confirm = make_confirm(db)

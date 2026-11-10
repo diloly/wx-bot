@@ -64,10 +64,11 @@ import handoff
 import monitor_store
 import outreach_core as oc
 import ui_gate
+import db_gate
 from ai_client import generate as ai_generate
 from wechat_ui import (WeChatPCBot, load_config, SendNotVerified,
                        SendUnconfirmed, SendAborted)
-from wx_recv_bridge import poll_new, is_self, me_username, WeChatDB
+from wx_recv_bridge import poll_new, is_self, me_username
 
 GROUP_SUFFIX = "@chatroom"
 
@@ -330,10 +331,12 @@ class AutoReplier:
             return cached
         info = {"name": name, "tags": [], "note": ""}
         try:
-            # 本方法只被 AI 线程调用；用独立的 WeChatDB 实例，避免与主线程的
-            # 收消息轮询共享同一个连接（跨线程共用连接是隐患）。
+            # 统一走 db_gate 的进程单例。以前这里「为线程安全」另建一个
+            # WeChatDB，反而更危险：库的构建锁是实例级的，多实例会并发
+            # replace 同一份解密副本（WinError 5）。库每次查询都是新开连接
+            # 用完即 close，共享对象本身不共享 sqlite 连接，是安全的。
             if self._ai_db_obj is None:
-                self._ai_db_obj = WeChatDB()
+                self._ai_db_obj = db_gate.get_db()
             rows = self._ai_db_obj.search_contact(name) or []
             # 精确匹配本会话 wxid 优先；搜不到（名字是昵称/别称）就取首行，
             # 备注仍有参考价值——丢什么都不丢备注。
@@ -929,14 +932,16 @@ class AutoReplier:
 
     # ---------- 发送结果校验（回读微信库，真实发出才算数） ----------
     def _send_db(self):
-        """发送线程专属的 WeChatDB 实例。
+        """发送线程用的微信库（db_gate 进程单例）。
 
-        不共用主线程的 self.db、也不共用 AI 线程的 _ai_db_obj：WeChatDB 底下是
-        sqlite 连接，跨线程共用是隐患（与 _contact_of 同一个道理）。
+        库内部每次查询都是 ``_open(rel)`` 新开连接、用完 close；共享的只是
+        WeChatDB 对象（密钥 / 私有缓存目录 / 构建锁注册表），不会跨线程共用
+        sqlite 连接。反过来，多建实例会因实例级构建锁各解各的、并发
+        os.replace 同一份副本，触发 WinError 5。
         """
         if self._send_db_obj is None:
             try:
-                self._send_db_obj = WeChatDB()
+                self._send_db_obj = db_gate.get_db()
             except Exception as e:          # noqa: BLE001
                 print("[auto] 发送校验初始化 WeChatDB 失败（无法校验，不写库）: %s" % e)
                 return None
@@ -1455,11 +1460,16 @@ class AutoReplier:
         except Exception:
             pass
         try:
-            self.db = WeChatDB()
+            self.db = db_gate.get_db()
             me = self.db.get_self_info()
             print("[auto] 当前账号: %s (%s)" % (me.get("nick_name"), me.get("username")))
         except Exception as e:
             print("[!] WeChatDB 初始化失败（微信需已登录并跑过 wechatauto 体检）: %s" % e)
+            if getattr(e, "winerror", None) in (5, 32, 33):
+                print("[!] 这是 Windows 文件占用错误。db_gate 已把解密副本隔离到"
+                      "本进程私有目录；若仍复现，多半是共享目录残留，"
+                      "关掉所有 python 进程后删除 "
+                      r"%TEMP%\wechatauto_db\<账号>\ 下的 .tmp*/-shm/-wal 再启动。")
             sys.exit(1)
         self.switches = monitor_store.get_switches()
         # 启动清理：上次运行残留的未完成任务标为作废。内存队列随进程一起没了，

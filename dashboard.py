@@ -643,12 +643,16 @@ def _avatar_loop():
     头像来自微信 contact 表的 small_head_url（wx.qlogo.cn，无需登录态），
     新好友 / 换头像都能跟上。微信没开或读库失败只记一行日志——
     头像只是显示，不该影响看板本身。
+
+    走 db_gate.get_db()：看板与 auto_reply 是两个进程，各自持有独立的
+    解密副本目录，不会互相 os.replace 对方正在读的库（2026-11-10 WinError 5）。
     """
     import time as _t
     while True:
         try:
-            from wx_recv_bridge import WeChatDB, sync_avatars, sync_contacts
-            db = WeChatDB()
+            import db_gate
+            from wx_recv_bridge import sync_avatars, sync_contacts
+            db = db_gate.get_db()
             sync_avatars(db)
             sync_contacts(db)      # 通讯录跟着一起刷新：新加的好友选择器里马上能看到
         except Exception as e:      # noqa: BLE001

@@ -496,6 +496,8 @@ python activate.py --send --icebreak      # 临时把「没聊过」的一起破
 python <项目根目录>\wx_recv_bridge.py --once        :: 只轮询一轮后退出（快速看全量结果）
 python <项目根目录>\auto_reply.py --interval 5      :: 自定义轮询间隔（秒）
 python -u <项目根目录>\wx_recv_bridge.py            :: 无缓冲输出（排查"终端卡住"观感）
+python -c "import db_gate; d=db_gate.get_db(); print(d.workdir)"  :: 只读验证解密库能否初始化，打印本进程私有副本目录
+python -c "import db_gate; print(db_gate.cleanup_stale())"       :: 清理其他进程遗留 48h+ 的解密副本目录
 ```
 
 ---
@@ -522,6 +524,7 @@ python -u <项目根目录>\wx_recv_bridge.py            :: 无缓冲输出（�
 | 图片/卡片不显示 | 跑一次 `--media-backfill`；看终端 `[media] 下载失败` 行 |
 | 看板里**自己发的消息在左边、对方的在右边**，同时发送一直失败/一直重发 | 换设备后 `sender_id` 编号变了（它不是固定 2）。先 `python wx_recv_bridge.py --fix-roles --dry-run` 试算，确认后去掉 `--dry-run` 校正历史数据；代码已改为按 `sender_username` 判定，重启 bridge + auto_reply 即生效。详见 RUNBOOK「十、走过的弯路」 |
 | 只看到自己的消息 | 首轮没跑完就被 Ctrl+C 了（自测会话排最前）；重跑等 `[poll]` 汇总行出现 |
+| 启动报 `WeChatDB 初始化失败 ... [WinError 5] 拒绝访问` | 多个进程/多个实例抢同一份解密副本。确认 `dashboard.py` 与 `auto_reply.py` 都重启到新版 `db_gate`；先 `python -c "import db_gate; d=db_gate.get_db(); print(d.workdir)"` 单测能否初始化，再关掉全部 python 进程、清掉 `%TEMP%\wechatauto_db\<账号>\` 下残留的 `.tmp* / -shm / -wal` 重启。详见 RUNBOOK「十、走过的弯路」 |
 
 ---
 

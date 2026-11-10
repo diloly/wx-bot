@@ -29,6 +29,7 @@ try:
 except ImportError:
     print("[!] 需要 wechatauto-replica: pip install wechatauto-replica")
     sys.exit(1)
+import db_gate
 
 # 备份目录：与脚本同目录的 backups/（.gitignore 已覆盖，不会误提交客户数据）
 BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backups")
@@ -55,7 +56,7 @@ def main():
 
     print("[*] 连接微信数据库（首轮要全量解密，可能数分钟）...")
     try:
-        db = WeChatDB()
+        db = db_gate.get_db()
         me = db.get_self_info()
         print("[*] 当前账号: %s (%s)" % (me.get("nick_name"), me.get("username")))
     except Exception as e:
