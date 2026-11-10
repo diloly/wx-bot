@@ -2,6 +2,19 @@
 
 > 全部命令在 Windows 本机执行；键盘发送期间微信需已登录、保持前台、不锁屏。
 > 工作目录：`<项目根目录>`（下面都用绝对路径，任意目录可直接粘贴运行）。
+>
+> ⚠️ **解释器必须用 `python`**：依赖（requests / wechatauto-replica /
+> flask 等）都装在这个 conda 环境里。直接敲 `python` 会落到系统 Python，报
+> `ModuleNotFoundError: No module named 'requests'`。下文所有 `python` 均指该解释器，
+> PowerShell 里可先 `Set-Alias python python`。
+>
+> **最简启动（只看看板，只读、不碰微信 UI）**：
+> ```
+> cd <项目根目录>
+> & "python" dashboard.py
+> ```
+> 浏览器打开 http://localhost:5000 （新版 Vue 看板），`/legacy` 是旧版回退。
+> 不需要 npm / node：前端构建产物 `static/dist/` 已入库；只有改前端才需要 `npm run build`。
 
 ---
 

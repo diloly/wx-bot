@@ -42,6 +42,17 @@
 
 ## 三、日常运行（三个终端）
 
+> **解释器**：依赖装在 `<Python 环境>`，必须用
+> `"python" 脚本.py` 启动；直接敲 `python` 会落到系统
+> Python 并报 `ModuleNotFoundError: No module named 'requests'`。
+> 先 `cd <项目根目录>` 最稳妥（配置、密钥、知识库、消息库都按脚本
+> 目录定位，不受 cwd 影响，但日志与相对路径的输出以项目根为准）。
+> 下文命令里的 `python` 一律指该 conda 解释器。
+>
+> **只看看板时只需终端 A**：dashboard 是只读的，不抢微信焦点、不发消息。
+> 前端构建产物 `static/dist/` 已入库，**不需要装 node、不需要 npm run build**；
+> 打开 http://localhost:5000 是 Vue 新版，`/legacy` 是旧版回退。
+
 **终端 A — 看板（常开）**
 ```
 python <项目根目录>\dashboard.py
