@@ -93,7 +93,7 @@ async function save() {
 
     <div class="wb-card">
       <h3>接管记录 {{ recent.length }}</h3>
-      <div v-for="r in recent" :key="r.id" style="padding: 9px 0; border-bottom: 1px solid var(--wb-border); font-size: 12px">
+      <div v-for="r in recent" :key="r.id" style="padding: 9px 0; border-bottom: 1px solid var(--wb-border); font-size: 14px">
         <div style="display: flex; gap: 10px; align-items: center">
           <b>{{ r.customer || r.conv_id }}</b>
           <el-tag v-if="r.paused" size="small" type="warning" effect="plain">已暂停回复</el-tag>

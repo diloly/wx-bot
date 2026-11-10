@@ -472,7 +472,11 @@ def clear_unread(conv_id):
 
 def set_switch(conv_id, enabled):
     """设置某会话的 AI 自动回复开关（看板每个会话一个，默认关）。
-    upsert：不存在则插入，存在则更新。"""
+    upsert：不存在则插入，存在则更新。
+
+    开启时顺带补一条会话占位（见 ensure_switch_conversations），否则一个
+    「加了好友但从没聊过天」的客户开了托管后，左侧列表里不会出现。
+    """
     conn = init()
     conn.execute(
         "INSERT INTO conv_switch(conv_id, enabled, updated_at) VALUES(?, ?, ?) "
@@ -481,6 +485,50 @@ def set_switch(conv_id, enabled):
     )
     conn.commit()
     conn.close()
+    if enabled:
+        ensure_switch_conversations()
+
+
+def ensure_switch_conversations():
+    """让「已开 AI 托管但从没聊过天」的会话在列表里也有一条占位记录（幂等）。
+
+    conversations 表原本只由 add_message() 在收到消息时创建，所以从「+」
+    选择器里给一个从没聊过的客户开托管后，开关写进了 conv_switch，列表却
+    查不到这条会话 —— 看板上表现为「托管开了，左侧却没出现」。这里按
+    conv_switch 里 enabled=1 的项补占位，顺带把历史上遗留的「幽灵开关」
+    一起补上；已有会话一律不覆盖（INSERT OR IGNORE）。
+
+    占位行 last_msg 为空、last_ts 取开关打开时刻：刚开启的会话排在列表最前，
+    用户立刻能看到反馈；前端对空 last_msg 的会话不显示时间。主动触达候选靠
+    messages 表判断「有没有聊过」，不会被占位行骗到。
+    """
+    conn = init()
+    try:
+        # 先只读探测，绝大多数请求（没有缺口）不产生任何写操作
+        missing = conn.execute(
+            "SELECT 1 FROM conv_switch s "
+            "LEFT JOIN conversations c ON c.conv_id = s.conv_id "
+            "WHERE s.enabled = 1 AND c.conv_id IS NULL LIMIT 1"
+        ).fetchone()
+        if not missing:
+            return 0
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO conversations"
+            "(conv_id, name, last_msg, last_ts, unread) "
+            "SELECT s.conv_id, "
+            "  COALESCE(NULLIF(ct.name, ''), NULLIF(ct.nick, ''), "
+            "           NULLIF(ct.remark, ''), s.conv_id), "
+            "  '', CASE WHEN COALESCE(s.updated_at, 0) > 0 "
+            "          THEN s.updated_at ELSE ? END, 0 "
+            "FROM conv_switch s "
+            "LEFT JOIN contacts ct ON ct.conv_id = s.conv_id "
+            "WHERE s.enabled = 1",
+            (int(time.time()),),
+        )
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
 
 
 def get_switches():
@@ -1361,7 +1409,9 @@ def get_activation_targets(silent_hours=24, max_days=0, min_gap_days=7,
                     "     AND COALESCE(t.reason,'') NOT LIKE 'dry-run%') AS act_count "
                     "FROM contacts ct "
                     "WHERE ct.kind='friend' AND NOT EXISTS ("
-                    "  SELECT 1 FROM conversations c WHERE c.conv_id=ct.conv_id)")
+                    # 判「从没聊过」要看 messages，不能看 conversations：
+                    # 开了托管但没聊过的人现在也会有一条占位会话记录。
+                    "  SELECT 1 FROM messages m WHERE m.conv_id=ct.conv_id)")
             p2 = []
             if me:                          # 通讯录里有自己，别给自己发破冰消息
                 sql2 += " AND ct.conv_id <> ?"

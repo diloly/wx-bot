@@ -52,14 +52,18 @@ watch(dark, (v) => {
 
 let timer = null
 
+// 会话列表单独抽出来：开启托管后要立刻刷新左侧，而不是等下一轮 2s 轮询。
+async function loadConversations() {
+  const d = await api.conversations()
+  store.conversations = d.conversations || []
+  store.autoReplyEnabled = !!d.auto_reply_enabled
+  store.allowGroups = !!d.allow_groups
+  store.me = d.me || ''
+}
+
 async function poll() {
   const jobs = [
-    api.conversations().then((d) => {
-      store.conversations = d.conversations || []
-      store.autoReplyEnabled = !!d.auto_reply_enabled
-      store.allowGroups = !!d.allow_groups
-      store.me = d.me || ''
-    }),
+    loadConversations(),
     api.moments().then((d) => Object.assign(store.moments, d)),
     api.tasks().then((d) => Object.assign(store.tasks, d)),
     api.friends().then((d) => Object.assign(store.friends, d)),
@@ -76,7 +80,10 @@ async function poll() {
 // 接管页 / 活动页不进轮询：表单正在编辑时被覆盖会丢输入。
 async function loadPage(id) {
   try {
-    if (id === 'chat') store.contacts = (await api.contacts()).contacts || []
+    if (id === 'chat') {
+      await loadConversations()       // 刚开了托管的会话马上出现在左侧
+      store.contacts = (await api.contacts()).contacts || []
+    }
     else if (id === 'handoff') Object.assign(store.handoff, await api.handoffConfig())
     else if (id === 'campaign') Object.assign(store.campaigns, await api.campaigns())
   } catch (e) {
@@ -135,6 +142,6 @@ onUnmounted(() => clearInterval(timer))
 .wb-nbadge {
   display: inline-block; min-width: 16px; padding: 0 4px; margin-left: 5px;
   border-radius: 8px; background: #fa5151; color: #fff;
-  font-size: 10px; line-height: 16px; text-align: center;
+  font-size: 11px; line-height: 16px; text-align: center;
 }
 </style>

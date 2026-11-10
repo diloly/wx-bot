@@ -95,17 +95,17 @@ async function action(c, act) {
       <h3>活动列表 {{ campaigns.length }}</h3>
       <div v-for="c in campaigns" :key="c.id" style="padding: 12px 0; border-bottom: 1px solid var(--wb-border)">
         <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
-          <b style="font-size: 13px">{{ c.name || '未命名活动' }}</b>
+          <b style="font-size: 15px">{{ c.name || '未命名活动' }}</b>
           <el-tag size="small" effect="plain" :type="statusType(c.status)">{{ CAMPAIGN_STATUS[c.status] || c.status }}</el-tag>
-          <span style="font-size: 11px; color: var(--wb-muted)">计划 {{ fmtTime(c.send_at) }} · {{ (c.targets || []).length }} 个对象</span>
+          <span style="font-size: 13px; color: var(--wb-muted)">计划 {{ fmtTime(c.send_at) }} · {{ (c.targets || []).length }} 个对象</span>
           <div style="margin-left: auto; display: flex; gap: 6px">
             <el-button v-if="c.status === 'scheduled'" size="small" @click="action(c, 'now')">立即发送</el-button>
             <el-button v-if="c.status === 'scheduled'" size="small" @click="action(c, 'cancel')">取消</el-button>
             <el-button v-if="c.status !== 'scheduled'" size="small" type="danger" plain @click="action(c, 'del')">删除</el-button>
           </div>
         </div>
-        <div style="font-size: 12px; color: var(--wb-muted); margin-top: 6px; white-space: pre-wrap">{{ c.content }}</div>
-        <div v-if="(c.result || []).length" style="font-size: 11px; color: var(--wb-muted); margin-top: 6px">
+        <div style="font-size: 14px; color: var(--wb-muted); margin-top: 6px; white-space: pre-wrap">{{ c.content }}</div>
+        <div v-if="(c.result || []).length" style="font-size: 13px; color: var(--wb-muted); margin-top: 6px">
           结果：成功 {{ c.result.filter((r) => r.ok).length }} / 失败 {{ c.result.filter((r) => !r.ok).length }}
         </div>
       </div>

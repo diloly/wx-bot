@@ -113,7 +113,7 @@ async function delMessage(id) {
             <div class="sub">{{ c.last_msg || '暂无消息' }}</div>
           </div>
           <div style="display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex-shrink: 0">
-            <span class="ts">{{ fmtClock(c.last_ts) }}</span>
+            <span v-if="c.last_msg" class="ts">{{ fmtClock(c.last_ts) }}</span>
             <el-switch
               size="small" :model-value="!!c.auto_reply"
               @click.stop @change="(v) => toggleConv(c, v)"
@@ -146,7 +146,7 @@ async function delMessage(id) {
               :msg="m" :conv-id="store.activeConv" :me-avatar="meAvatar" :peer-avatar="peerAvatar"
               @delete="delMessage"
             />
-            <div v-if="!store.messages.length" class="wb-empty">还没有消息</div>
+            <div v-if="!store.messages.length" class="wb-empty">还没有聊天记录，发一条消息开始吧</div>
           </div>
         </div>
 
@@ -174,12 +174,12 @@ async function delMessage(id) {
       <div style="max-height: 46vh; overflow-y: auto; margin-top: 10px">
         <div v-for="c in pickerList" :key="c.conv_id" class="wb-picker-row" @click="enableConv(c)">
           <WbAvatar :url="c.avatar_url" :name="c.name" size="sm" />
-          <span style="flex: 1; min-width: 0; font-size: 12px">{{ c.name }}</span>
+          <span style="flex: 1; min-width: 0; font-size: 14px">{{ c.name }}</span>
           <el-tag v-if="!c.has_conv" size="small" effect="plain">未聊过</el-tag>
           <el-tag size="small" effect="plain" :type="c.kind === 'group' ? 'primary' : 'info'">
             {{ c.kind === 'group' ? '群聊' : '好友' }}
           </el-tag>
-          <span style="color: var(--wb-accent); font-size: 17px">+</span>
+          <span style="color: var(--wb-accent); font-size: 19px">+</span>
         </div>
         <div v-if="!pickerList.length" class="wb-empty">没有可开启的会话</div>
       </div>

@@ -576,3 +576,60 @@ site-packages、不宜改（重装即丢），所以 `moment_ops._human_cursor()
 
 - 键盘驱动仍违反微信 ToS，有封号风险；频率闸 + 冷仅是软防护，不是豁免。
 - 只维护已知客户；禁止无差别加陌生人、禁止群发骚扰营销。
+
+## 十二、仓库历史重写后：其他机器怎么同步
+
+2026-11-10 清过一次公开历史，所有 commit hash 都变了。已经 clone 过的机器
+**不能靠 `git pull` 跟上** —— 新历史不是旧历史的后代。
+
+> **前提**：本项目有大量被 `.gitignore` 的本地运行数据（`wechat_monitor.db`、
+> `ai_secrets.json`、`knowledge/`、`wechat_media/`）。**不要重新 clone 覆盖**，
+> 也**绝对不要 `git clean -fdx`**，否则这些文件会被删掉。`fetch + reset` 只动
+> git 跟踪的文件，本地数据原样保留。
+
+在原来那个 clone 目录里：
+
+```bash
+cd <项目根目录>
+
+git fetch origin                     # 只更新远端指针，不动本地分支和工作区
+git status -sb                       # 预期显示 diverged
+git log --oneline origin/main..HEAD   # 检查本地有没有未推送的提交
+```
+
+> ⚠️ **下面这条会永久丢弃本地未提交改动和上面列出的本地提交**，执行前确认没有
+> 要保留的东西。有本地提交就先 `git format-patch origin/main..HEAD -o <项目外的目录>`
+> 导出，reset 后再 `git am` 应用（注意 patch 里若含敏感内容，等于又复制了一份）。
+
+```bash
+git reset --hard origin/main
+git log --oneline -1                 # 应与远端一致
+git status -sb                       # 干净、且跟踪 origin/main
+```
+
+**不要用 `git pull`**：会报 non-fast-forward；若配了 `pull.rebase=true`，还可能把
+旧提交重放上去，把已经从历史里删掉的数据重新推回远端。
+
+旧 commit 对象仍会留在本机 `.git/objects` 里（`git log <旧SHA>` 还能翻出来），
+`fetch / reset` 不会删它们。要真正清掉：
+
+```bash
+git branch -a                        # 有别的分支/标签指向旧 commit 就先删掉
+git reflog expire --expire=now --all
+git gc --prune=now
+```
+
+只要还有一个引用指向旧 commit，`gc` 就清不掉。没有本地运行数据的机器，最省事
+的做法是改名旧目录后重新 `git clone`。
+
+**多台机器**：每台各做一次；任何一台在旧历史上 `git push --force` 都会让旧历史
+复活。已经 fork 的仓库不受这些命令影响，需要在平台上同步或重建 fork。
+
+> `git filter-repo` 会移除 `origin` remote。重写完的机器要
+> `git remote add origin <仓库地址>` + `git fetch origin` +
+> `git branch --set-upstream-to=origin/main main`，否则后续 `git push` 会报
+> 没有 upstream。
+>
+> **重写 ≠ 删除**：强推之后，托管平台上的旧 commit 页面 / API / 按旧 SHA fetch
+> 仍可能取到旧对象（平台保留不可达对象与缓存）。要彻底消除公开泄露只能删仓库
+> 重建或转 private，并联系平台清除缓存对象。

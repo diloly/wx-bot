@@ -55,14 +55,14 @@ function toggle(id, checked) {
           @change="(v) => toggle(c.conv_id, v)"
         />
         <WbAvatar :name="c.name" size="sm" />
-        <span style="flex: 1; min-width: 0; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap">{{ c.name }}</span>
+        <span style="flex: 1; min-width: 0; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap">{{ c.name }}</span>
         <el-tag size="small" effect="plain" :type="c.kind === 'group' ? 'primary' : 'info'">
           {{ c.kind === 'group' ? '群聊' : '好友' }}
         </el-tag>
       </div>
       <div v-if="!list.length" class="wb-empty">没有匹配的对象</div>
     </div>
-    <div style="margin-top: 6px; font-size: 11px; color: var(--wb-muted)">
+    <div style="margin-top: 6px; font-size: 13px; color: var(--wb-muted)">
       已选 {{ modelValue.length }} 个 · 只列通讯录好友与群聊，群里的陌生人已排除
     </div>
   </div>

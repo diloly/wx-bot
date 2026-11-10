@@ -54,14 +54,14 @@ async function importText() {
       </div>
       <div class="wb-metric">
         <div class="k">今日已发 / 上限</div>
-        <div class="v">{{ store.friends.sent_today || 0 }}<span style="font-size: 13px; color: var(--wb-muted)"> / {{ store.friends.daily_limit || 0 }}</span></div>
+        <div class="v">{{ store.friends.sent_today || 0 }}<span style="font-size: 15px; color: var(--wb-muted)"> / {{ store.friends.daily_limit || 0 }}</span></div>
       </div>
     </div>
 
     <div class="wb-grid2">
       <div class="wb-card">
         <h3>上传 CSV</h3>
-        <p style="font-size: 12px; color: var(--wb-muted); line-height: 1.7; margin: 0 0 12px">
+        <p style="font-size: 14px; color: var(--wb-muted); line-height: 1.7; margin: 0 0 12px">
           一行一个手机号 / 微信号，UTF-8 或 GBK 均可。
           <a href="/api/friends/template" style="color: var(--wb-accent)">下载模板</a>
         </p>

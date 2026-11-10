@@ -66,7 +66,7 @@ const imgFailed = ref(false)
       <!-- 文件卡片 -->
       <a v-else-if="cardKind === 'file'" class="wb-linkcard" :href="media ? mediaUrl(media) : (card.url || '#')" :download="media ? '' : undefined" target="_blank" rel="noopener">
         <div style="display: flex; gap: 10px; align-items: center">
-          <div style="width: 38px; height: 38px; border-radius: 8px; background: var(--wb-accent-soft); color: var(--wb-accent); display: flex; align-items: center; justify-content: center; font-size: 11px">
+          <div style="width: 38px; height: 38px; border-radius: 8px; background: var(--wb-accent-soft); color: var(--wb-accent); display: flex; align-items: center; justify-content: center; font-size: 13px">
             {{ card.ext || fileExt || '文件' }}
           </div>
           <div style="flex: 1; min-width: 0">

@@ -45,6 +45,7 @@ from flask import (Flask, render_template, jsonify, request, send_from_directory
 
 from monitor_store import (
     init, list_conversations, get_messages, add_message, clear_unread, set_switch,
+    ensure_switch_conversations,
     get_moments, get_interactions, mark_interactions_read, moment_unread_count,
     get_moment_switches, set_moment_switch, get_tasks, task_counts,
     friend_counts, get_friend_tasks, friend_sent_today, get_setting, set_setting,
@@ -150,6 +151,9 @@ def api_conversations():
     cfg = wechat_ui.load_config()
     ar = cfg.get("auto_reply", {}) or {}
     contacts = cfg.get("contacts") or []
+    # 已开托管但从没聊过天的客户：conversations 表里原本没有记录，左侧列表
+    # 就永远看不到他。这里幂等补占位，也顺带修好历史上遗留的「幽灵开关」。
+    ensure_switch_conversations()
     convs = list_conversations()
     for c in convs:                    # 看板「+ 选择托管」按标签筛选用
         c["tags"] = _conv_tags(c, contacts)

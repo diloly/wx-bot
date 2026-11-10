@@ -71,9 +71,9 @@ async function readAll() {
   <div class="wb-view">
     <aside class="wb-side">
       <div class="wb-side-head">
-        <span style="font-size: 12px; color: var(--wb-muted)">新动态 {{ list.length }}</span>
+        <span style="font-size: 14px; color: var(--wb-muted)">新动态 {{ list.length }}</span>
         <div style="margin-left: auto; display: flex; align-items: center; gap: 6px">
-          <span style="font-size: 11px; color: var(--wb-muted)">模拟</span>
+          <span style="font-size: 13px; color: var(--wb-muted)">模拟</span>
           <el-switch size="small" :model-value="!!store.moments.dry_run" @change="toggleDry" />
         </div>
       </div>
@@ -109,8 +109,8 @@ async function readAll() {
               <div style="display: flex; align-items: center; gap: 10px">
                 <div class="wb-avatar">{{ (active.nickname || '?').slice(0, 1) }}</div>
                 <div style="flex: 1">
-                  <div style="font-size: 13px; font-weight: 500">{{ active.nickname || active.username }}</div>
-                  <div style="font-size: 11px; color: var(--wb-muted)">{{ fmtTime(active.create_time) }}</div>
+                  <div style="font-size: 15px; font-weight: 500">{{ active.nickname || active.username }}</div>
+                  <div style="font-size: 13px; color: var(--wb-muted)">{{ fmtTime(active.create_time) }}</div>
                 </div>
                 <el-tag size="small" effect="plain">自动点赞 {{ sw.auto_like ? '开' : '关' }}</el-tag>
                 <el-tag size="small" effect="plain">自动评论 {{ sw.auto_comment ? '开' : '关' }}</el-tag>
@@ -125,11 +125,11 @@ async function readAll() {
               <div class="wb-card">
                 <h3>按客户开关</h3>
                 <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 10px">
-                  <span style="font-size: 12px; width: 64px">自动点赞</span>
+                  <span style="font-size: 14px; width: 64px">自动点赞</span>
                   <el-switch :model-value="!!sw.auto_like" @change="(v) => toggleSwitch('like', v)" />
                 </div>
                 <div style="display: flex; align-items: center; gap: 12px">
-                  <span style="font-size: 12px; width: 64px">自动评论</span>
+                  <span style="font-size: 14px; width: 64px">自动评论</span>
                   <el-switch :model-value="!!sw.auto_comment" @change="(v) => toggleSwitch('comment', v)" />
                 </div>
               </div>
@@ -148,7 +148,7 @@ async function readAll() {
 
             <div class="wb-card">
               <h3>已有评论 {{ comments.length }}</h3>
-              <div v-for="(c, i) in comments" :key="i" style="font-size: 12px; padding: 5px 0; border-bottom: 1px solid var(--wb-border)">
+              <div v-for="(c, i) in comments" :key="i" style="font-size: 14px; padding: 5px 0; border-bottom: 1px solid var(--wb-border)">
                 <b>{{ c.nickname || c.username }}</b>：{{ c.content }}
               </div>
               <div v-if="!comments.length" class="wb-empty">暂无评论</div>
@@ -158,7 +158,7 @@ async function readAll() {
 
           <div class="wb-card">
             <h3>互动记录 {{ interactions.length }}</h3>
-            <div v-for="(it, i) in interactions" :key="i" style="display: flex; gap: 10px; font-size: 12px; padding: 6px 0; border-bottom: 1px solid var(--wb-border)">
+            <div v-for="(it, i) in interactions" :key="i" style="display: flex; gap: 10px; font-size: 14px; padding: 6px 0; border-bottom: 1px solid var(--wb-border)">
               <el-tag size="small" effect="plain">{{ it.type === 1 ? '赞' : '评论' }}</el-tag>
               <span style="flex: 1; min-width: 0">{{ it.from_nickname || it.from_username }} {{ it.content || '' }}</span>
               <span style="color: var(--wb-muted)">{{ fmtTime(it.create_time) }}</span>
