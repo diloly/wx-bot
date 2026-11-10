@@ -922,20 +922,23 @@ function renderPicker() {
   const kw = (document.getElementById('pickerSearch').value || '').trim();
   // 候选只给「还没开启托管」的：已开启的就在左边列表里，这里不重复列。
   // 数据源是通讯录全量（pickerAll），所以加了好友没聊过的人也能选到。
-  const cands = pickerAll.filter(c => !c.auto_reply && c.kind !== 'system');
+  // contact 表里混着「只在群聊里出现、没加好友的陌生人」/公众号/系统号，
+  // 后端 /api/contacts 已只返回 friend+group，这里再兜一层。接口失败时会
+  // 短暂用 allConvs 铺底（那些条目没有 kind），所以不能用白名单严格卡 kind。
+  const NOT_HOSTABLE = ['system', 'official', 'stranger', 'unknown'];
+  const cands = pickerAll.filter(c => !c.auto_reply && !NOT_HOSTABLE.includes(c.kind));
   const tagSet = [];
   for (const c of cands) {
     for (const t of (c.tags || [])) {
       if (!tagSet.includes(t)) tagSet.push(t);
     }
   }
-  // 内置分类（不依赖 config）：群聊 / 好友 / 公众号，配上 config 里的标签一起做筛选项
+  // 内置分类（不依赖 config）：好友 / 群聊，配上 config 里的标签一起做筛选项
+  // 「好友」= 不是群、不是公众号、不是群里陌生人的个人通讯录联系人
   const isGroup = c => c.kind === 'group' || String(c.conv_id).endsWith('@chatroom');
-  const isOfficial = c => c.kind === 'official';
   const BUILTIN = [
-    {id: '__private', label: '好友', test: c => !isGroup(c) && !isOfficial(c)},
+    {id: '__private', label: '好友', test: c => !isGroup(c) && c.kind !== 'official' && c.kind !== 'stranger'},
     {id: '__group', label: '群聊', test: isGroup},
-    {id: '__official', label: '公众号', test: isOfficial},
   ];
 
   let list = cands;
@@ -990,8 +993,10 @@ function renderPicker() {
   }
   const onCount = pickerAll.filter(c => c.auto_reply).length;
   const chatCount = pickerAll.filter(c => c.has_conv).length;
+  const friendCount = pickerAll.filter(c => c.kind === 'friend').length;
+  const groupCount = pickerAll.filter(isGroup).length;
   document.getElementById('pickerFoot').textContent =
-    `通讯录 ${pickerAll.length} 个（${chatCount} 个聊过），已托管 ${onCount} 个；点一行即开启托管`;
+    `可托管 ${pickerAll.length} 个（好友 ${friendCount} / 群聊 ${groupCount}，${chatCount} 个聊过），已托管 ${onCount} 个；只列通讯录好友与群聊，群里的陌生人已排除`;
 }
 
 async function enableConv(convId) {

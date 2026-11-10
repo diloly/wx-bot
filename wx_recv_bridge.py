@@ -524,55 +524,121 @@ def sync_avatars(db, only=None, force=False):
     return got, cached, failed
 
 
-# ---- 通讯录同步（2026-11-09）----
+# ---- 通讯录同步（2026-11-09；2026-11-10 修正「好友」判据）----
 # conversations 只记录「有过消息的会话」：加了好友却从没聊过的人在看板上根本
 # 不存在——选择器选不到、激活脚本也发不了。contact.db 的 contact 表是唯一
 # 全量来源，这里整体同步一份到 monitor_store.contacts。
+#
+# 但 contact 表 ≠ 通讯录好友表：它同时装着群聊、公众号、系统号，以及
+# **只在群里见过、并没加好友的陌生人**。旧版只按 username 形态判断，把后面
+# 这批人全标成了 friend，于是「+ 选择托管」的「好友」里混进一堆群成员，
+# 主动触达甚至可能给没加过好友的人发消息（合规红线）。
 _SYSTEM_IDS = {
     "filehelper", "weixin", "fmessage", "medianote", "floatbottle", "newsapp",
     "notifymessage", "helper_entry", "qqmail", "qqsafe", "brandsessionholder",
     "brandservicesessionholder", "weixinreminder", "officialaccounts",
 }
 
+# 微信 4.x contact.local_type（跨版本会有漂移，所以下面仍保留 flag 兜底）：
+#   1 = 通讯录好友（含手动存进通讯录的群聊、公众号）
+#   2 = 未存入通讯录的群聊
+#   3 = **群中的陌生人（非好友）**
+#   5 = 企业微信好友
+#   6 = 群中的陌生企业微信好友
+# chatlog 的 ContactV4 同样按 `IsFriend = LocalType != 3` 判定。
+_FRIEND_LOCAL_TYPES = {1, 5}
+_STRANGER_LOCAL_TYPES = {3, 6}
 
-def _contact_kind(username):
-    """通讯录条目分类：friend / group / official / system。
 
-    按 username 形态判断（稳定），不依赖 local_type（含义随版本变）。
+def _friend_whitelist():
+    """config.json → contact_sync.friend_whitelist：判据漂移时手动拉回好友。"""
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "config.json")
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        raw = (cfg.get("contact_sync") or {}).get("friend_whitelist") or []
+        return {str(x) for x in raw}
+    except Exception:                    # noqa: BLE001
+        return set()
+
+
+def _contact_kind(username, local_type=None, flag=None, verify_flag=None,
+                  delete_flag=None, whitelist=None):
+    """通讯录条目分类：friend / group / official / system / stranger。
+
+    优先级：手工白名单 > username 形态 > 删除标记 > 认证标记 > local_type > flag。
+    字段全读不到时退回「friend」（保持旧行为，不误杀），但本机 4.x 实测
+    local_type / flag 齐全，判据完全生效。
     """
     u = (username or "").lower()
+    if whitelist and (str(username) in whitelist or u in whitelist):
+        return "friend"
     if u.endswith("@chatroom"):
         return "group"
-    if u.startswith("gh_"):
-        return "official"
+    if u.endswith("@stranger") or u.startswith("v3_"):
+        return "stranger"               # stranger 表里的加密群成员身份
     if u in _SYSTEM_IDS:
         return "system"
-    return "friend"
+    if u.startswith("gh_"):
+        return "official"
+    try:
+        if int(delete_flag or 0):       # 已删除的好友仍可能留在 contact 表
+            return "stranger"
+    except (TypeError, ValueError):
+        pass
+    try:
+        if int(verify_flag or 0) & 8:   # 公众号 / 认证号标记
+            return "official"
+    except (TypeError, ValueError):
+        pass
+    try:
+        lt = int(local_type)
+    except (TypeError, ValueError):
+        lt = None
+    if lt in _FRIEND_LOCAL_TYPES:
+        return "friend"
+    if lt in _STRANGER_LOCAL_TYPES:
+        return "stranger"
+    if lt == 2:
+        return "group"
+    try:
+        # 兜底判据：flag 低两位非 0 = 通讯录联系人（flag & 3 != 0）。
+        # 本机数据里好友 flag=1/3、群中陌生人 flag=0/4、群聊 flag=2。
+        return "friend" if (int(flag) & 3) else "stranger"
+    except (TypeError, ValueError):
+        return "friend"
 
 
 def sync_contacts(db):
     """把微信通讯录同步到 monitor_store.contacts，返回写入条数（失败返回 0）。
 
-    全量覆盖语义：同名 conv_id 直接更新，已消失联系人不主动删（看板仍要能看历史）。
+    全量覆盖语义：同名 conv_id 直接更新（kind 也一并纠正，历史误标的
+    群成员会在下一次同步自动变成 stranger），已消失联系人不主动删。
     """
     rows = []
+    wl = _friend_whitelist()
     try:
         for rel, path, _ in getattr(db, "_db_files", None) or []:
             if os.path.basename(path) != "contact.db":
                 continue
             conn = db._open(rel)
             try:
-                for u, nick, remark in conn.execute(
-                        "SELECT username, nick_name, remark FROM contact "
-                        "WHERE username IS NOT NULL AND username <> ''"):
-                    nick = (nick or "").strip()
-                    remark = (remark or "").strip()
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(contact)")}
+                extra = [c for c in ("local_type", "flag", "verify_flag",
+                                     "delete_flag") if c in cols]
+                sql = ("SELECT username, nick_name, remark"
+                       + "".join(", " + c for c in extra)
+                       + " FROM contact WHERE username IS NOT NULL AND username <> ''")
+                for r in conn.execute(sql):
+                    u, nick, remark = r[0], (r[1] or "").strip(), (r[2] or "").strip()
+                    kw = dict(zip(extra, r[3:]))
                     rows.append({
                         "conv_id": u,
                         "name": remark or nick or u,
                         "nick": nick,
                         "remark": remark,
-                        "kind": _contact_kind(u),
+                        "kind": _contact_kind(u, whitelist=wl, **kw),
                     })
             finally:
                 conn.close()
@@ -580,7 +646,14 @@ def sync_contacts(db):
     except Exception as e:          # noqa: BLE001
         print("[contact] 读通讯录失败（跳过同步）: %s" % e)
         return 0
-    return monitor_store.upsert_contacts(rows)
+    n = monitor_store.upsert_contacts(rows)
+    stat = {}
+    for x in rows:
+        k = x["kind"]
+        stat[k] = stat.get(k, 0) + 1
+    print("[contact] 同步 %d 条：%s"
+          % (n, " / ".join("%s %d" % (k, v) for k, v in sorted(stat.items()))))
+    return n
 
 
 def _xml_placeholder(xml):

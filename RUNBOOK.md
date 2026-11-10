@@ -517,6 +517,23 @@ site-packages、不宜改（重装即丢），所以 `moment_ops._human_cursor()
   运维注意：**旧代码的 dashboard 必须重启**才会走 `db_gate`；
   遗留的 `proc_*` 目录用 `python -c "import db_gate; print(db_gate.cleanup_stale())"`
   清理（只删 48 小时未修改且非本进程的目录）。
+- **`contact` 表 ≠ 通讯录好友表**（2026-11-10）：旧 `sync_contacts()` 只按 username
+  形态分类，凡不是 `@chatroom` / `gh_` / 系统号的统统标 `friend`，于是「+ 选择托管」
+  的「好友」里混进一堆**只在群聊里出现、没加过好友的陌生人**，主动触达候选池
+  也含他们（差点踩「只维护已知客户」的合规红线）。微信 4.x 的
+  `contact.local_type` 才是判据：`1`=通讯录好友、`2`=未存通讯录的群聊、
+  `3`=**群中陌生人**、`5`=企业微信好友、`6`=陌生企业微信好友
+  （chatlog 的 ContactV4 也是 `IsFriend = LocalType != 3`）；
+  `delete_flag` 排除已删好友、`verify_flag & 8` 认公众号、`flag & 3` 兜底
+  （本机好友 flag 1/3、陌生人 0/4、群 2、两套判据结论一致）。
+  修复：`kind` 新增 `stranger`；`GET /api/contacts` 只返回 friend+group
+  （还排除本机自己）、前端「好友」chip 严格按 kind；`_handoff_candidates()`
+  与 `get_activation_targets()` 都只认 friend。实测本机 56 条 =
+  friend 13 / group 11 / official 16 / stranger 11 / system 5，选择器 23 个，
+  接管对象 23 个、主动触达候选 4 个均无陌生人。
+  误杀兜底：`config.contact_sync.friend_whitelist`（wxid 数组）。
+  **升级后必须重启 dashboard.py** —— 旧进程每 10 分钟同步一次会用旧判据把
+  kind 覆盖回 friend。
 
 ## 十一、风控与合规（始终有效）
 

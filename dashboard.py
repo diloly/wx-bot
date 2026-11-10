@@ -158,18 +158,28 @@ def api_contacts():
     聊过的人根本不在里面——选择器永远选不到，也就没法开托管。
     数据来自 monitor_store.contacts（由 wx_recv_bridge.sync_contacts 从微信
     contact.db 同步），再看有没有对应会话、有没有开托管。
+
+    **只返回 friend / group**：contact 表里还混着「只在群聊里出现、没加好友的
+    陌生人」(local_type=3)、公众号和系统号，它们既不是可托管对象，也不该被
+    主动触达当客户（合规红线）。分类由 sync_contacts 按 local_type 判定。
     """
     import wechat_ui
     cfg_contacts = wechat_ui.load_config().get("contacts") or []
     convs = {c["conv_id"]: c for c in list_conversations()}
+    me = get_setting("me_wxid") or ""
     out = []
     for r in list_contacts():
+        kind = r.get("kind") or ""
+        if kind not in ("friend", "group"):
+            continue
         cid = r["conv_id"]
+        if cid == me:                   # 通讯录里有自己，不需要托管自己
+            continue
         cv = convs.get(cid) or {}
         item = {
             "conv_id": cid,
             "name": r.get("name") or r.get("nick") or cid,
-            "kind": r.get("kind") or "friend",
+            "kind": kind,
             "has_conv": bool(cv),
             "last_msg": cv.get("last_msg") or "",
             "last_ts": cv.get("last_ts") or 0,
@@ -465,11 +475,11 @@ def api_handoff_config():
 
 
 def _handoff_candidates():
-    """可选通知目标 = 全部通讯录里的**好友 + 群聊**（公众号/系统号没意义）。"""
+    """可选通知目标 = **通讯录好友 + 群聊**（陌生人/公众号/系统号一律不算）。"""
     rows = list_contacts() or []
     out = []
     for r in rows:
-        kind = r.get("kind") or "friend"
+        kind = r.get("kind") or ""     # 不能默认 friend：空 kind 可能是脏数据
         if kind not in ("friend", "group"):
             continue
         cid = r.get("conv_id") or ""

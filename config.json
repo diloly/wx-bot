@@ -105,6 +105,9 @@
     "pause_auto_reply": true,
     "skip_ai_reply": true
   },
+  "contact_sync": {
+    "friend_whitelist": []
+  },
   "dashboard": {
     "port": 5000,
     "db_path": "wechat_monitor.db"

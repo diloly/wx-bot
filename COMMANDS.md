@@ -316,11 +316,27 @@ pending → already（对方已在通讯录，跳过）/ failed（同一号码�
 - **接口**：`GET /api/avatar/<conv_id>`（404 = 没头像，前端兜底）；
   `/api/conversations` 每项带 `avatar_url`（含 `?v=<ts>` 缓存键）和 `me`（本机 wxid）。
 
-**通讯录（2026-11-09）**：左栏和选择器原来只看 `conversations`（聊过的会话），
-加了好友却从没聊过的人根本不存在于看板。现在 `wx_recv_bridge.sync_contacts()`
-把微信 `contact.db` 全量同步进 `contacts` 表（`kind` = friend/group/official/system），
+**通讯录（2026-11-09；2026-11-10 修正好友判据）**：左栏和选择器原来只看
+`conversations`（聊过的会话），加了好友却从没聊过的人根本不存在于看板。现在
+`wx_recv_bridge.sync_contacts()` 把微信 `contact.db` 全量同步进 `contacts` 表，
+`kind` = friend / group / official / system / **stranger**。
 看板用 `GET /api/contacts` 取全量（合并会话状态、托管开关、头像），
 选择器里「未聊过」的会打标记。同步时机与头像相同（启动 + 每 10 分钟）。
+
+**「好友」怎么判**（旧版只按 username 形态，把群成员全标成 friend，选择器里混进一堆
+没加过好友的人，主动触达甚至可能给他们发消息）：微信 4.x `contact.local_type`——
+`1`=通讯录好友、`2`=未存通讯录的群聊、`3`=**群中的陌生人**、`5`=企业微信好友、
+`6`=陌生企业微信好友；`delete_flag` 排除已删好友，`verify_flag & 8` 认公众号，
+`flag & 3` 兜底（好友 flag 1/3，陌生人 0/4，群 2）。本机实测 56 条 =
+friend 13 / group 11 / official 16 / stranger 11 / system 5。
+- `GET /api/contacts` 只返回 **friend + group**（还排除本机自己）；前端「好友」chip
+  严格按 kind，不再有「公众号」分类。
+- `_handoff_candidates()`（接管通知对象 / 活动触达对象）同样只认 friend + group；
+  `get_activation_targets()` 的 revive 和 icebreak 两条 SQL 都用 `kind='friend'`。
+- 判据跨版本漂移时，把误判的 wxid 填进 `config.contact_sync.friend_whitelist`
+  手动拉回好友。
+- **升级后必须重启 dashboard.py**：旧进程每 10 分钟仍会用旧判据跑一次同步，
+  把 `kind` 覆盖回 friend。
 
 ---
 
@@ -524,6 +540,8 @@ python -c "import db_gate; print(db_gate.cleanup_stale())"       :: 清理其他
 | 图片/卡片不显示 | 跑一次 `--media-backfill`；看终端 `[media] 下载失败` 行 |
 | 看板里**自己发的消息在左边、对方的在右边**，同时发送一直失败/一直重发 | 换设备后 `sender_id` 编号变了（它不是固定 2）。先 `python wx_recv_bridge.py --fix-roles --dry-run` 试算，确认后去掉 `--dry-run` 校正历史数据；代码已改为按 `sender_username` 判定，重启 bridge + auto_reply 即生效。详见 RUNBOOK「十、走过的弯路」 |
 | 只看到自己的消息 | 首轮没跑完就被 Ctrl+C 了（自测会话排最前）；重跑等 `[poll]` 汇总行出现 |
+| 「+」里出现没加过好友、只在群里见过的人 | `contact.db` 的 contact 表混着群中陌生人（`local_type=3`）。新版 `sync_contacts` 会标 `stranger` 并从选择器/接管/触达里排除；**确认 dashboard.py 已重启到新版**，否则旧进程每 10 分钟同步一次会把 kind 覆盖回去。手动校验：`python -c "import monitor_store,collections; print(collections.Counter(r['kind'] for r in monitor_store.list_contacts()))"` |
+| 某个确实是好友的人被排除了 | 把他的 wxid 填进 `config.json` → `contact_sync.friend_whitelist`，重启 dashboard 后同步一次 |
 | 启动报 `WeChatDB 初始化失败 ... [WinError 5] 拒绝访问` | 多个进程/多个实例抢同一份解密副本。确认 `dashboard.py` 与 `auto_reply.py` 都重启到新版 `db_gate`；先 `python -c "import db_gate; d=db_gate.get_db(); print(d.workdir)"` 单测能否初始化，再关掉全部 python 进程、清掉 `%TEMP%\wechatauto_db\<账号>\` 下残留的 `.tmp* / -shm / -wal` 重启。详见 RUNBOOK「十、走过的弯路」 |
 
 ---
