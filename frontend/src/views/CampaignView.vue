@@ -82,7 +82,8 @@ async function action(c, act) {
       </div>
       <div class="wb-card">
         <h3>发送对象</h3>
-        <ContactPicker v-model="selected" :contacts="contacts" />
+        <ContactPicker v-model="selected" :contacts="contacts"
+                       @contacts-updated="(v) => store.campaigns.contacts = v" />
       </div>
     </div>
 

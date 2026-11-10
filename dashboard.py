@@ -540,7 +540,12 @@ def api_handoff_config():
 
 
 def _handoff_candidates():
-    """可选通知目标 = **通讯录好友 + 群聊**（陌生人/公众号/系统号一律不算）。"""
+    """可选通知目标 = **通讯录好友 + 群聊**（陌生人/公众号/系统号一律不算）。
+
+    带上 avatar_url：接管页 / 活动页的联系人选择器要用它显头像。头像其实早由
+    _avatar_loop 同步进 avatars 表了，以前这里只返回 conv_id/name/kind，前端拿不到
+    URL 就只能画首字色块 —— 看起来像「头像没同步」，其实是显示链路缺了一截。
+    """
     rows = list_contacts() or []
     out = []
     for r in rows:
@@ -550,9 +555,41 @@ def _handoff_candidates():
         cid = r.get("conv_id") or ""
         if cid == (get_setting("me_wxid") or ""):
             continue                       # 别把通知发给自己
-        out.append({"conv_id": cid, "name": r.get("name") or cid, "kind": kind})
+        av = get_avatar(cid)
+        out.append({
+            "conv_id": cid,
+            "name": r.get("name") or cid,
+            "kind": kind,
+            "avatar_url": (
+                "/api/avatar/%s?v=%s" % (quote(cid, safe=""), av.get("ts") or 0)
+            ) if av else "",
+        })
     out.sort(key=lambda x: (0 if x["kind"] == "group" else 1, x["name"]))
     return out
+
+
+@app.route("/api/avatars/sync", methods=["POST"])
+def api_avatars_sync():
+    """手动触发一次通讯录 + 头像同步（平时 _avatar_loop 每 10 分钟自动跑）。
+
+    给接管页 / 活动页的「同步头像」按钮用：新加的好友不想等下一轮定时同步时，
+    点一下立刻补。读的是本地微信库，微信客户端没开时给人话提示，不抛栈。
+    """
+    try:
+        import db_gate
+        from wx_recv_bridge import sync_avatars, sync_contacts
+        db = db_gate.get_db()
+        sync_contacts(db)
+        got, cached, failed = sync_avatars(db)
+        return jsonify({"ok": True, "downloaded": got, "cached": cached,
+                        "failed": failed, "contacts": _handoff_candidates()})
+    except Exception as e:              # noqa: BLE001
+        log.warning("手动同步头像失败: %s", e)
+        return jsonify({
+            "ok": False,
+            "error": "同步失败：%s。需要微信 PC 客户端在运行、且本地通讯录库可读。"
+                     "可以等后台每 10 分钟自动重试。" % e,
+        }), 500
 
 
 @app.route("/api/handoff/config", methods=["POST"])

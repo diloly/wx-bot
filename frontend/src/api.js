@@ -58,6 +58,16 @@ export const api = {
     return json('/api/friends/import', { method: 'POST', body: fd })
   },
 
+  // ---- 接管 / 活动页共用的联系人选择器 ----
+  // 不用通用 post()：微信没开时后端返回 500 + {ok:false,error:人话}，
+  // 通用封装会直接抛 "HTTP 500" 把可读提示吞掉。这里无论如何都解析响应体。
+  avatarsSync: async () => {
+    const r = await fetch('/api/avatars/sync', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    })
+    return r.json().catch(() => ({ ok: false, error: 'HTTP ' + r.status }))
+  },
+
   // ---- 人工接管 ----
   handoffSave: (config) => post('/api/handoff/config', config),
 

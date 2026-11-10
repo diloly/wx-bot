@@ -82,7 +82,8 @@ async function save() {
 
       <div class="wb-card">
         <h3>通知谁</h3>
-        <ContactPicker v-model="selected" :contacts="contacts" />
+        <ContactPicker v-model="selected" :contacts="contacts"
+                       @contacts-updated="(v) => store.handoff.contacts = v" />
       </div>
     </div>
 
