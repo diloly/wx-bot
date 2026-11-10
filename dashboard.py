@@ -44,8 +44,9 @@ from monitor_store import (
     get_moment_switches, set_moment_switch, get_tasks, task_counts,
     friend_counts, get_friend_tasks, friend_sent_today, get_setting, set_setting,
     count_outreach_since, delete_message, get_avatar,
-    list_contacts,
+    list_contacts, list_handoff_log,
 )
+import handoff
 import outreach_core as oc
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -443,6 +444,57 @@ def api_outreach_toggle():
     on = bool(body.get("enabled"))
     set_setting("outreach_enabled", "1" if on else "0")
     return jsonify({"ok": True, "enabled": on})
+
+
+# ---------------------------------------------------------------------------
+# 人工接管：客户有意向 → 通知选定的群聊/私聊（真人）
+# 配置存在 app_setting，auto_reply 每条消息都重读，看板保存后无需重启主进程。
+# ---------------------------------------------------------------------------
+@app.route("/api/handoff/config")
+def api_handoff_config():
+    conf = handoff.load()
+    return jsonify({
+        "ok": True,
+        "config": conf,
+        "contacts": _handoff_candidates(),
+        "recent": list_handoff_log(30),
+    })
+
+
+def _handoff_candidates():
+    """可选通知目标 = 全部通讯录里的**好友 + 群聊**（公众号/系统号没意义）。"""
+    rows = list_contacts() or []
+    out = []
+    for r in rows:
+        kind = r.get("kind") or "friend"
+        if kind not in ("friend", "group"):
+            continue
+        cid = r.get("conv_id") or ""
+        if cid == (get_setting("me_wxid") or ""):
+            continue                       # 别把通知发给自己
+        out.append({"conv_id": cid, "name": r.get("name") or cid, "kind": kind})
+    out.sort(key=lambda x: (0 if x["kind"] == "group" else 1, x["name"]))
+    return out
+
+
+@app.route("/api/handoff/config", methods=["POST"])
+def api_handoff_config_save():
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "error": "配置格式不对"}), 400
+    targets = body.get("targets") or []
+    if not isinstance(targets, list):
+        return jsonify({"ok": False, "error": "targets 必须是数组"}), 400
+    try:
+        conf = handoff.save(body)
+    except Exception as e:              # noqa: BLE001
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True, "config": conf})
+
+
+@app.route("/api/handoff/log")
+def api_handoff_log():
+    return jsonify({"log": list_handoff_log(50)})
 
 
 @app.route("/api/friends/import", methods=["POST"])

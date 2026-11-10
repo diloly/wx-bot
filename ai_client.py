@@ -464,3 +464,44 @@ def generate(cfg, contact, intent, extra_context="", timeout=60):
         raise
     except Exception as e:  # noqa: BLE001
         raise RuntimeError(f"AI 生成失败：{e}")
+
+
+def classify(cfg, system, user, timeout=20):
+    """轻量二分类/打标：**不套销售系统提示词、不注入知识库**的裸调用。
+
+    给「客户这条消息有没有合作意向」这类判断用。generate() 会把销售人设、
+    产品资料全塞进去，让它回答 YES/NO 既浪费 token 又容易被带偏，所以单独走
+    一条最短路径：temperature=0、max_tokens 给推理模型留够预算、只要一行结论。
+
+    返回清洗后的短文本；调用方自己解析 YES/NO（用 startswith，别要求全等）。
+    """
+    base_url, api_key, model, _sp, _temp, max_tokens, _provider = _resolve(cfg)
+    url = base_url.rstrip("/") + "/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    # 推理模型（gpt-5.x 之类）思维链也吃 max_tokens，给太少会返回空正文，
+    # 与 generate() 里踩过的坑同源；这里直接给够，不搞二次重试。
+    budget = min(max(int(max_tokens or 512) * 3, 1024), 4000)
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0,
+        "max_tokens": budget,
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        resp.raise_for_status()
+        content, why = _extract_content(resp.json())
+        if not content:
+            raise RuntimeError("分类调用返回空内容（%s）" % why)
+        return _clean(content)
+    except requests.exceptions.ConnectionError:
+        raise RuntimeError("连不上大模型服务（%s），无法做意向判定" % url)
+    except RuntimeError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError("意向判定调用失败：%s" % e)

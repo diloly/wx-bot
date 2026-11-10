@@ -54,6 +54,7 @@ import sys
 import time
 
 import monitor_store
+from progress_bar import Progress
 
 try:
     from wechatauto import WeChatDB
@@ -752,6 +753,9 @@ def poll_new(db, progress=False):
     sessions = db.get_sessions(limit=SESSION_LIMIT)
     total = len(sessions)
     n_baseline = n_incr = 0
+    # 进度条：TTY 原地重绘；日志/管道里只留一行汇总（原来每会话一行太吵）
+    bar = Progress("scan", total, enabled=bool(progress))
+    say = bar.echo
     get_new = getattr(db, "get_new_messages", None)  # 老版本库没有则回退全量
     for idx, s in enumerate(sessions, 1):
         user = s.get("username")
@@ -761,6 +765,7 @@ def poll_new(db, progress=False):
             name = db.get_nickname(user) or user
         except Exception:
             name = user
+        bar.update(idx, name)
         _name_cache[user] = name        # 供 _sync_names 定期回写（改备注后看板要跟着变）
         cursor = monitor_store.get_cursor(user)
         try:
@@ -768,12 +773,11 @@ def poll_new(db, progress=False):
                 msgs = get_new(user, since_seq=cursor["max_seq"])
                 n_incr += 1
             else:
-                if progress:
-                    print("[scan] %d/%d %s（首次建基线）" % (idx, total, name))
+                bar.update(detail=name + "（建基线）")
                 msgs = db.get_messages(user, limit=PER_SESSION_LIMIT)
                 n_baseline += 1
         except Exception as e:
-            print("[!] 读取会话失败 %s: %s" % (user, e))
+            say("[!] 读取会话失败 %s: %s" % (user, e))
             continue
         for m in msgs:
             text = msg_text(m)
@@ -825,7 +829,7 @@ def poll_new(db, progress=False):
                         text = "[动画表情]"
                     elif mtype == "视频":
                         text = "[视频]"
-                    print("[media] + %s %s -> %s" % (name, mtype, media_rel))
+                    say("[media] + %s %s -> %s" % (name, mtype, media_rel))
             # 群聊消息补发送者前缀（卡片已由 card.sender 承载，不重复拼）
             if sender_name and not card_json:
                 text = "%s: %s" % (sender_name, text)
@@ -839,10 +843,10 @@ def poll_new(db, progress=False):
                         "conv_id": user, "name": name, "text": text,
                         "ts": ts, "type": m.get("type"), "role": role,
                     })
-                    print("[store] + [%s][%s] %s"
-                          % (name, "我" if self_msg else "对方", text[:60]))
+                    say("[store] + [%s][%s] %s"
+                        % (name, "我" if self_msg else "对方", text[:60]))
             except Exception as e:
-                print("[!] 写入失败 %s: %s" % (user, e))
+                say("[!] 写入失败 %s: %s" % (user, e))
         # 推进水印：max_seq 取本批最大值（不小于旧值）；last_time 用会话表的值
         max_seq = cursor["max_seq"] if cursor else 0
         for m in msgs:
@@ -853,10 +857,12 @@ def poll_new(db, progress=False):
             if seq > max_seq:
                 max_seq = seq
         monitor_store.set_cursor(user, s.get("last_time") or 0, max_seq)
+    # 先收掉进度条，再让 _sync_names 之类的普通 print 正常输出
+    bar.update(total, "完成")
+    bar.close("[poll] 扫描 %d 会话（基线 %d / 增量 %d），新增 %d 条，耗时 %.1fs"
+              % (total, n_baseline, n_incr, len(new_items), time.time() - t0)
+              if progress else "")
     _sync_names()      # 低频：把改过的备注/昵称同步回看板会话名
-    if progress:
-        print("[poll] 扫描 %d 会话（基线 %d / 增量 %d），耗时 %.1fs"
-              % (total, n_baseline, n_incr, time.time() - t0))
     return new_items
 
 
@@ -1008,7 +1014,8 @@ def main():
         print("[avatar] 头像/通讯录同步异常（不影响收消息）: %s" % e)
 
     print("[*] 收消息桥启动，每 %ds 轮询一次（Ctrl+C 停止）" % args.interval)
-    print("[*] 首轮要全量解密全部数据库，可能数分钟；之后每轮秒级。进度见 [scan] 行")
+    print("[*] 首轮要全量解密全部数据库，可能数分钟；之后每轮秒级。"
+          "扫描进度在终端单行刷新，日志里每轮只留一行汇总")
     while True:
         try:
             n = poll_once(db, progress=True)

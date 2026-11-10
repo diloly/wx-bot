@@ -148,7 +148,24 @@
   .dotst.generating i, .dotst.generated i, .dotst.sending i { background: #3f7fd0; }
   .dotst.sent i, .dotst.passed i { background: #07c160; }
   .dotst.failed i, .dotst.rejected i, .dotst.expired i { background: #e05252; }
+  .dotst.handoff i { background: #b06be0; }
   .dotst.already i { background: #9aa0a8; }
+
+  .ho-list { max-height: 296px; overflow: auto; border: 1px solid #e6e8eb; border-radius: 8px; margin-top: 8px; }
+  .ho-row { display: flex; align-items: center; gap: 9px; padding: 8px 11px; border-bottom: 1px solid #f0f1f3; font-size: 12px; cursor: pointer; }
+  .ho-row:last-child { border-bottom: none; }
+  .ho-row:hover { background: #f7f8fa; }
+  .ho-row input { width: 15px; height: 15px; accent-color: #07c160; flex-shrink: 0; }
+  .ho-kind { font-size: 11px; padding: 1px 6px; border-radius: 4px; background: #eef0f2; color: #8a9099; flex-shrink: 0; }
+  .ho-kind.group { background: #e8f0fe; color: #3568c4; }
+  .ho-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 14px; }
+  .ho-field { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #576b95; min-width: 0; }
+  .ho-field > label { min-width: 86px; flex-shrink: 0; }
+  .ho-field input[type=number], .ho-field select { flex: 1; min-width: 0; padding: 5px 7px; border: 1px solid #dcdfe4; border-radius: 6px; font-size: 12px; background: #fff; color: #1f2329; }
+  .ho-field.check { min-width: 0; }
+  .ho-field.check input { accent-color: #07c160; }
+  .ho-saved { font-size: 12px; color: #12864a; }
+  .ho-log .tr { font-size: 12px; }
 
   /* 窄屏：两栏卡片改单栏，列表列宽压缩 */
   @media (max-width: 980px) {
@@ -336,6 +353,7 @@
   }
   .bytag.ai { background: #e8f0fe; color: #3568c4; }
   .bytag.human { background: #eef0f2; color: #8a9099; }
+  .bytag.handoff { background: #f2e8fe; color: #8d4bc4; }
 
   /* 群聊卡片的真实发送者（普通文本消息靠「昵称: 」前缀，卡片会丢，故单独渲染） */
   .bubble .msg-sender { font-size: 11px; color: #9a9a9a; margin: -2px 0 6px; }
@@ -549,6 +567,7 @@
       <button class="nav-item" id="navMoment" onclick="navTo('moment')">朋友圈<span class="nav-badge" id="momentBadge" style="display:none"></span></button>
       <button class="nav-item" id="navFriends" onclick="navTo('friends')">加好友<span class="nav-badge" id="friendBadge" style="display:none"></span></button>
       <button class="nav-item" id="navTasks" onclick="navTo('tasks')">维护任务<span class="nav-badge" id="taskBadge" style="display:none"></span></button>
+      <button class="nav-item" id="navHandoff" onclick="navTo('handoff')">人工接管</button>
     </nav>
     <div class="nav-hint" id="arBanner"></div>
   </header>
@@ -617,6 +636,64 @@
           <div class="chips" id="taskChips"></div>
         </div>
         <section class="pcard"><div class="tbl" id="taskList"></div></section>
+      </div>
+
+      <!-- 人工接管：客户有意向 → 通知真人（选群聊 + 私聊），配置存库实时生效 -->
+      <div class="page" id="handoffPage" style="display:none">
+        <div class="page-head">
+          <div>
+            <h2>人工接管</h2>
+            <p class="sub">激活后客户表现出意向 → 自动给选定的群聊 / 私聊（真人）发一条通知，并交出这个会话。</p>
+          </div>
+          <label class="switch-lg">
+            <input type="checkbox" id="hoEnabled" onchange="updateHoState()">
+            <span>启用接管</span>
+            <em id="hoState">—</em>
+          </label>
+        </div>
+        <div class="grid2">
+          <section class="pcard">
+            <h3>① 通知发给谁 <span class="muted" id="hoCount"></span></h3>
+            <p class="muted">从微信通讯录里勾选，群聊和私聊可同时选。保存后主进程立即生效，<b>不用重启</b>。</p>
+            <input class="q" id="hoSearch" placeholder="搜索名字" oninput="renderHoTargets()"
+                   style="width:100%;box-sizing:border-box;margin-top:8px">
+            <div class="picker-tags" id="hoFilters"></div>
+            <div class="ho-list" id="hoTargets"></div>
+          </section>
+          <section class="pcard">
+            <h3>② 判定与动作</h3>
+            <div class="ho-form">
+              <div class="ho-field"><label>观察范围</label>
+                <select id="hoScope">
+                  <option value="activated">仅近期激活过的会话</option>
+                  <option value="all">所有客户回复</option>
+                </select></div>
+              <div class="ho-field"><label>激活观察期</label>
+                <input type="number" id="hoDays" min="1" max="90" step="1"> <span>天</span></div>
+              <div class="ho-field"><label>意向判定</label>
+                <select id="hoDetector">
+                  <option value="ai">AI 二分类（推荐）</option>
+                  <option value="keywords">关键词（零成本）</option>
+                </select></div>
+              <div class="ho-field"><label>通知冷却</label>
+                <input type="number" id="hoCooldown" min="1" max="720" step="1"> <span>小时</span></div>
+              <label class="ho-field check"><input type="checkbox" id="hoPause"> 通知后暂停该会话自动回复</label>
+              <label class="ho-field check"><input type="checkbox" id="hoSkip"> 本次不自动回客户（留给真人）</label>
+            </div>
+            <p class="muted" style="margin-top:10px">
+              AI 判定是独立的一次轻量调用，不套销售话术也不查知识库，只要一行 YES/NO；
+              模型调不通会自动降级关键词。冷却期内同一客户只通知一次。
+            </p>
+            <div class="row-btns">
+              <button class="btn" onclick="saveHoConfig()">保存配置</button>
+              <span class="ho-saved" id="hoSaved"></span>
+            </div>
+          </section>
+        </div>
+        <section class="pcard" style="margin-top:14px">
+          <h3>③ 最近接管记录</h3>
+          <div class="tbl ho-log" id="hoLog"></div>
+        </section>
       </div>
     </main>
   </div>
@@ -1037,12 +1114,13 @@ function sigOf(m) {
   return [m.role, m.ts, m.text || '', m.media || '', m.card || '', m.sent_by || ''].join('\u0001');
 }
 
-// 「谁发的」小标：AI=蓝，人工=灰。sent_by 为空（历史消息 / 手机端发的）不标，
-// 宁可不标也不标错——AI 的标只认账本，认不出来就留白。
+// 「谁发的」小标：AI=蓝，人工=灰，接管通知=紫。sent_by 为空（历史消息 /
+// 手机端发的）不标，宁可不标也不标错——AI 的标只认账本，认不出来就留白。
 function byTag(m) {
   if (m.role !== 'me') return '';
   if (m.sent_by === 'ai') return '<span class="bytag ai">AI</span>';
   if (m.sent_by === 'manual') return '<span class="bytag human">人工</span>';
+  if (m.sent_by === 'handoff') return '<span class="bytag handoff">接管通知</span>';
   return '';
 }
 
@@ -1174,13 +1252,13 @@ function fmtTime(ts){
 }
 
 /* ==================== 朋友圈轻互动 ==================== */
-let activeView = 'chat';       // 'chat' | 'moment' | 'friends' | 'tasks'
+let activeView = 'chat';       // 'chat' | 'moment' | 'friends' | 'tasks' | 'handoff'
 let momentData = null;         // /api/moments 最近一次响应
 let activeMoment = null;       // 当前打开的圈 tid
 let momentView = 'panel';      // 'panel'=自动互动管理 | 'detail'=圈详情
 let momentSigs = '';           // 增量渲染签名（与消息区同理，免打扰复制/滚动）
 
-const VIEW_NAV = { chat: 'navChat', moment: 'navMoment', friends: 'navFriends', tasks: 'navTasks' };
+const VIEW_NAV = { chat: 'navChat', moment: 'navMoment', friends: 'navFriends', tasks: 'navTasks', handoff: 'navHandoff' };
 
 function navTo(view) {
   activeView = view;
@@ -1197,6 +1275,7 @@ function navTo(view) {
   document.getElementById('momentPane').style.display = view === 'moment' ? 'flex' : 'none';
   document.getElementById('friendPage').style.display = view === 'friends' ? 'block' : 'none';
   document.getElementById('taskPage').style.display = view === 'tasks' ? 'block' : 'none';
+  document.getElementById('handoffPage').style.display = view === 'handoff' ? 'block' : 'none';
   // 空会话提示：opened 会话后 chatPane 已被整体重写，这个节点可能不存在
   const et = document.getElementById('emptyTip');
   if (et) et.style.display = (view === 'chat' && !activeConv) ? 'flex' : 'none';
@@ -1208,6 +1287,8 @@ function navTo(view) {
     loadFriends();
   } else if (view === 'tasks') {
     loadTasks();
+  } else if (view === 'handoff') {
+    loadHoConfig();
   }
 }
 
@@ -1508,7 +1589,8 @@ async function readInteractions() {
    不做取消/插队——只看得见。 */
 const TASK_LABEL = {
   pending: '待生成', generating: '生成中', generated: '待发送',
-  sending: '发送中', sent: '已发送', failed: '失败', expired: '已作废'
+  sending: '发送中', sent: '已发送', failed: '失败', expired: '已作废',
+  handoff: '已转人工'
 };
 
 function setNavBadge(id, n) {
@@ -1540,6 +1622,7 @@ function renderTaskChips(c) {
   if (c.open) bits.push(`<span class="chip ok">进行中 ${c.open}</span>`);
   if (c.failed) bits.push(`<span class="chip bad">失败 ${c.failed}</span>`);
   if (c.expired) bits.push(`<span class="chip">作废 ${c.expired}</span>`);
+  if (c.handoff) bits.push(`<span class="chip">转人工 ${c.handoff}</span>`);
   if (!bits.length) bits.push(`<span class="chip">当前空闲</span>`);
   document.getElementById('taskChips').innerHTML = bits.join('');
 }
@@ -1671,6 +1754,132 @@ function renderFriendList(tasks) {
     </div>`;
   }).join('');
   box.innerHTML = tblHead(['状态', '客户', '备注 / 原因', '时间']) + rows;
+}
+
+// ---------------------------------------------------------------------------
+// 人工接管配置页（目标选择 + 判定参数 + 接管记录）
+// 只在切到本页时拉一次，绝不进 2s 轮询——否则正在勾选/输入会被反复重绘冲掉。
+// ---------------------------------------------------------------------------
+let hoConf = null, hoContacts = [], hoSel = new Set(), hoFilter = 'all';
+
+async function loadHoConfig() {
+  try {
+    const d = await (await fetch('/api/handoff/config')).json();
+    hoConf = d.config || {};
+    hoContacts = d.contacts || [];
+    hoSel = new Set((hoConf.targets || []).map(t => t.conv_id));
+    const $ = id => document.getElementById(id);
+    $('hoEnabled').checked = !!hoConf.enabled;
+    $('hoScope').value = hoConf.watch_scope || 'activated';
+    $('hoDays').value = hoConf.watch_days ?? 7;
+    $('hoDetector').value = hoConf.detector || 'ai';
+    $('hoCooldown').value = hoConf.cooldown_hours ?? 24;
+    $('hoPause').checked = hoConf.pause_auto_reply !== false;
+    $('hoSkip').checked = hoConf.skip_ai_reply !== false;
+    $('hoSaved').textContent = '';
+    renderHoFilters(); renderHoTargets(); renderHoLog(d.recent || []);
+    updateHoState();
+  } catch (e) {
+    document.getElementById('hoSaved').textContent = '读取配置失败: ' + e;
+  }
+}
+
+function updateHoState() {
+  const on = document.getElementById('hoEnabled').checked;
+  const n = hoSel.size;
+  document.getElementById('hoState').textContent =
+    !on ? '已停用' : (n ? `已启用 · 通知 ${n} 处` : '已启用 · 未选通知对象');
+  document.getElementById('hoCount').textContent = n ? `（已选 ${n} 个）` : '（还没选）';
+}
+
+function setHoFilter(k) { hoFilter = k; renderHoFilters(); renderHoTargets(); }
+
+function renderHoFilters() {
+  const g = hoContacts.filter(c => c.kind === 'group').length;
+  const defs = [
+    ['all', '全部 ' + hoContacts.length], ['group', '群聊 ' + g],
+    ['friend', '私聊 ' + (hoContacts.length - g)], ['selected', '已选 ' + hoSel.size]
+  ];
+  document.getElementById('hoFilters').innerHTML = defs.map(([k, label]) =>
+    `<button class="tagchip ${hoFilter === k ? 'on' : ''}" onclick="setHoFilter('${k}')">${label}</button>`
+  ).join('');
+}
+
+function renderHoTargets() {
+  const q = (document.getElementById('hoSearch').value || '').trim().toLowerCase();
+  const rows = hoContacts.filter(c => {
+    if (hoFilter === 'selected' && !hoSel.has(c.conv_id)) return false;
+    if ((hoFilter === 'group' || hoFilter === 'friend') && c.kind !== hoFilter) return false;
+    return !q || (c.name || '').toLowerCase().includes(q) || c.conv_id.toLowerCase().includes(q);
+  });
+  const box = document.getElementById('hoTargets');
+  if (!rows.length) { box.innerHTML = '<div class="blank" style="padding:14px">没有匹配的联系人</div>'; return; }
+  box.innerHTML = rows.map(c => `<label class="ho-row">
+    <input type="checkbox" data-cid="${esc(c.conv_id)}" ${hoSel.has(c.conv_id) ? 'checked' : ''}
+           onchange="toggleHoTarget(this.dataset.cid, this.checked)">
+    <span class="ho-kind ${c.kind === 'group' ? 'group' : ''}">${c.kind === 'group' ? '群聊' : '私聊'}</span>
+    <span>${esc(c.name)}</span>
+  </label>`).join('');
+}
+
+function toggleHoTarget(cid, on) {
+  if (on) hoSel.add(cid); else hoSel.delete(cid);
+  renderHoFilters(); updateHoState();
+  // 不整表重绘：只是勾选变化，保持搜索框与滚动位置不动
+}
+
+function hoTargetPayload() {
+  const byId = new Map(hoContacts.map(c => [c.conv_id, c]));
+  const saved = new Map((hoConf.targets || []).map(t => [t.conv_id, t]));
+  return [...hoSel].map(cid => byId.get(cid) || saved.get(cid) ||
+    { conv_id: cid, name: cid, kind: 'friend' });
+}
+
+async function saveHoConfig() {
+  const $ = id => document.getElementById(id);
+  const num = (id, fallback) => Math.max(1, Number($(id).value) || fallback);
+  const body = {
+    enabled: $('hoEnabled').checked,
+    targets: hoTargetPayload(),
+    watch_scope: $('hoScope').value,
+    watch_days: num('hoDays', 7),
+    detector: $('hoDetector').value,
+    cooldown_hours: num('hoCooldown', 24),
+    pause_auto_reply: $('hoPause').checked,
+    skip_ai_reply: $('hoSkip').checked
+  };
+  $('hoSaved').textContent = '保存中…';
+  try {
+    const r = await fetch('/api/handoff/config', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.error || '保存失败');
+    hoConf = d.config;
+    $('hoSaved').textContent = '已保存，主进程立即生效';
+    setTimeout(() => { if ($('hoSaved')) $('hoSaved').textContent = ''; }, 4000);
+    updateHoState();
+  } catch (e) { $('hoSaved').textContent = '保存失败: ' + e; }
+}
+
+function renderHoLog(rows) {
+  const box = document.getElementById('hoLog');
+  if (!rows.length) {
+    box.innerHTML = '<div class="blank">还没有接管记录。客户出现明确意向并成功通知后，这里会留一条账。</div>';
+    return;
+  }
+  const html = rows.map(r => {
+    let names = '';
+    try { names = (JSON.parse(r.targets || '[]') || []).map(t => t.name).join('、'); } catch (e) { }
+    return `<div class="tr">
+      <span class="name">${esc(r.customer || '')}</span>
+      <span class="sub2">${esc(String(r.quote || '').slice(0, 42))}</span>
+      <span class="sub2">${esc((r.reason || '') + (names ? ' → ' + names : ''))}</span>
+      <span class="time">${esc(fmtTime(r.ts))}${r.paused ? ' · 已暂停' : ''}</span>
+    </div>`;
+  }).join('');
+  box.innerHTML = tblHead(['客户', '原话', '判定 / 通知到', '时间']) + html;
 }
 
 setInterval(() => {

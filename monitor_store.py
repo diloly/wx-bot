@@ -191,6 +191,18 @@ def _init_schema(path=None):
             kind    TEXT,               -- friend / group / official / system
             ts      INTEGER
         );
+        -- 人工接管记录（2026-11-09）：客户有意向 → 通知真人 → 留一条账。
+        -- 兼做「同一会话冷却期」判据，防止客户连说两句就刷屏通知内部群。
+        CREATE TABLE IF NOT EXISTS handoff_log (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            conv_id  TEXT,               -- 客户会话
+            customer TEXT,
+            quote    TEXT,               -- 触发接管的客户原话
+            reason   TEXT,               -- 判定依据（AI 结论 / 命中关键词）
+            targets  TEXT,               -- JSON：本次通知发给了谁
+            paused   INTEGER DEFAULT 0,  -- 是否同时关掉了该会话自动回复
+            ts       INTEGER
+        );
         """
     )
     # 老库可能没有 msg_hash / media / card / sent_by 列，补齐（ALTER 不支持 IF NOT EXISTS，用异常吞掉已存在）
@@ -882,7 +894,7 @@ def _jload(s):
 # 状态机：pending → generating → generated → sending → sent
 #         任一环节失败/超时 → failed / expired（终态）
 TASK_OPEN = ("pending", "generating", "generated", "sending")   # 未终态
-TASK_DONE = ("sent", "failed", "expired")                       # 终态
+TASK_DONE = ("sent", "failed", "expired", "handoff")          # 终态
 
 
 def add_task(conv_id, name, text, deadline, kind="reply", created=None):
@@ -1409,5 +1421,63 @@ def set_setting(k, v):
         conn.execute("INSERT OR REPLACE INTO app_setting(k, v) VALUES(?, ?)",
                      (k, "" if v is None else str(v)))
         conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 人工接管（客户有意向 → 通知真人，2026-11-09）
+# ---------------------------------------------------------------------------
+def has_recent_outreach(conv_id, since_ts):
+    """这个会话最近有没有被我们主动激活/触达过。
+
+    「激活后客户才回的话」是接管检测的重点：只对这类会话做意向判定，
+    既贴合业务，也避免每条普通消息都多调一次模型。
+    """
+    conn = init()          # 新库第一次用到时自动建 handoff_log
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM reply_task WHERE conv_id=? AND kind='outreach' "
+            "AND status='sent' AND created>=? "
+            "AND COALESCE(reason,'') NOT LIKE 'dry-run%' LIMIT 1",
+            (conv_id, int(since_ts))).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def last_handoff_ts(conv_id):
+    conn = init()
+    try:
+        row = conn.execute("SELECT MAX(ts) AS t FROM handoff_log WHERE conv_id=?",
+                           (conv_id,)).fetchone()
+        return int(row["t"] or 0)
+    finally:
+        conn.close()
+
+
+def add_handoff_log(conv_id, customer, quote, reason, targets, paused, ts=None):
+    import json
+    conn = init()
+    try:
+        cur = conn.execute(
+            "INSERT INTO handoff_log(conv_id, customer, quote, reason, targets, paused, ts) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (conv_id, customer, quote, reason,
+             json.dumps(targets or [], ensure_ascii=False), 1 if paused else 0,
+             int(ts or time.time())))
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def list_handoff_log(limit=30):
+    conn = init()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM handoff_log ORDER BY ts DESC LIMIT ?",
+            (int(limit),)).fetchall()
+        return [dict(r) for r in rows]
     finally:
         conn.close()

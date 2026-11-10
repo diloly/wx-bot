@@ -59,6 +59,7 @@ import sys
 import threading
 import time
 
+import handoff
 import monitor_store
 import outreach_core as oc
 import ui_gate
@@ -83,10 +84,10 @@ class ReplyTask:
     排了别人就无限期挂着。
     """
     __slots__ = ("id", "conv_id", "name", "text", "created", "deadline", "reply",
-                 "kind", "at_name", "variant")
+                 "kind", "at_name", "variant", "by")
 
     def __init__(self, conv_id, name, text, timeout, task_id=None, kind="reply",
-                 at_name=None, variant="revive"):
+                 at_name=None, variant="revive", by="ai"):
         self.id = task_id          # reply_task 表主键（落库后回填；None=未落库）
         self.conv_id = conv_id
         self.name = name
@@ -99,6 +100,8 @@ class ReplyTask:
         self.at_name = at_name
         # 主动触达子类型：revive=承接旧话题 / icebreak=从没聊过的破冰
         self.variant = variant
+        # 消息库里的「谁发的」标签：ai / manual / handoff（内部接管通知）
+        self.by = by
 
     def remaining(self):
         return self.deadline - time.time()
@@ -793,12 +796,78 @@ class AutoReplier:
             except Exception as e:      # noqa: BLE001 —— worker 绝不能因单条异常退出
                 print("[auto] AI 环节异常(%s): %s" % (task.name, e))
 
+    # ---------- 人工接管：客户有意向就通知真人、让出会话 ----------
+    def _maybe_handoff(self, task):
+        """返回 True = 这条已转人工，调用方不要再生成/发送自动回复。
+
+        闸门顺序刻意从便宜到贵：开关 → 有没有配通知对象 → 是不是激活过的会话 →
+        冷却期 → 最后才调模型做意向判定。任一步不满足就安静返回，绝不影响
+        正常回复链路；`handoff` 整个模块出任何异常也都被吞在这里。
+        """
+        if task.kind != "reply":
+            return False
+        # 接管只针对 1 对 1 客户会话。群里一句 @ 就关掉整个群的自动回复、
+        # 再往内部群发通知，动静太大且容易误判。
+        if task.conv_id.endswith(GROUP_SUFFIX):
+            return False
+        try:
+            conf = handoff.load(self.cfg)
+            if not conf["enabled"] or not conf["targets"]:
+                return False
+            if not handoff.in_scope(task.conv_id, conf):
+                return False
+            if handoff.cooling(task.conv_id, conf):
+                return False
+            ok, reason = handoff.detect(self.cfg, conf, task.text)
+            if not ok:
+                return False
+
+            name = (task.name or task.conv_id).strip()
+            paused = bool(conf["pause_auto_reply"])
+            text = handoff.notice(name, task.text, reason, paused)
+            if paused:
+                try:
+                    monitor_store.set_switch(task.conv_id, False)
+                    self.switches[task.conv_id] = False
+                except Exception as e:      # noqa: BLE001
+                    print("[handoff] 暂停自动回复失败（继续通知）: %s" % e)
+                    paused = False
+
+            # 通知走的是同一条发送队列：UI 独占门、三态回读校验、账本全都现成。
+            # kind='handoff' 不进 count_outreach_since，不占主动触达额度。
+            delivered = []
+            for t in conf["targets"]:
+                nt = ReplyTask(t["conv_id"], t["name"], "", self.task_timeout,
+                               kind="handoff", by="handoff")
+                nt.reply = text
+                nt.id = self._task_open(nt)
+                try:
+                    self._send_q.put_nowait(nt)
+                    delivered.append(t)
+                except queue.Full:
+                    self._task_set(nt, "failed", reason="接管通知队列已满")
+                    print("[handoff] 待发送队列已满，没通知到 %s" % t["name"])
+            handoff.log(task.conv_id, name, task.text, reason, delivered, paused)
+            print("[handoff] %s 判定有意向（%s）→ 通知 %d 处，%s"
+                  % (name, reason, len(delivered),
+                     "已暂停自动回复" if paused else "自动回复保持开启"))
+            self._task_set(task, "handoff", reason="已转人工接管：%s" % reason)
+            # 一个通知都没投出去就不算接管成功，让机器人照常回客户，别晾着他
+            return bool(delivered) and bool(conf["skip_ai_reply"])
+        except Exception as e:          # noqa: BLE001 —— 接管绝不能拖垮回复主流程
+            print("[handoff] 判定异常（按未命中处理）: %s" % e)
+            return False
+
     def _generate(self, task):
         """一条任务的大模型环节：过拟人节流 → 调 AI → 投递到待发送队列。"""
         if task.expired():
             print("[auto] 任务超时未生成（预算 %.0fs 已耗尽）: %s"
                   % (self.task_timeout, task.name))
             self._task_set(task, "expired", reason="预算耗尽（未生成）")
+            return
+        # 意向识别放在 AI 生成之前：命中就直接转真人，不再生成机器人回复。
+        # 只对客户主动发来的消息判定，主动触达/首条激活本身不进这个分支。
+        if self._maybe_handoff(task):
             return
         self._task_set(task, "generating")     # 账本：AI 线程已接手
         # 拟人节流（wechatauto rhythm）：写动作前统一过闸——两次写动作最小间隔
@@ -946,7 +1015,7 @@ class AutoReplier:
             try:
                 self.bot.send_to_contact(task.name, task.reply,
                                          conv_id=task.conv_id, ui_timeout=rem,
-                                         by="ai",   # 看板打「AI」标，别和人工发混在一起
+                                         by=task.by,   # ai / manual / handoff
                                          confirm=self._confirm_sent,
                                          at_name=task.at_name)   # 群聊：发送前先 @ 提问者
             except ui_gate.UITimeoutError as e:
@@ -1336,7 +1405,8 @@ class AutoReplier:
                      "开" if self.ou_include_new else "关"))
         else:
             print("[auto] 主动触达未启用（config.outreach.enabled=false）：不会主动给客户发消息")
-        print("[auto] 首轮要全量解密全部数据库，可能数分钟；之后每轮秒级。进度见 [scan] 行")
+        print("[auto] 首轮要全量解密全部数据库，可能数分钟；之后每轮秒级。"
+              "扫描进度在终端单行刷新，日志里每轮只留一行汇总")
         # 朋友圈轮询（读路线：MomentDB 解密 sns.db，零 UI；写操作默认手动，
         # 开了客户自动开关（moment_switch）才对新圈自动点赞/评论）
         self._moment_ops = None
