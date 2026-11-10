@@ -29,10 +29,10 @@
 
 ## 二、一次性准备
 
-1. `pip install wechatauto-replica`（已完成）
-2. `wechatauto 体检`（已完成：数据库密钥 20/20、图片密钥 OK；控件树缺失只影响 GUI 发送，不影响本路径）
+1. `pip install -r requirements.txt`（依赖清单在 `requirements.txt`，环境自选）
+2. `wechatauto 体检`（数据库密钥 20/20、图片密钥 OK；控件树缺失只影响 GUI 发送，不影响本路径）
 3. 编辑 `ai_secrets.json`（**AI 配置统一在这一个文件**，含 api_key，不要外发/截图；已加入 .gitignore）：
-   - `provider` / `model`：当前为 `custom` + `your-model`（`base_url` 自带 `/v1`，代码不拼）
+   - `provider` / `model`：填你自己接入的 OpenAI 兼容服务与模型名
    - 接自定义/云端大模型时：`provider` 设 `custom`，`base_url` 写全端点（**自带 `/v1`，代码不拼**），`model` 写该服务实际支持的模型名
    - `system_prompt` / `temperature` / `max_tokens`：可选，不填用代码内置默认
    编辑 `config.json`：
@@ -43,48 +43,39 @@
 
 ## 三、日常运行（三个终端）
 
-> **解释器**：依赖装在 `<Python 环境>`，必须用
-> `"python" 脚本.py` 启动；直接敲 `python` 会落到系统
-> Python 并报 `ModuleNotFoundError: No module named 'requests'`。
-> 先 `cd <项目根目录>` 最稳妥（配置、密钥、知识库、消息库都按脚本
-> 目录定位，不受 cwd 影响，但日志与相对路径的输出以项目根为准）。
-> 下文命令里的 `python` 一律指该 conda 解释器。
+> **环境**：Python 3.10+，用你自己的虚拟环境（venv / conda / 系统 Python 均可），
+> 激活后 `pip install -r requirements.txt`。下文命令里的 `python` 一律指
+> **你当前激活的解释器**，不绑定任何具体路径、盘符或环境名。
+> 所有命令在**项目根目录**（clone 下来的那个目录）执行；配置、密钥、知识库、
+> 消息库都按脚本所在目录定位，日志与相对路径输出以项目根为准。
 >
 > **只看看板时只需终端 A**：dashboard 是只读的，不抢微信焦点、不发消息。
 > 前端构建产物 `static/dist/` 已入库，**不需要装 node、不需要 npm run build**；
 > 打开 http://localhost:5000 是 Vue 新版，`/legacy` 是旧版回退。
 
 **终端 A — 看板（常开，最小启动）**
-```powershell
-cd <项目根目录>
-$PY = "python"
-& $PY dashboard.py
+```
+python dashboard.py
 ```
 
 **终端 B — 收消息 + AI 自动回复（二选一）**
-```powershell
-cd <项目根目录>
-$PY = "python"
-
-& $PY wx_recv_bridge.py          # B1 只收不发（纯监控上屏，不调 AI、不碰 UI）
-& $PY auto_reply.py              # B2 演练：当前 dry_run=true，AI 生成但不发送
-& $PY auto_reply.py --no-dry     # B2 真发：抢键鼠焦点，运行时别碰电脑
+```
+python wx_recv_bridge.py          # B1 只收不发（纯监控上屏，不调 AI、不碰 UI）
+python auto_reply.py              # B2 演练：默认 dry_run=true，AI 生成但不发送
+python auto_reply.py --no-dry     # B2 真发：抢键鼠焦点，运行时别碰电脑
 ```
 
-> 当前 `config.json` 是 `auto_reply.enabled=true` + `dry_run=true`：
+> 默认 `config.json` 是 `auto_reply.enabled=true` + `dry_run=true`：
 > 会收消息、生成回复、写任务账本，**不会真发**。真发只能靠显式 `--no-dry`。
 > 终端 A / B 都必须是带 `db_gate` 的新版（WeChatDB 解密副本按进程隔离）。
 
 **终端 C — 主动外发 / 存量激活（按需）**
-```powershell
-cd <项目根目录>
-$PY = "python"
-
-& $PY wechat_ui.py --inspect
-& $PY wechat_ui.py --send --template followup --tag old --no-dry
-& $PY wechat_ui.py --send --ai --intent "周末问候" --tag vip --no-dry
-& $PY wechat_ui.py --schedule --no-dry
-& $PY activate.py                 # 只列候选；--preview 出文案；--send 才真发
+```
+python wechat_ui.py --inspect
+python wechat_ui.py --send --template followup --tag old --no-dry
+python wechat_ui.py --send --ai --intent "周末问候" --tag vip --no-dry
+python wechat_ui.py --schedule --no-dry
+python activate.py                 # 只列候选；--preview 出文案；--send 才真发
 ```
 
 > **首次运行注意**：首轮要全量解密全部数据库 + 为每个新会话建基线（分钟级、一次性，之后每轮秒级）。
@@ -102,12 +93,12 @@ $PY = "python"
 - 图片密钥链：cfgDword 派生 → 本地缓存（体检时已拿到）→ 内存扫描，**离线可用**。
 - 历史消息补渲染（一次性，幂等可重跑；先存了占位的旧记录也补上）：
   ```
-  python <项目根目录>\wx_recv_bridge.py --media-backfill --depth 50
+  python wx_recv_bridge.py --media-backfill --depth 50
   ```
 - **原图模式**（`--original`，仅限手动回填）：图片强制下载 `_h.dat` 真原件（清晰），
   但会**驱动微信界面**（点开气泡、滚动消息列表）——运行时勿操作电脑；
   不想滚界面加 `--no-scroll-original`。轮询路径只走本地解密档，绝不碰界面。
-- 群聊发送者显示名：**微信群备注优先于昵称**（「某总」优于「本名」），
+- 群聊发送者显示名：**微信群备注优先于昵称**（如「某总」优于本名），
   群成员表 5 分钟缓存（`_group_member_name`），刚改的备注下一轮生效。
 - **卡片仿微信四段式**：标题（2 行截断）+ 大小/描述 + 右侧类型图标
   （PDF 红 / W 蓝 / X 绿；app 分享用首字母占位）+ 底栏来源（微信电脑版 / 千问APP / 腾讯会议）；
@@ -225,9 +216,9 @@ $PY = "python"
 ## 六、聊天记录备份（export_history.py）
 
 ```
-python <项目根目录>\export_history.py                    # 全量导出 backups/history_时间戳.json
-python <项目根目录>\export_history.py --user wxid_xxx    # 只导指定会话
-python <项目根目录>\export_history.py --limit 500        # 每会话上限
+python export_history.py                    # 全量导出 backups/history_时间戳.json
+python export_history.py --user wxid_xxx    # 只导指定会话
+python export_history.py --limit 500        # 每会话上限
 ```
 
 - wechatauto 的 `export_history` 封装；输出含**客户聊天内容**，属敏感数据：

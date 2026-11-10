@@ -1,5 +1,5 @@
 {
-  "_note": "免 API 主路径 = directory（直接爬公开黄页/B2B/行业目录的列表页与站内搜索结果页，零第三方 API key）。web_search 是可选增强，需要自行申请 Bing/SerpAPI key 才生效，不填也能跑（自动跳过）。",
+  "_note": "免 API 主路径 = directory（直接爬公开黄页/B2B/行业目录的列表页与站内搜索结果页，零第三方 API key）。web_search 是可选增强，需要自行申请 Bing/SerpAPI key 才生效，不填也能跑（自动跳过）。llm 的 base_url / api_key / model 留空时从项目根 ai_secrets.json 读取，不要在仓库里写死任何账号或环境专属值。",
   "user_agent": "Mozilla/5.0 (compatible; DealerScraper/1.0; +public-collection)",
   "respect_robots": true,
   "min_interval_seconds": 3,
@@ -9,7 +9,7 @@
   "llm": {
     "base_url": "",
     "api_key": "",
-    "model": "your-model"
+    "model": ""
   },
   "compliance": {
     "exclude_personal_mobile": false

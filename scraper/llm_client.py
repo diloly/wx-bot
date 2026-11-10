@@ -1,7 +1,7 @@
 """大模型提取层：把抓回的网页正文交给 LLM，抽成结构化经销商字段。
 
-优先复用项目根目录的 ai_secrets.json（OpenAI 兼容接口，模型 your-model）；
-若不存在则读 config["llm"]。没有 key 或库未安装时 available()=False，调用方回退正则。
+优先复用项目根目录的 ai_secrets.json（OpenAI 兼容接口，模型名由配置提供，不硬编码）；
+若不存在则读 config["llm"]。没有 key / model 或库未安装时 available()=False，调用方回退正则。
 只抽取企业/商家主动公开披露的商业信息，不编造、缺失留空。
 """
 from __future__ import annotations
@@ -47,16 +47,18 @@ class LLMExtractor:
         sec = _load_secret()
         self.base_url = self.cfg.get("base_url") or sec.get("base_url") or ""
         self.api_key = self.cfg.get("api_key") or sec.get("api_key") or ""
-        self.model = self.cfg.get("model") or sec.get("model") or "your-model"
+        self.model = self.cfg.get("model") or sec.get("model") or ""
         self.client = None
-        if OpenAI and self.api_key:
+        if not self.model:
+            logger.warning("未配置 LLM 模型名（ai_secrets.json 或 config.llm.model），跳过 LLM 提取")
+        elif OpenAI and self.api_key:
             try:
                 self.client = OpenAI(base_url=self.base_url, api_key=self.api_key)
             except Exception as e:  # noqa: BLE001
                 logger.warning("LLM 客户端初始化失败: %s", e)
 
     def available(self) -> bool:
-        return self.client is not None
+        return self.client is not None and bool(self.model)
 
     @staticmethod
     def _clean_json(text: str) -> str:

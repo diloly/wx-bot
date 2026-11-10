@@ -312,7 +312,7 @@ class AutoReplier:
 
     @staticmethod
     def _group_sender(text):
-        """群消息前缀 → 发送者显示名：'某总: wxid_xxx:\\n正文' → '某总'。
+        """群消息前缀 → 发送者显示名：'群备注: wxid_xxx:\\n正文' → '群备注'。
 
         前缀是 wx_recv_bridge 入库时拼的（群聊消息都带），不用再查库。
         解析不出就返回空串，调用方按「不 @」处理。
@@ -325,7 +325,7 @@ class AutoReplier:
             if c.get("name") == name or c.get("wxid") == conv_id:
                 return c
         # config 没配这个联系人：用库反查补全（wxid 精确匹配 + 微信备注进 note）。
-        # 备注比昵称更可能是客户对他的称呼（「某总」），喂给 AI 后称呼不会出错。
+        # 备注比昵称更可能是客户对他的称呼（「群备注」），喂给 AI 后称呼不会出错。
         cached = self._contact_cache.get(conv_id)
         if cached is not None:
             return cached
@@ -571,7 +571,7 @@ class AutoReplier:
         matched = min(pool, key=lambda t: t[0])[1] if pool else None
         # 搜索词必须是**微信备注/昵称**：Ctrl+F 只认昵称和备注，喂 wxid 搜不到
         # （2026-10-19 实测：名单里没填 name 的两条首条激活，全挂在
-        # 「wxid_xxxxxxxx」上，任务落 failed）。
+        # 「wxid_xxxxxxxx」这种纯 ID 上，任务落 failed）。
         # 三级回退：消息里的昵称 → 名单里填的 name → 联系人库反查 → wxid（保底）。
         name = item.get("name") or (matched.get("name") if matched else None) or ""
         if not name:

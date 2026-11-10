@@ -15,7 +15,7 @@ export_history.py —— 聊天记录导出备份（wechatauto-replica 的 expor
     python export_history.py                          # 全量导出到 backups/history_时间戳.json
     python export_history.py --user wxid_xxx           # 只导指定会话（--user 可重复多次）
     python export_history.py --limit 500               # 每会话最多导 500 条（默认全部）
-    python export_history.py --out backups/mydata.json   # 自定义输出路径
+    python export_history.py --out backups/mydata.json # 自定义输出路径（相对项目根）
 
 依赖：wechatauto-replica（装在跑得通 auto_reply.py 的那个 Python 里）。
 """

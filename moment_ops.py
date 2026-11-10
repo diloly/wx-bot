@@ -47,7 +47,8 @@ import monitor_store
 import ui_gate
 import db_gate
 
-# wechatauto 装在 your-env 环境；本模块被 dashboard/auto_reply  import 时同理
+# 依赖 wechatauto；本模块被 dashboard / auto_reply 导入时同理。
+# 缺库时允许导入失败，看板相关 API 会自己容错。
 try:
     from wechatauto import WeChat, WeChatDB, MomentDB
     from wechatauto.moment import Moment

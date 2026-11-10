@@ -78,7 +78,7 @@ VIDEO_EXTS = (".mp4", ".mov", ".webm")
 _md = None  # MediaDownloader 懒初始化（首次遇到媒体消息时才建）
 
 # 群成员表缓存：chatroom -> (拉取时间, {wxid: 显示名})。备注优先于昵称
-# （「某总」比「本名」更可能是客户对他的称呼）。TTL 5 分钟：群成员变动不频繁，
+# （如「某总」比本名更可能是客户对他的称呼）。TTL 5 分钟：群成员变动不频繁，
 # 不值得每条消息都全量拉一次。
 _GROUP_MEMBERS_TTL = 300
 _group_members_cache = {}
