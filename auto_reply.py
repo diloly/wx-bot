@@ -52,6 +52,7 @@ auto_reply.py —— 自动回复闭环：实时收消息 -> 大模型生成 -> 
     python auto_reply.py --interval 5   # 自定义轮询间隔秒数
 """
 import argparse
+import json
 import queue
 import random
 import re
@@ -84,10 +85,10 @@ class ReplyTask:
     排了别人就无限期挂着。
     """
     __slots__ = ("id", "conv_id", "name", "text", "created", "deadline", "reply",
-                 "kind", "at_name", "variant", "by")
+                 "kind", "at_name", "variant", "by", "campaign_id")
 
     def __init__(self, conv_id, name, text, timeout, task_id=None, kind="reply",
-                 at_name=None, variant="revive", by="ai"):
+                 at_name=None, variant="revive", by="ai", campaign_id=None):
         self.id = task_id          # reply_task 表主键（落库后回填；None=未落库）
         self.conv_id = conv_id
         self.name = name
@@ -100,8 +101,10 @@ class ReplyTask:
         self.at_name = at_name
         # 主动触达子类型：revive=承接旧话题 / icebreak=从没聊过的破冰
         self.variant = variant
-        # 消息库里的「谁发的」标签：ai / manual / handoff（内部接管通知）
+        # 消息库里的「谁发的」标签：ai / manual / handoff / campaign
         self.by = by
+        # 活动触达：发完要把结果回写到 campaign.result（None=普通任务）
+        self.campaign_id = campaign_id
 
     def remaining(self):
         return self.deadline - time.time()
@@ -216,7 +219,10 @@ class AutoReplier:
         self.ou_work_end = int(ou.get("work_end_hour", 21))
         self.ou_silent_days = int(ou.get("silent_days", 7))       # 多久没动算沉默
         self.ou_max_days = int(ou.get("max_days", 0) or 0)        # 0=不限（越久越该激活）
-        self.ou_min_gap_days = int(ou.get("min_gap_days", 14))    # 同一人冷却
+        self.ou_min_gap_days = int(ou.get("min_gap_days", 7))     # 同一人冷却（7 天 1 次）
+        # 0=不启用。设 7 则「整体 7 天才跑一轮」：上次真实触达后 7 天内不再碰任何人。
+        # 这是比 per-contact 冷却更狠的全局降频闸，按需开。
+        self.ou_cycle_days = int(ou.get("cycle_days", 0) or 0)
         self.ou_max_per_contact = int(ou.get("max_per_contact", 3))
         self.ou_lookback_days = int(ou.get("lookback_days", 180)) # 取历史对话的窗口
         # 加了好友但从没聊过的人，是否也做破冰（默认**不**：给没说过话的人主动
@@ -225,6 +231,9 @@ class AutoReplier:
         self.ou_intent = (ou.get("intent") or "").strip()
         self._ou_day = ""             # 已提示「今日达上限」的那一天（只打印一次）
         self._ou_next_at = 0.0        # 下一次允许触达的时刻（间隔在投递时抽一次定死）
+        # 活动触达：cid -> {content, targets, ids, queued}（内存态，库里有终态账本）
+        self._campaign_active = {}
+        self._campaign_lock = threading.Lock()
         # 群聊：我在每个群的群昵称（@ 匹配用）+ 缓存时间。群昵称是会变的
         # （用户随时能改），所以缓存 10 分钟过期，不能永久缓存。
         self._group_nick = {}         # chatroom -> {昵称, ...}
@@ -1008,6 +1017,7 @@ class AutoReplier:
                 print("[auto] 任务超时未发出（预算 %.0fs 已耗尽）: %s"
                       % (self.task_timeout, task.name))
                 self._task_set(task, "expired", reason="预算耗尽（未发出）")
+                self._campaign_result(task, False, "预算耗尽（未发出）")
                 continue
             if self._send_q.qsize():
                 print("[auto] 发送 %s（后面还排着 %d 条）" % (task.name, self._send_q.qsize()))
@@ -1015,14 +1025,15 @@ class AutoReplier:
             try:
                 self.bot.send_to_contact(task.name, task.reply,
                                          conv_id=task.conv_id, ui_timeout=rem,
-                                         by=task.by,   # ai / manual / handoff
+                                         by=task.by,   # ai / manual / handoff / campaign
                                          confirm=self._confirm_sent,
                                          at_name=task.at_name)   # 群聊：发送前先 @ 提问者
             except ui_gate.UITimeoutError as e:
                 print("[auto] 发送排队超时（本条 %.0fs 预算内没排到）: %s —— %s"
                       % (task.name, rem, e))
-                self._task_set(task, "expired",
-                               reason="UI 排队超时（%.0fs 预算内没排到）" % rem)
+                reason = "UI 排队超时（%.0fs 预算内没排到）" % rem
+                self._task_set(task, "expired", reason=reason)
+                self._campaign_result(task, False, reason)
                 continue
             except SendNotVerified as e:
                 # 键盘动作跑完了，但回读微信库没有这条 → 目标会话里没出现。
@@ -1031,33 +1042,39 @@ class AutoReplier:
                 # 另外还要提示「可能发到别的会话了」——Ctrl+F 那一环万一失败，
                 # 正文会落到当时打开的那个会话里，光看目标会话是查不到的。
                 print("[auto] 发送未确认，按未发出处理(%s): %s" % (task.name, e))
-                self._task_set(task, "failed",
-                               reason="发送未确认：目标会话里没查到这条（可能没发出，"
-                                      "也可能发到了别的会话，请人工核对）")
+                reason = ("发送未确认：目标会话里没查到这条（可能没发出，"
+                          "也可能发到了别的会话，请人工核对）")
+                self._task_set(task, "failed", reason=reason)
+                self._campaign_result(task, False, reason)
                 continue
             except SendUnconfirmed as e:
                 # 校验链路本身不可用（读库打不开、微信刚重启）。这条消息**可能
                 # 已经发出去了**，所以绝不重试；也不写库——真实发出才落库。
                 # 落 failed 并写明「无法确认」，人工去客户端看一眼即可。
                 print("[auto] 发送无法确认(%s): %s" % (task.name, e))
-                self._task_set(task, "failed",
-                               reason="无法确认：回读微信库不可用，可能已发出")
+                reason = "无法确认：回读微信库不可用，可能已发出"
+                self._task_set(task, "failed", reason=reason)
+                self._campaign_result(task, False, reason)
                 continue
             except SendAborted as e:
                 # 没进到目标会话就中止了：**确定什么都没发出去**。
                 # 与上面两种不同，这里不存在「可能已发出」的风险，面板上直接写
                 # 清楚卡在哪一环（搜索没进 / 正文没粘进去 / 没切回聊天页）。
                 print("[auto] 发送中止(%s): %s" % (task.name, e))
-                self._task_set(task, "failed",
-                               reason="未发送（按键前已中止）：%s" % str(e)[:110])
+                reason = "未发送（按键前已中止）：%s" % str(e)[:110]
+                self._task_set(task, "failed", reason=reason)
+                self._campaign_result(task, False, reason)
                 continue
             except Exception as e:      # noqa: BLE001
                 print("[auto] 发送异常(%s): %s" % (task.name, e))
-                self._task_set(task, "failed", reason="发送异常: %s" % e)
+                reason = "发送异常: %s" % e
+                self._task_set(task, "failed", reason=reason)
+                self._campaign_result(task, False, reason)
                 continue
             # 发送成功（dry-run 下 send_to_contact 不真发，账本注明，免得看板误判）
             self._task_set(task, "sent", reply=task.reply,
                            reason=("dry-run：未真发" if self.dry_run else None))
+            self._campaign_result(task, True)
             # 主动触达发出去之后，顺手把该会话的自动回复打开：我们主动找的人
             # 回话了我们却不接，比不发还糟。dry-run 不真发，也就不该改开关。
             if task.kind == "outreach" and not self.dry_run:
@@ -1067,6 +1084,94 @@ class AutoReplier:
                 except Exception as e:  # noqa: BLE001
                     print("[auto] 开启 %s 的自动回复失败（客户回话需人工看）: %s"
                           % (task.name, e))
+
+    # ---------- 活动触达 worker（固定文案 + 指定时间 + 指定对象） ----------
+    def _campaign_result(self, task, ok, reason=""):
+        """把单个目标的发送结果回写到活动账本；普通任务直接跳过。"""
+        if not task.campaign_id:
+            return
+        try:
+            monitor_store.record_campaign_result(
+                task.campaign_id, task.conv_id, task.name, ok, reason)
+            # 释放「在途」名额：发送线程与活动线程各自跑，用同一把锁保护内存态
+            with self._campaign_lock:
+                st = self._campaign_active.get(task.campaign_id)
+                if st:
+                    st["queued"].discard(task.conv_id)
+        except Exception as e:          # noqa: BLE001
+            print("[campaign] 结果回写失败(%s): %s" % (task.name, e))
+
+    def _campaign_worker(self):
+        print("[auto] 活动触达线程已启动（每 20s 巡检到点的活动）")
+        while not self._stop.is_set():
+            try:
+                self._campaign_tick()
+            except Exception as e:      # noqa: BLE001 —— worker 绝不能因单条异常退出
+                print("[campaign] 本轮异常（已跳过）: %s" % e)
+            self._stop.wait(20)
+
+    def _campaign_tick(self):
+        """一轮巡检：收新到点的活动 → 每个活动本轮最多投 1 个对象。
+
+        为什么一次只投 1 条：活动常常一次选几十个对象，若一股脑塞进发送队列，
+        客户此时发消息要排在几十条后面才能回，等于把自动回复堵死了。20s 一条
+        既让活动在几分钟内发完，也给回复留出了插队空间。
+        """
+        now = int(time.time())
+        for c in monitor_store.due_campaigns(now):
+            cid = c["id"]
+            if cid in self._campaign_active:
+                continue
+            if not monitor_store.claim_campaign(cid):
+                continue                # 别的进程/上一轮已经抢走了
+            try:
+                targets = json.loads(c.get("targets") or "[]")
+            except Exception:           # noqa: BLE001
+                targets = []
+            content = (c.get("content") or "").strip()
+            if not content or not targets:
+                monitor_store.record_campaign_result(
+                    cid, "", "", False, "内容为空或没选对象")
+                continue
+            with self._campaign_lock:
+                self._campaign_active[cid] = {
+                    "content": content, "targets": targets,
+                    "ids": [t.get("conv_id") for t in targets],
+                    "queued": set(),
+                }
+            print("[campaign] 开始执行「%s」（%d 个对象）"
+                  % (c.get("name") or cid, len(targets)))
+
+        for cid, st in list(self._campaign_active.items()):
+            db = monitor_store.get_campaign(cid)
+            if not db or db["status"] in ("sent", "partial", "expired", "canceled"):
+                with self._campaign_lock:
+                    self._campaign_active.pop(cid, None)
+                continue
+            with self._campaign_lock:
+                # 同一活动始终只保留 1 条在途：几十个对象也不会一次塞满发送队列
+                if st["queued"]:
+                    continue
+                done = {r.get("conv_id") for r in db["result"]}
+                nxt = next((t for t in st["targets"]
+                            if t.get("conv_id") not in done), None)
+                if nxt is None:
+                    if all(i in done for i in st["ids"]):
+                        self._campaign_active.pop(cid, None)
+                    continue
+                cid2 = nxt.get("conv_id")
+                st["queued"].add(cid2)   # 先占名额，投递失败再释放
+            name = (nxt.get("name") or cid2).strip()
+            task = ReplyTask(cid2, name, "", max(self.task_timeout, 300),
+                             kind="campaign", by="campaign", campaign_id=cid)
+            task.reply = st["content"]
+            task.id = self._task_open(task)
+            try:
+                self._send_q.put_nowait(task)
+                print("[campaign] 投递 → %s" % name)
+            except queue.Full:
+                self._task_set(task, "failed", reason="活动触达队列已满")
+                self._campaign_result(task, False, "发送队列已满")
 
     # ---------- 加好友 worker（名单队列，发完即走） ----------
     # 关键语义：**添加好友是异步的**。点完「确定」这条就结束，worker 立刻处理
@@ -1239,6 +1344,10 @@ class AutoReplier:
         # 跨重启也守住最小间隔：库里最近一条（含在途的）不足 gap_min 就不发
         if last_at and now - last_at < self.ou_gap_min:
             return
+        # 可选全局周期闸：上次真实触达后 cycle_days 天内不再碰任何人
+        if (self.ou_cycle_days > 0 and last_at
+                and now - last_at < self.ou_cycle_days * 86400):
+            return
         try:
             # 候选规则统一走 outreach_core（与 activate.py 同一份实现）：
             # 沉默客户在前、没聊过的破冰在后，冷却/累计次数都在那边卡。
@@ -1305,13 +1414,14 @@ class AutoReplier:
                        (self._send_worker, "send-worker"),
                        (self._moment_worker, "moment-worker"),
                        (self._add_worker, "add-friend-worker"),
-                       (self._outreach_worker, "outreach-worker")):
+                       (self._outreach_worker, "outreach-worker"),
+                       (self._campaign_worker, "campaign-worker")):
             t = threading.Thread(target=self._worker_entry, args=(fn, nm),
                                  name=nm, daemon=True)
             t.start()
             self._threads.append(t)
-        print("[auto] 流水线已启动：AI 生成 / 发送 / 朋友圈 / 加好友 / 主动触达 五个线程"
-              "（生成与发送互不阻塞，朋友圈刷新也不再卡住收消息）")
+        print("[auto] 流水线已启动：AI 生成 / 发送 / 朋友圈 / 加好友 / 主动触达 / "
+              "活动触达 六个线程（生成与发送互不阻塞，朋友圈刷新也不再卡住收消息）")
 
     def _worker_entry(self, fn, name):
         """worker 统一入口：先给**本线程** CoInitialize（UIAutomation 前提），再跑活。
@@ -1395,13 +1505,14 @@ class AutoReplier:
                   "名单只入库，不会自动发申请")
         if self._ou_enabled():
             limit_txt = ("%d 条" % self.ou_daily_limit) if self.ou_daily_limit > 0 else "不限"
+            cycle_txt = ("%d 天一轮" % self.ou_cycle_days) if self.ou_cycle_days > 0 else "不限制"
             print("[auto] 主动触达已启用：每日 %s、间隔 %.0f~%.0f 分钟、%02d:00-%02d:00、"
-                  "沉默 ≥%d 天、同一人冷却 %d 天/最多 %d 次；"
+                  "沉默 ≥%d 天、同一人冷却 %d 天/最多 %d 次、全局周期 %s；"
                   "没聊过的破冰=%s（看板可随时开关）"
                   % (limit_txt, self.ou_gap_min / 60.0, self.ou_gap_max / 60.0,
                      self.ou_work_start, self.ou_work_end,
                      self.ou_silent_days, self.ou_min_gap_days,
-                     self.ou_max_per_contact,
+                     self.ou_max_per_contact, cycle_txt,
                      "开" if self.ou_include_new else "关"))
         else:
             print("[auto] 主动触达未启用（config.outreach.enabled=false）：不会主动给客户发消息")

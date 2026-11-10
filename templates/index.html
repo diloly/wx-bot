@@ -166,6 +166,25 @@
   .ho-field.check input { accent-color: #07c160; }
   .ho-saved { font-size: 12px; color: #12864a; }
   .ho-log .tr { font-size: 12px; }
+  /* 活动触达表单 */
+  .cp-form { display: grid; gap: 10px; }
+  .cp-form .f { display: flex; align-items: center; gap: 10px; font-size: 12px; color: #576b95; }
+  .cp-form .f > label { min-width: 76px; flex-shrink: 0; }
+  .cp-form input[type=text], .cp-form input[type=datetime-local],
+  .cp-form input[type=number], .cp-form textarea {
+    flex: 1; min-width: 0; padding: 6px 9px; border: 1px solid #dcdfe4;
+    border-radius: 6px; font-size: 12px; background: #fff; color: #1f2329;
+    font-family: inherit;
+  }
+  .cp-form textarea { resize: vertical; line-height: 1.6; }
+  .cp-list { max-height: 210px; overflow: auto; border: 1px solid #e6e8eb; border-radius: 8px; }
+  .cp-note { font-size: 11px; color: #9aa0a8; line-height: 1.6; }
+  .cp-badge { font-size: 11px; padding: 2px 7px; border-radius: 4px; background: #eef0f2; color: #576b95; }
+  .cp-badge.scheduled { background: #e8f0fe; color: #3568c4; }
+  .cp-badge.running { background: #fff5e0; color: #b07915; }
+  .cp-badge.sent { background: #eafaf1; color: #12864a; }
+  .cp-badge.partial { background: #fff0e8; color: #c2652a; }
+  .cp-badge.expired, .cp-badge.canceled { background: #f0f1f3; color: #9aa0a8; }
 
   /* 窄屏：两栏卡片改单栏，列表列宽压缩 */
   @media (max-width: 980px) {
@@ -354,6 +373,7 @@
   .bytag.ai { background: #e8f0fe; color: #3568c4; }
   .bytag.human { background: #eef0f2; color: #8a9099; }
   .bytag.handoff { background: #f2e8fe; color: #8d4bc4; }
+  .bytag.campaign { background: #fff2e0; color: #b5771b; }
 
   /* 群聊卡片的真实发送者（普通文本消息靠「昵称: 」前缀，卡片会丢，故单独渲染） */
   .bubble .msg-sender { font-size: 11px; color: #9a9a9a; margin: -2px 0 6px; }
@@ -568,6 +588,7 @@
       <button class="nav-item" id="navFriends" onclick="navTo('friends')">加好友<span class="nav-badge" id="friendBadge" style="display:none"></span></button>
       <button class="nav-item" id="navTasks" onclick="navTo('tasks')">维护任务<span class="nav-badge" id="taskBadge" style="display:none"></span></button>
       <button class="nav-item" id="navHandoff" onclick="navTo('handoff')">人工接管</button>
+      <button class="nav-item" id="navCampaign" onclick="navTo('campaign')">活动触达</button>
     </nav>
     <div class="nav-hint" id="arBanner"></div>
   </header>
@@ -693,6 +714,51 @@
         <section class="pcard" style="margin-top:14px">
           <h3>③ 最近接管记录</h3>
           <div class="tbl ho-log" id="hoLog"></div>
+        </section>
+      </div>
+
+      <!-- 活动触达：固定文案 + 指定时间 + 指定对象，到点由 auto_reply 自动发 -->
+      <div class="page" id="campaignPage" style="display:none">
+        <div class="page-head">
+          <div>
+            <h2>活动触达</h2>
+            <p class="sub">自己写文案、定时间、选对象，到点自动发。<b>不经过 AI</b>，写什么就发什么。</p>
+          </div>
+          <div class="chips"><span class="chip" id="cpSummary">—</span></div>
+        </div>
+        <div class="grid2">
+          <section class="pcard">
+            <h3>① 新建活动</h3>
+            <div class="cp-form">
+              <div class="f"><label>活动名称</label>
+                <input type="text" id="cpName" placeholder="例：周三线上分享通知"></div>
+              <div class="f"><label>发送时间</label>
+                <input type="datetime-local" id="cpTime">
+                <label style="min-width:auto">过期补发</label>
+                <input type="number" id="cpGrace" value="60" min="1" max="1440" style="max-width:70px">
+                <span>分</span></div>
+              <div class="f" style="align-items:flex-start"><label style="padding-top:6px">发送内容</label>
+                <textarea id="cpContent" rows="5" placeholder="直接写在微信里要发的原文，支持换行。确认无误再创建。"></textarea></div>
+            </div>
+            <p class="cp-note">过点未发（比如当时没开程序）只在宽限期内补发，超时自动作废，
+              避免隔夜突然群发。发送结果逐个回写，失败的不会自动重试。</p>
+            <div class="row-btns">
+              <button class="btn" onclick="createCampaign()">创建活动</button>
+              <span class="ho-saved" id="cpMsg"></span>
+            </div>
+          </section>
+          <section class="pcard">
+            <h3>② 发给谁 <span class="muted" id="cpCount"></span></h3>
+            <p class="muted">群聊和私聊都能选，可按名字搜索。创建后到点自动逐个发出。</p>
+            <input class="q" id="cpSearch" placeholder="搜索名字" oninput="renderCpTargets()"
+                   style="width:100%;box-sizing:border-box;margin-top:8px">
+            <div class="picker-tags" id="cpFilters"></div>
+            <div class="cp-list" id="cpTargets"></div>
+          </section>
+        </div>
+        <section class="pcard" style="margin-top:14px">
+          <h3>③ 活动列表</h3>
+          <div class="tbl" id="cpList"></div>
         </section>
       </div>
     </main>
@@ -1121,6 +1187,7 @@ function byTag(m) {
   if (m.sent_by === 'ai') return '<span class="bytag ai">AI</span>';
   if (m.sent_by === 'manual') return '<span class="bytag human">人工</span>';
   if (m.sent_by === 'handoff') return '<span class="bytag handoff">接管通知</span>';
+  if (m.sent_by === 'campaign') return '<span class="bytag campaign">活动</span>';
   return '';
 }
 
@@ -1252,13 +1319,13 @@ function fmtTime(ts){
 }
 
 /* ==================== 朋友圈轻互动 ==================== */
-let activeView = 'chat';       // 'chat' | 'moment' | 'friends' | 'tasks' | 'handoff'
+let activeView = 'chat';       // 'chat' | 'moment' | 'friends' | 'tasks' | 'handoff' | 'campaign'
 let momentData = null;         // /api/moments 最近一次响应
 let activeMoment = null;       // 当前打开的圈 tid
 let momentView = 'panel';      // 'panel'=自动互动管理 | 'detail'=圈详情
 let momentSigs = '';           // 增量渲染签名（与消息区同理，免打扰复制/滚动）
 
-const VIEW_NAV = { chat: 'navChat', moment: 'navMoment', friends: 'navFriends', tasks: 'navTasks', handoff: 'navHandoff' };
+const VIEW_NAV = { chat: 'navChat', moment: 'navMoment', friends: 'navFriends', tasks: 'navTasks', handoff: 'navHandoff', campaign: 'navCampaign' };
 
 function navTo(view) {
   activeView = view;
@@ -1276,6 +1343,7 @@ function navTo(view) {
   document.getElementById('friendPage').style.display = view === 'friends' ? 'block' : 'none';
   document.getElementById('taskPage').style.display = view === 'tasks' ? 'block' : 'none';
   document.getElementById('handoffPage').style.display = view === 'handoff' ? 'block' : 'none';
+  document.getElementById('campaignPage').style.display = view === 'campaign' ? 'block' : 'none';
   // 空会话提示：opened 会话后 chatPane 已被整体重写，这个节点可能不存在
   const et = document.getElementById('emptyTip');
   if (et) et.style.display = (view === 'chat' && !activeConv) ? 'flex' : 'none';
@@ -1289,6 +1357,8 @@ function navTo(view) {
     loadTasks();
   } else if (view === 'handoff') {
     loadHoConfig();
+  } else if (view === 'campaign') {
+    loadCampaigns();
   }
 }
 
@@ -1640,6 +1710,8 @@ function renderTaskList(tasks) {
     const body = bad ? (t.reason || '') : (t.reply || t.text || '');
     const kind = t.kind === 'first_touch' ? ' <span class="muted">首条激活</span>'
                : t.kind === 'outreach'   ? ' <span class="muted">主动触达</span>'
+               : t.kind === 'handoff'    ? ' <span class="muted">接管通知</span>'
+               : t.kind === 'campaign'   ? ' <span class="muted">活动触达</span>'
                : '';
     return `<div class="tr">
       <span class="dotst ${esc(t.status)}"><i></i>${esc(st)}</span>
@@ -1880,6 +1952,136 @@ function renderHoLog(rows) {
     </div>`;
   }).join('');
   box.innerHTML = tblHead(['客户', '原话', '判定 / 通知到', '时间']) + html;
+}
+
+// ---------------------------------------------------------------------------
+// 活动触达：固定文案 + 指定时间 + 指定对象（同样只在切页时拉，不进 2s 轮询）
+// ---------------------------------------------------------------------------
+const CP_LABEL = {
+  scheduled: '待发送', running: '发送中', sent: '已完成',
+  partial: '部分失败', expired: '已过期', canceled: '已取消'
+};
+let cpContacts = [], cpSel = new Set(), cpFilter = 'all';
+
+function localDateTime(d) {
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+async function loadCampaigns() {
+  try {
+    const d = await (await fetch('/api/campaigns')).json();
+    cpContacts = d.contacts || [];
+    if (!document.getElementById('cpTime').value) {
+      document.getElementById('cpTime').value = localDateTime(new Date(Date.now() + 3600e3));
+    }
+    renderCpFilters(); renderCpTargets(); renderCpList(d.campaigns || []);
+  } catch (e) {
+    document.getElementById('cpMsg').textContent = '读取活动失败: ' + e;
+  }
+}
+
+function setCpFilter(k) { cpFilter = k; renderCpFilters(); renderCpTargets(); }
+
+function renderCpFilters() {
+  const g = cpContacts.filter(c => c.kind === 'group').length;
+  const defs = [['all', '全部 ' + cpContacts.length], ['group', '群聊 ' + g],
+                ['friend', '私聊 ' + (cpContacts.length - g)], ['selected', '已选 ' + cpSel.size]];
+  document.getElementById('cpFilters').innerHTML = defs.map(([k, label]) =>
+    `<button class="tagchip ${cpFilter === k ? 'on' : ''}" onclick="setCpFilter('${k}')">${label}</button>`
+  ).join('');
+}
+
+function toggleCpTarget(cid, on) {
+  if (on) cpSel.add(cid); else cpSel.delete(cid);
+  renderCpFilters(); updateCpCount();
+}
+
+function updateCpCount() {
+  document.getElementById('cpCount').textContent = cpSel.size ? `（已选 ${cpSel.size} 个）` : '（还没选）';
+}
+
+function renderCpTargets() {
+  const q = (document.getElementById('cpSearch').value || '').trim().toLowerCase();
+  const rows = cpContacts.filter(c => {
+    if (cpFilter === 'selected' && !cpSel.has(c.conv_id)) return false;
+    if ((cpFilter === 'group' || cpFilter === 'friend') && c.kind !== cpFilter) return false;
+    return !q || (c.name || '').toLowerCase().includes(q) || c.conv_id.toLowerCase().includes(q);
+  });
+  const box = document.getElementById('cpTargets');
+  if (!rows.length) { box.innerHTML = '<div class="blank" style="padding:14px">没有匹配的联系人</div>'; return; }
+  box.innerHTML = rows.map(c => `<label class="ho-row">
+    <input type="checkbox" data-cid="${esc(c.conv_id)}" ${cpSel.has(c.conv_id) ? 'checked' : ''}
+           onchange="toggleCpTarget(this.dataset.cid, this.checked)">
+    <span class="ho-kind ${c.kind === 'group' ? 'group' : ''}">${c.kind === 'group' ? '群聊' : '私聊'}</span>
+    <span>${esc(c.name)}</span>
+  </label>`).join('');
+  updateCpCount();
+}
+
+async function createCampaign() {
+  const $ = id => document.getElementById(id);
+  const content = $('cpContent').value.trim();
+  const targets = cpContacts.filter(c => cpSel.has(c.conv_id));
+  if (!content) { $('cpMsg').textContent = '请先写发送内容'; return; }
+  if (!targets.length) { $('cpMsg').textContent = '请先选发送对象'; return; }
+  if (!$('cpTime').value) { $('cpMsg').textContent = '请填发送时间'; return; }
+  if (!confirm(`确认创建？\n\n将在 ${$('cpTime').value} 给 ${targets.length} 个对象发送：\n\n${content.slice(0, 80)}${content.length > 80 ? '…' : ''}`)) return;
+  $('cpMsg').textContent = '创建中…';
+  try {
+    const r = await fetch('/api/campaigns', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: $('cpName').value.trim() || '未命名活动',
+        content, send_at: $('cpTime').value,
+        grace_minutes: Number($('cpGrace').value) || 60,
+        targets
+      })
+    });
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.error || '创建失败');
+    $('cpMsg').textContent = '已创建，到点自动发';
+    $('cpName').value = ''; $('cpContent').value = '';
+    cpSel.clear(); renderCpFilters(); renderCpTargets();
+    loadCampaigns();
+  } catch (e) { $('cpMsg').textContent = '创建失败: ' + e; }
+}
+
+async function cpAction(id, action) {
+  const tips = { 'send-now': '立即真发给所有对象？', 'cancel': '取消这个活动？', 'delete': '删除这条活动记录？' };
+  if (!confirm(tips[action])) return;
+  const r = await fetch(`/api/campaigns/${id}` + (action === 'delete' ? '' : '/' + action), {
+    method: action === 'delete' ? 'DELETE' : 'POST'
+  });
+  const d = await r.json();
+  if (!d.ok) alert('操作失败，可能状态已变化（只有「待发送」能改）');
+  loadCampaigns();
+}
+
+function renderCpList(rows) {
+  const box = document.getElementById('cpList');
+  const pending = rows.filter(r => r.status === 'scheduled').length;
+  document.getElementById('cpSummary').textContent = `${rows.length} 个活动 · ${pending} 个待发送`;
+  if (!rows.length) {
+    box.innerHTML = '<div class="blank">还没有活动。左边写内容、定时间，右边选对象即可创建。</div>';
+    return;
+  }
+  const html = rows.map(r => {
+    const n = (r.targets || []).length, ok = (r.result || []).filter(x => x.ok).length;
+    const st = CP_LABEL[r.status] || r.status;
+    const ops = r.status === 'scheduled'
+      ? `<button class="btn ghost" style="padding:3px 8px;font-size:11px" onclick="cpAction(${r.id},'send-now')">立即发</button>
+         <button class="btn ghost" style="padding:3px 8px;font-size:11px" onclick="cpAction(${r.id},'cancel')">取消</button>`
+      : `<button class="btn ghost" style="padding:3px 8px;font-size:11px" onclick="cpAction(${r.id},'delete')">删除</button>`;
+    const content = String(r.content || '').replace(/\n/g, ' ').slice(0, 40);
+    return `<div class="tr">
+      <span class="name">${esc(r.name || '')}<br><span class="muted" style="font-size:11px">${esc(content)}</span></span>
+      <span class="sub2">${esc(fmtTime(r.send_at))}<br><span class="cp-badge ${esc(r.status)}">${esc(st)}</span></span>
+      <span class="sub2">${n} 个对象 · 成功 ${ok}<br><span class="muted" style="font-size:11px">宽限 ${r.grace_minutes} 分钟内补发</span></span>
+      <span class="time" style="display:flex;gap:5px;justify-content:flex-end">${ops}</span>
+    </div>`;
+  }).join('');
+  box.innerHTML = tblHead(['活动 / 内容', '计划时间 / 状态', '对象 / 结果', '操作']) + html;
 }
 
 setInterval(() => {

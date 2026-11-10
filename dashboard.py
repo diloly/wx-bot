@@ -45,6 +45,8 @@ from monitor_store import (
     friend_counts, get_friend_tasks, friend_sent_today, get_setting, set_setting,
     count_outreach_since, delete_message, get_avatar,
     list_contacts, list_handoff_log,
+    add_campaign, list_campaigns, cancel_campaign, send_campaign_now,
+    delete_campaign,
 )
 import handoff
 import outreach_core as oc
@@ -428,7 +430,8 @@ def api_outreach():
         "work_start_hour": int(ou.get("work_start_hour", 8)),
         "work_end_hour": int(ou.get("work_end_hour", 21)),
         "silent_days": int(ou.get("silent_days", 7)),
-        "min_gap_days": int(ou.get("min_gap_days", 14)),
+        "min_gap_days": int(ou.get("min_gap_days", 7)),
+        "cycle_days": int(ou.get("cycle_days", 0) or 0),
         "max_per_contact": int(ou.get("max_per_contact", 3)),
         "include_new_contacts": bool(ou.get("include_new_contacts", False)),
         # 只看不改：与常驻触达同一套规则算出来的候选（排查用，前端暂未展示）
@@ -495,6 +498,92 @@ def api_handoff_config_save():
 @app.route("/api/handoff/log")
 def api_handoff_log():
     return jsonify({"log": list_handoff_log(50)})
+
+
+# ---------------------------------------------------------------------------
+# 活动触达：人工写死文案 + 指定时间 + 指定对象，到点由 auto_reply 自动发。
+# 发送不在 dashboard 进程里做——否则会和 auto_reply 抢 UI 焦点。
+# ---------------------------------------------------------------------------
+def _parse_send_at(v):
+    """接受 datetime-local 字符串（浏览器本地时间）或 Unix 秒，返回 int。"""
+    import datetime
+    if isinstance(v, (int, float)):
+        return int(v)
+    s = str(v or "").strip()
+    if not s:
+        raise ValueError("没有填发送时间")
+    for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return int(datetime.datetime.strptime(s, fmt).timestamp())
+        except ValueError:
+            pass
+    raise ValueError("时间格式不对（应为 YYYY-MM-DDTHH:MM）")
+
+
+@app.route("/api/campaigns")
+def api_campaigns():
+    return jsonify({
+        "ok": True,
+        "campaigns": list_campaigns(50),
+        "contacts": _handoff_candidates(),   # 与接管页同一份通讯录候选
+    })
+
+
+@app.route("/api/campaigns", methods=["POST"])
+def api_campaign_create():
+    body = request.get_json(silent=True) or {}
+    content = str(body.get("content") or "").strip()
+    targets = body.get("targets") or []
+    if not content:
+        return jsonify({"ok": False, "error": "发送内容不能为空"}), 400
+    if len(content) > 2000:
+        return jsonify({"ok": False, "error": "内容太长（上限 2000 字）"}), 400
+    if not isinstance(targets, list) or not targets:
+        return jsonify({"ok": False, "error": "至少选一个发送对象"}), 400
+    if len(targets) > 200:
+        return jsonify({"ok": False, "error": "一次最多 200 个对象"}), 400
+    # 只认通讯录里真实存在的好友/群聊，防止前端传个假 conv_id 乱发
+    valid = {c["conv_id"] for c in _handoff_candidates()}
+    clean, seen = [], set()
+    for t in targets:
+        if not isinstance(t, dict):
+            continue
+        cid = str(t.get("conv_id") or "").strip()
+        if cid not in valid or cid in seen:
+            continue
+        seen.add(cid)
+        clean.append({"conv_id": cid,
+                      "name": str(t.get("name") or cid)[:80],
+                      "kind": t.get("kind") or
+                              ("group" if cid.endswith("@chatroom") else "friend")})
+    if not clean:
+        return jsonify({"ok": False, "error": "所选对象都不在通讯录里"}), 400
+    try:
+        send_at = _parse_send_at(body.get("send_at"))
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    try:
+        grace = max(1, min(int(body.get("grace_minutes") or 60), 1440))
+    except (TypeError, ValueError):
+        grace = 60
+    cid = add_campaign(str(body.get("name") or "未命名活动")[:80], content,
+                       send_at, clean, grace)
+    return jsonify({"ok": True, "id": cid})
+
+
+@app.route("/api/campaigns/<int:cid>/cancel", methods=["POST"])
+def api_campaign_cancel(cid):
+    return jsonify({"ok": cancel_campaign(cid)})
+
+
+@app.route("/api/campaigns/<int:cid>/send-now", methods=["POST"])
+def api_campaign_send_now(cid):
+    return jsonify({"ok": send_campaign_now(cid)})
+
+
+@app.route("/api/campaigns/<int:cid>", methods=["DELETE"])
+def api_campaign_delete(cid):
+    return jsonify({"ok": delete_campaign(cid)})
 
 
 @app.route("/api/friends/import", methods=["POST"])

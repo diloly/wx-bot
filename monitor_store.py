@@ -14,6 +14,7 @@ import sqlite3
 import threading
 import time
 import hashlib
+import json
 
 DEFAULT_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wechat_monitor.db")
 
@@ -202,6 +203,23 @@ def _init_schema(path=None):
             targets  TEXT,               -- JSON：本次通知发给了谁
             paused   INTEGER DEFAULT 0,  -- 是否同时关掉了该会话自动回复
             ts       INTEGER
+        );
+        -- 活动触达（2026-11-10）：人工写死文案 + 指定时间 + 指定对象，到点自动发。
+        -- 与 AI 主动触达的区别：不调模型、一次性、内容和名单都由人在看板里定。
+        CREATE TABLE IF NOT EXISTS campaign (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            name          TEXT,
+            content       TEXT,           -- 固定正文（不经过 AI）
+            send_at       INTEGER,        -- 计划发送时刻（Unix 秒）
+            targets       TEXT,           -- JSON [{conv_id, name, kind}]
+            status        TEXT DEFAULT 'scheduled',
+                                          -- scheduled/running/sent/partial/expired/canceled
+            result        TEXT DEFAULT '[]',
+                                          -- JSON [{conv_id, name, ok, reason, ts}]
+            grace_minutes INTEGER DEFAULT 60,
+                                          -- 过点多久内还补发；超时作废，防隔夜群发
+            created       INTEGER,
+            updated       INTEGER
         );
         """
     )
@@ -1479,5 +1497,154 @@ def list_handoff_log(limit=30):
             "SELECT * FROM handoff_log ORDER BY ts DESC LIMIT ?",
             (int(limit),)).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 活动触达（固定文案 + 指定时间 + 指定对象，2026-11-10）
+# ---------------------------------------------------------------------------
+def _json(s, fallback):
+    try:
+        v = json.loads(s or "")
+        return v if isinstance(v, type(fallback)) else fallback
+    except Exception:               # noqa: BLE001
+        return fallback
+
+
+def add_campaign(name, content, send_at, targets, grace_minutes=60):
+    conn = init()
+    try:
+        now = int(time.time())
+        cur = conn.execute(
+            "INSERT INTO campaign(name, content, send_at, targets, status, result, "
+            "grace_minutes, created, updated) VALUES(?,?,?,?, 'scheduled', '[]', ?,?,?)",
+            (name, content, int(send_at),
+             json.dumps(targets or [], ensure_ascii=False),
+             int(grace_minutes), now, now))
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def list_campaigns(limit=50):
+    conn = init()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM campaign ORDER BY send_at DESC, id DESC LIMIT ?",
+            (int(limit),)).fetchall()
+    finally:
+        conn.close()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["targets"] = _json(d.get("targets"), [])
+        d["result"] = _json(d.get("result"), [])
+        out.append(d)
+    return out
+
+
+def get_campaign(cid):
+    for c in list_campaigns(1000):
+        if c["id"] == int(cid):
+            return c
+    return None
+
+
+def claim_campaign(cid):
+    """抢占一条待发活动（条件 UPDATE，保证多进程/多轮巡检只投一次）。"""
+    conn = init()
+    try:
+        cur = conn.execute(
+            "UPDATE campaign SET status='running', updated=? "
+            "WHERE id=? AND status='scheduled'",
+            (int(time.time()), int(cid)))
+        conn.commit()
+        return cur.rowcount == 1
+    finally:
+        conn.close()
+
+
+def due_campaigns(now=None):
+    """到点且仍在宽限期内的活动；同时把过点的标 expired（绝不隔夜群发）。"""
+    now = int(now or time.time())
+    conn = init()
+    try:
+        conn.execute(
+            "UPDATE campaign SET status='expired', updated=? "
+            "WHERE status='scheduled' "
+            "AND (? - send_at) > grace_minutes * 60",
+            (now, now))
+        # 进程重启后残留的 running（没投完就退出）标 partial，不再自动重投
+        conn.execute(
+            "UPDATE campaign SET status='partial', updated=? "
+            "WHERE status='running' AND updated < ?",
+            (now, now - 1800))
+        conn.commit()
+        rows = conn.execute(
+            "SELECT * FROM campaign WHERE status='scheduled' AND send_at<=? "
+            "ORDER BY send_at ASC LIMIT 10", (now,)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def record_campaign_result(cid, conv_id, name, ok, reason=""):
+    """回写单个对象的发送结果；全部回齐后把活动收口成 sent / partial。"""
+    conn = init()
+    try:
+        row = conn.execute("SELECT targets, result FROM campaign WHERE id=?",
+                           (int(cid),)).fetchone()
+        if not row:
+            return
+        targets = _json(row["targets"], [])
+        results = _json(row["result"], [])
+        results = [r for r in results if r.get("conv_id") != conv_id]
+        results.append({"conv_id": conv_id, "name": name, "ok": bool(ok),
+                        "reason": str(reason or "")[:160], "ts": int(time.time())})
+        status = "running"
+        if len(results) >= len(targets):
+            status = "sent" if all(r["ok"] for r in results) else "partial"
+        conn.execute("UPDATE campaign SET result=?, status=?, updated=? WHERE id=?",
+                     (json.dumps(results, ensure_ascii=False), status,
+                      int(time.time()), int(cid)))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def cancel_campaign(cid):
+    conn = init()
+    try:
+        cur = conn.execute(
+            "UPDATE campaign SET status='canceled', updated=? "
+            "WHERE id=? AND status='scheduled'", (int(time.time()), int(cid)))
+        conn.commit()
+        return cur.rowcount == 1
+    finally:
+        conn.close()
+
+
+def send_campaign_now(cid):
+    """把计划时间改成现在，下一轮巡检（≤20s）就会真发。"""
+    conn = init()
+    try:
+        cur = conn.execute(
+            "UPDATE campaign SET send_at=?, updated=? "
+            "WHERE id=? AND status='scheduled'",
+            (int(time.time()), int(time.time()), int(cid)))
+        conn.commit()
+        return cur.rowcount == 1
+    finally:
+        conn.close()
+
+
+def delete_campaign(cid):
+    conn = init()
+    try:
+        cur = conn.execute("DELETE FROM campaign WHERE id=?", (int(cid),))
+        conn.commit()
+        return cur.rowcount == 1
     finally:
         conn.close()
