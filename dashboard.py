@@ -32,11 +32,21 @@ API：
     GET  /api/friends             开关状态 + 今日用量 + 各状态计数 + 最近 50 条
     POST /api/friends/toggle      {enabled} 开关自动加好友（落库，20 秒内生效，无需重启）
     POST /api/friends/import      导入名单：multipart 字段 file=CSV，或 JSON {text}
+    知识库（knowledge_store + ai_client）：
+    GET    /api/knowledge        资料列表 + 运行参数 + 检索单元统计 + 格式能力
+    POST   /api/knowledge/upload      上传文件（multipart files，可多份）并自动文本化
+    POST   /api/knowledge/config      {mode,max_chars,top_k} 保存注入策略
+    POST   /api/knowledge/diagnose    {query} 检索自检：看这次模型会读到哪几段
+    GET/POST /api/knowledge/<id>/text    查看 / 人工补写提取出的正文
+    POST   /api/knowledge/<id>/toggle     {enabled} 启用或停用某份资料
+    DELETE /api/knowledge/<id>            删除资料
+    GET    /api/knowledge/<id>/file       下载原始上传文件
 """
 import os
 import io
 import csv
 import logging
+import re
 import threading
 from urllib.parse import quote
 
@@ -56,6 +66,7 @@ from monitor_store import (
 )
 import handoff
 import outreach_core as oc
+import knowledge_store as kb
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("dashboard")
@@ -63,6 +74,8 @@ log = logging.getLogger("dashboard")
 init()
 BASE = os.path.dirname(os.path.abspath(__file__))
 app = Flask(__name__, template_folder=os.path.join(BASE, "templates"))
+# 知识库上传限额（单文件在 knowledge_store 里再单独卡一道 20MB）
+app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
 MEDIA_DIR = os.path.join(BASE, "wechat_media")
 os.makedirs(MEDIA_DIR, exist_ok=True)
 # Vue 3 + Element Plus 前端的构建产物（frontend/ 下 npm run build 生成）。
@@ -697,6 +710,136 @@ def api_friends_template():
         data, mimetype="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="friend_list_template.csv"'},
     )
+
+
+# ---------------------------------------------------------------------------
+# 知识库：把上传文件变成模型能看见的文字
+# ---------------------------------------------------------------------------
+# 大模型不读本地文件、没有跨次记忆，唯一通道是每次请求把资料原文拼进 system
+# prompt。所以这里只做一件事：上传 → 抽成纯文本 → 生成顶层 .md 镜像。
+# ai_client.load_knowledge() 按目录 mtime 自动重载，上传后下一条客户消息就生效，
+# **不用重启 auto_reply**（那个进程启动后 cfg 常驻，但知识库不走 cfg）。
+def _kb_id_ok(kid):
+    return bool(re.fullmatch(r"[0-9a-f]{32}", kid or ""))
+
+
+@app.route("/api/knowledge")
+def api_knowledge_list():
+    import ai_client
+    cfg = ai_client.load_kb_config({})
+    units = ai_client.load_knowledge(cfg.get("dir", "knowledge"))
+    items = kb.list_items()
+    return jsonify({
+        "ok": True,
+        "items": items,
+        "config": cfg,
+        "modes": kb.MODE_LABELS,
+        "capabilities": kb.capabilities(),
+        "stats": {
+            "total": len(items),
+            "ready": sum(1 for x in items if x["status"] == "ready"),
+            "needs_text": sum(1 for x in items if x["status"] == "needs_text"),
+            "chars": sum(x["chars"] for x in items if x["enabled"]),
+            "units": len(units),
+            "total_chars": sum(len(u["text"]) for u in units),
+        },
+    })
+
+
+@app.route("/api/knowledge/upload", methods=["POST"])
+def api_knowledge_upload():
+    """multipart 字段名 files（也兼容单个 file），一次可传多份。
+
+    能自动抽文本的当场入库；PDF 扫描件 / 图片抽不出文字时状态为 needs_text，
+    前端提示人工粘贴正文——绝不把「文件已上传」伪装成「模型已知道」。
+    """
+    files = request.files.getlist("files") or request.files.getlist("file")
+    if not files:
+        return jsonify({"ok": False, "error": "没有收到文件"}), 400
+    added, errors = [], []
+    for f in files:
+        try:
+            item, err = kb.save_upload(f.filename or "file", f.read())
+        except Exception as e:              # noqa: BLE001
+            item, err = None, str(e)
+        if err:
+            errors.append({"name": f.filename or "", "error": err})
+        else:
+            added.append(item)
+    return jsonify({"ok": True, "added": added, "errors": errors, "count": len(added)})
+
+
+@app.route("/api/knowledge/config", methods=["POST"])
+def api_knowledge_config():
+    """保存注入策略。写 knowledge/_config.json；ai_client 把它纳入目录签名，
+    所以改完下一条消息就按新策略注入，不用重启任何进程。"""
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "error": "配置格式不对"}), 400
+    return jsonify({"ok": True, "config": kb.save_config(body)})
+
+
+@app.route("/api/knowledge/diagnose", methods=["POST"])
+def api_knowledge_diagnose():
+    """检索自检：用一句客户可能说的话，原样跑一遍选段逻辑。
+
+    返回 matched（关键词命中的）/ injected（预算内真正塞进 prompt 的）两份清单，
+    前端把「模型这次能看到什么」直接摆出来——这是排查答非所问最有效的入口。
+    """
+    import ai_client
+    q = str((request.get_json(silent=True) or {}).get("query") or "").strip()
+    if not q:
+        return jsonify({"ok": False, "error": "先填一句要试的话"}), 400
+    if len(q) > 500:
+        return jsonify({"ok": False, "error": "测试语句太长了"}), 400
+    return jsonify({"ok": True, **ai_client.diagnose(q)})
+
+
+@app.route("/api/knowledge/<kid>/text", methods=["GET", "POST"])
+def api_knowledge_text(kid):
+    if not _kb_id_ok(kid):
+        return jsonify({"ok": False, "error": "资料 id 不合法"}), 400
+    if request.method == "GET":
+        r = kb.get_text(kid)
+        if not r:
+            return jsonify({"ok": False, "error": "资料不存在"}), 404
+        return jsonify({"ok": True, **r})
+    body = request.get_json(silent=True) or {}
+    item, err = kb.set_text(kid, body.get("text"))
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    return jsonify({"ok": True, "item": item})
+
+
+@app.route("/api/knowledge/<kid>/toggle", methods=["POST"])
+def api_knowledge_toggle(kid):
+    if not _kb_id_ok(kid):
+        return jsonify({"ok": False, "error": "资料 id 不合法"}), 400
+    body = request.get_json(silent=True) or {}
+    item, err = kb.set_enabled(kid, bool(body.get("enabled")))
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    return jsonify({"ok": True, "item": item})
+
+
+@app.route("/api/knowledge/<kid>", methods=["DELETE"])
+def api_knowledge_delete(kid):
+    if not _kb_id_ok(kid):
+        return jsonify({"ok": False, "error": "资料 id 不合法"}), 400
+    if not kb.delete(kid):
+        return jsonify({"ok": False, "error": "资料不存在"}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/knowledge/<kid>/file")
+def api_knowledge_file(kid):
+    """下载原始上传文件（对照提取结果时用）。"""
+    if not _kb_id_ok(kid):
+        return jsonify({"ok": False, "error": "资料 id 不合法"}), 400
+    path, name = kb.original_path(kid)
+    if not path:
+        return ("", 404)
+    return send_file(path, as_attachment=True, download_name=name)
 
 
 def _avatar_loop():

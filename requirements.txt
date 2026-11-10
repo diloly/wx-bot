@@ -8,3 +8,9 @@ flask
 beautifulsoup4
 openai
 wechatauto-replica
+
+# 知识库上传文件的文本抽取。都是可选增强：缺了不会报错，对应文件会标成
+# 「待补文字」，在看板里人工粘贴正文即可。
+pypdf
+python-docx
+# 图片 OCR 另需 pytesseract + Pillow，且本机要装 Tesseract 与 chi_sim 中文包。

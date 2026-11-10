@@ -93,6 +93,8 @@
   },
   "knowledge": {
     "dir": "knowledge",
+    "mode": "auto",
+    "max_chars": 12000,
     "top_k": 3
   },
   "handoff": {

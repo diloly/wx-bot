@@ -66,4 +66,22 @@ export const api = {
   campaignCancel: (id) => post(`/api/campaigns/${id}/cancel`, {}),
   campaignSendNow: (id) => post(`/api/campaigns/${id}/send-now`, {}),
   campaignDelete: (id) => del(`/api/campaigns/${id}`),
+
+  // ---- 知识库（切页才拉，不进 2s 轮询）----
+  knowledgeList: () => json('/api/knowledge'),
+  knowledgeConfig: (config) => post('/api/knowledge/config', config),
+  knowledgeDiagnose: (query) => post('/api/knowledge/diagnose', { query }),
+  knowledgeText: (id) => json('/api/knowledge/' + encodeURIComponent(id) + '/text'),
+  knowledgeSaveText: (id, text) =>
+    post('/api/knowledge/' + encodeURIComponent(id) + '/text', { text }),
+  knowledgeToggle: (id, enabled) =>
+    post('/api/knowledge/' + encodeURIComponent(id) + '/toggle', { enabled }),
+  knowledgeDelete: (id) => del('/api/knowledge/' + encodeURIComponent(id)),
+  knowledgeFileUrl: (id) => '/api/knowledge/' + encodeURIComponent(id) + '/file',
+  knowledgeUpload: (files) => {
+    const fd = new FormData()
+    files.forEach((f) => fd.append('files', f))
+    // 不要手动设 Content-Type，浏览器要自己带 multipart boundary
+    return json('/api/knowledge/upload', { method: 'POST', body: fd })
+  },
 }

@@ -9,6 +9,7 @@ import FriendsView from './views/FriendsView.vue'
 import TasksView from './views/TasksView.vue'
 import HandoffView from './views/HandoffView.vue'
 import CampaignView from './views/CampaignView.vue'
+import KnowledgeView from './views/KnowledgeView.vue'
 
 const NAV = [
   { id: 'chat', label: '消息' },
@@ -17,9 +18,11 @@ const NAV = [
   { id: 'tasks', label: '维护任务' },
   { id: 'handoff', label: '人工接管' },
   { id: 'campaign', label: '活动触达' },
+  { id: 'knowledge', label: '知识库' },
 ]
 
-const active = ref('chat')
+const active = ref((location.hash || '').replace('#', ''))
+if (!NAV.some((n) => n.id === active.value)) active.value = 'chat'
 const dark = ref(document.documentElement.classList.contains('dark'))
 
 // 全看板共享的响应式中枢。原来原生 JS 里的 pickerSig / convSig / momentSigs
@@ -38,6 +41,7 @@ const store = reactive({
   friends: { enabled: false, daily_limit: 0, sent_today: 0, counts: {}, tasks: [] },
   handoff: { ok: false, config: {}, contacts: [], recent: [] },
   campaigns: { ok: false, campaigns: [], contacts: [] },
+  knowledge: { items: [], config: {}, modes: {}, capabilities: {}, stats: {} },
 })
 
 provide('store', store)
@@ -77,7 +81,7 @@ async function poll() {
   await Promise.allSettled(jobs)
 }
 
-// 接管页 / 活动页不进轮询：表单正在编辑时被覆盖会丢输入。
+// 接管页 / 活动页 / 知识库页不进轮询：表单正在编辑时被覆盖会丢输入。
 async function loadPage(id) {
   try {
     if (id === 'chat') {
@@ -86,6 +90,7 @@ async function loadPage(id) {
     }
     else if (id === 'handoff') Object.assign(store.handoff, await api.handoffConfig())
     else if (id === 'campaign') Object.assign(store.campaigns, await api.campaigns())
+    else if (id === 'knowledge') Object.assign(store.knowledge, await api.knowledgeList())
   } catch (e) {
     console.warn('[page]', id, e)
   }
@@ -93,8 +98,18 @@ async function loadPage(id) {
 
 function nav(id) {
   active.value = id
+  // hash 让刷新/分享链接能停在同一个 tab，也方便直接开 /#knowledge 排查
+  history.replaceState(null, '', '#' + id)
   loadPage(id)
 }
+
+window.addEventListener('hashchange', () => {
+  const id = (location.hash || '').replace('#', '')
+  if (NAV.some((n) => n.id === id) && id !== active.value) {
+    active.value = id
+    loadPage(id)
+  }
+})
 
 function badge(id) {
   if (id === 'tasks') return store.tasks.counts?.open || 0
@@ -104,7 +119,7 @@ function badge(id) {
 }
 
 onMounted(() => {
-  loadPage('chat')
+  loadPage(active.value)
   poll()
   timer = setInterval(poll, 2000)
 })
@@ -134,6 +149,7 @@ onUnmounted(() => clearInterval(timer))
       <TasksView v-show="active === 'tasks'" />
       <HandoffView v-show="active === 'handoff'" />
       <CampaignView v-show="active === 'campaign'" />
+      <KnowledgeView v-show="active === 'knowledge'" />
     </main>
   </div>
 </template>

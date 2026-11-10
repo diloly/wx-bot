@@ -11,11 +11,16 @@ AI 外发内容生成（OpenAI 兼容接口，支持本地 Ollama / DeepSeek / O
   （含 /v1 路径，代码不做拼接）。
 - 所有主流服务都兼容 OpenAI 的 /v1/chat/completions，所以一套代码走天下。
 - **销售化系统提示词（2026-10-15）**：默认 prompt 是「销售顾问」人设，含
-  ① 身份纪律（任何情况下不透露自己是 AI/模型，被问起有应对话术）
-  ② 微信聊天风格 ③ 产品知识注入（knowledge/ 目录按相关度检索 top_k 个小节）
-  ④ 输出纪律。ai_secrets.json 显式写 system_prompt 可完全接管 prompt。
-- **知识库**：knowledge/ 目录的 .md 文件，按「客户消息+意图+标签」二元切词检索，
-  按 mtime 自动重载。相关度为 0 的小节不注入（不塞无关资料）。详见 knowledge/_说明.md。
+  ① 身份纪律（被问到是不是 AI 必须坦然承认，没问不主动提）
+  ② 微信聊天风格 ③ 产品知识注入 ④ 输出纪律。
+  ai_secrets.json 显式写 system_prompt 可完全接管 prompt（那样就不注入知识库）。
+- **知识库（2026-11-10 改造）**：**模型不会读文件、没有记忆**，唯一通道是每次
+  请求把资料原文拼进 system prompt。所以"精准"取决于检索召回，与模型无关。
+  knowledge/ 顶层的 .md / .txt 按 ## 切成检索单元，按目录 mtime 自动重载；
+  mode=auto（默认）在资料总量 ≤ max_chars 时**全量注入**（小资料库最稳、零漏召回），
+  超预算才退回中文 bigram 关键词检索 top_k。
+  上传文件的落盘与文本化见 knowledge_store.py；运行参数在 knowledge/_config.json。
+  详见 knowledge/_说明.md。
 """
 import json
 import logging
@@ -66,8 +71,12 @@ SALES_SYSTEM_TEMPLATE = """你是{persona}，{company}的在线顾问，负责�
 只输出微信消息正文。不要引号、不要解释、不要"好的这是"开场白、不要自称前缀。"""
 
 
-# ==================== 知识库（knowledge/ 目录，关键词检索） ====================
+# ==================== 知识库（prompt 注入，不是模型记忆） ====================
+# 关键认知：模型不读本地文件、没有跨次记忆。它"知道"的全部内容，就是这一次
+# /chat/completions 请求里 system 消息中的那几段原文。所以精准度 = 检索召回率。
 _KB_CACHE = {"sig": None, "units": []}   # 按目录 mtime 签名缓存，改文件下条消息生效
+
+DEFAULT_KNOWLEDGE = {"dir": "knowledge", "mode": "auto", "max_chars": 12000, "top_k": 3}
 
 # 中文虚词/停用 bigram：出现这些的二元组不参与打分（降低"的是""可以"的噪音）
 _STOP_BIGRAMS = {
@@ -90,11 +99,11 @@ def _bigrams(text):
 
 
 def _split_sections(path):
-    """一个 md 文件按 `## 标题` 切成检索单元；没有 ## 的整文件算一个单元。"""
+    """一个 md/txt 文件按 `## 标题` 切成检索单元；没有 ## 的整文件算一个单元。"""
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8-sig") as f:
             text = f.read()
-    except Exception:
+    except (OSError, UnicodeDecodeError):
         return []
     parts = re.split(r"(?m)^##\s+", text)
     units = []
@@ -119,15 +128,26 @@ def _split_sections(path):
 
 
 def _dir_signature(d):
-    """目录下所有 md 的 (path, mtime, size) 集合，用于判断知识库是否变更。"""
+    """顶层 .md/.txt 的 (name, mtime_ns, size)；外加运行配置的 mtime。
+
+    把 _config.json 纳入签名：看板改了 mode/max_chars 之后，auto_reply 不用重启，
+    下一条消息就能按新参数注入。mtime_ns 而非秒级 mtime —— Windows 上同一秒内
+    连续上传/改配置，秒级签名会分不出变化。
+    """
     sig = []
     try:
         for fn in sorted(os.listdir(d)):
-            if not fn.lower().endswith(".md") or fn.startswith("_"):
-                continue                    # _ 开头是说明文件，不进检索库
+            if fn.startswith("_") or not fn.lower().endswith((".md", ".txt")):
+                continue                    # _ 开头是说明文件/元数据，不进检索库
             fp = os.path.join(d, fn)
+            if not os.path.isfile(fp):
+                continue
             st = os.stat(fp)
-            sig.append((fn, int(st.st_mtime), st.st_size))
+            sig.append((fn, st.st_mtime_ns, st.st_size))
+        cp = os.path.join(d, "_config.json")
+        if os.path.isfile(cp):
+            st = os.stat(cp)
+            sig.append(("_config.json", st.st_mtime_ns, st.st_size))
     except OSError:
         return None
     return tuple(sig)
@@ -144,34 +164,122 @@ def load_knowledge(dirname="knowledge"):
         return _KB_CACHE["units"]
     units = []
     for fn, _mtime, _size in sig:
-        units.extend(_split_sections(os.path.join(d, fn)))
+        if fn.lower().endswith((".md", ".txt")):
+            units.extend(_split_sections(os.path.join(d, fn)))
     _KB_CACHE["sig"] = sig
     _KB_CACHE["units"] = units
     return units
 
 
-def retrieve(units, query, top_k=3):
-    """按 query 与每个单元的重合度取 top_k 个小节；全不相关返回 []（不硬塞）。
-    标题 bigram 权重 x3：小节标题命中比正文命中更说明相关。"""
+def load_kb_config(cfg):
+    """config.json 的 knowledge 块 + knowledge/_config.json（看板可改，后者优先）。"""
+    kcfg = dict(DEFAULT_KNOWLEDGE)
+    kcfg.update({k: v for k, v in (cfg.get("knowledge") or {}).items()
+                 if k in DEFAULT_KNOWLEDGE})
+    try:
+        import knowledge_store
+        kcfg.update(knowledge_store.load_config())
+    except Exception as e:                 # noqa: BLE001
+        log.debug("知识库运行配置读取失败，用 config.json 默认值: %s", e)
+    return kcfg
+
+
+def retrieve_scored(units, query, top_k=3):
+    """按 query 与每个单元的重合度打分，返回 [(score, unit)] 降序。
+
+    修掉旧实现的权重 bug：以前写 `tg = list(title_bigrams)*3 + list(body_bigrams)`
+    再 `set(tg)`，重复的标题二元组被去重吃光，标题 x3 权重其实从未生效。
+    现在显式区分「命中标题=3 分 / 只命中正文=1 分」。
+    注意这仍是**字面匹配**：客户说"多少钱"、资料写"定价/报价"，一个字都对不上，
+    就召回不到 —— 这正是小资料库默认改成全量注入的原因。
+    """
     qg = _bigrams(query)
     if not qg or not units:
         return []
     scored = []
     for u in units:
-        tg = list(_bigrams(u["title"])) * 3 + list(_bigrams(u["text"]))
-        tg_set = set(tg)
-        if not tg_set:
+        tg = _bigrams(u["title"])
+        bg = _bigrams(u["text"])
+        hit = qg & (tg | bg)
+        if not hit:
             continue
-        covered = sum(1 for g in qg if g in tg_set)
-        if covered == 0:
-            continue
-        score = covered / len(qg)          # query 覆盖率：问的词有多少被本节说到
-        scored.append((score, u))
+        got = sum(3.0 if g in tg else 1.0 for g in hit)
+        scored.append((round(got / (len(qg) * 3.0), 4), u))
     scored.sort(key=lambda x: -x[0])
-    return [u for _s, u in scored[:max(1, int(top_k))]]
+    return scored[:max(1, int(top_k))]
 
 
-def build_system(ai_cfg, knowledge_units):
+def retrieve(units, query, top_k=3):
+    """兼容旧调用：只要单元列表，不要分数。全不相关返回 []（不硬塞）。"""
+    return [u for _s, u in retrieve_scored(units, query, top_k)]
+
+
+def _unit_brief(score, u):
+    return {
+        "file": os.path.splitext(u["file"])[0],
+        "title": u["title"],
+        "chars": len(u["text"]),
+        "score": score,
+        "preview": u["text"][:140],
+    }
+
+
+def select_units(units, query, kcfg):
+    """决定这一次请求给模型看哪些资料，并守住 max_chars 预算。
+
+    mode:
+      full      —— 不问相关度，全部单元按文件顺序注入
+      retrieve  —— 只注入关键词命中的 top_k 个单元
+      auto(默认)—— 资料总量 ≤ 预算就 full（小资料库零漏召回），超了自动 retrieve
+    返回 (hits, info)，info 供看板「检索自检」把模型视野可视化。
+    """
+    total_chars = sum(len(u["text"] or "") for u in units)
+    try:
+        budget = max(1000, int(kcfg.get("max_chars", 12000)))
+    except (TypeError, ValueError):
+        budget = 12000
+    mode = str(kcfg.get("mode") or "auto")
+    if mode not in ("auto", "full", "retrieve"):
+        mode = "auto"
+    effective = ("full" if mode == "full" or (mode == "auto" and total_chars <= budget)
+                 else "retrieve")
+    if effective == "full":
+        scored = [(1.0, u) for u in units]
+    else:
+        scored = retrieve_scored(units, query, kcfg.get("top_k", 3))
+
+    injected, used = [], 0
+    for s, u in scored:
+        if used >= budget:
+            break
+        injected.append((s, u))
+        used += len(u["text"] or "")
+    hits = [u for _s, u in injected]
+    info = {
+        "mode": mode,
+        "effective": effective,
+        "budget": budget,
+        "total_units": len(units),
+        "total_chars": total_chars,
+        "injected_chars": used,
+        "truncated": used > budget,
+        "matched": [_unit_brief(s, u) for s, u in scored],
+        "injected": [_unit_brief(s, u) for s, u in injected],
+    }
+    return hits, info
+
+
+def diagnose(query, cfg=None):
+    """给看板「检索自检」用：原样跑一遍选段逻辑，回答「这次模型到底看到了什么」。"""
+    kcfg = load_kb_config(cfg or {})
+    units = load_knowledge(kcfg.get("dir", "knowledge"))
+    _hits, info = select_units(units, query, kcfg)
+    info["query"] = query
+    info["config"] = kcfg
+    return info
+
+
+def build_system(ai_cfg, knowledge_units, max_chars=None):
     """组装销售系统提示词：人设 + 定位 + 产品知识小节。
     ai_cfg 可覆写 persona/company/product/positioning（config.json 的 ai 块）。"""
     persona = (ai_cfg.get("persona") or "小光").strip()
@@ -179,9 +287,13 @@ def build_system(ai_cfg, knowledge_units):
     product = (ai_cfg.get("product") or "AI照明工作站（A站）").strip()
     positioning = (ai_cfg.get("positioning") or "为设计提效的 AI SaaS 平台").strip()
     if knowledge_units:
-        blocks = ["〔资料：%s / %s〕\n%s" % (u["file"], u["title"], u["text"])
+        blocks = ["〔资料：%s / %s〕\n%s" %
+                  (os.path.splitext(u["file"])[0], u["title"], u["text"])
                   for u in knowledge_units]
         knowledge = "\n\n".join(blocks)
+        # 单元级预算之外再做一次字符级硬截：单个超长单元也不许把 prompt 撑爆
+        if max_chars and len(knowledge) > max_chars:
+            knowledge = knowledge[:max_chars] + "\n…（资料超出预算，后面已截断）"
     else:
         knowledge = "（暂无相关资料。客户问到产品细节就回答'我确认一下再回复你'，不要编造。）"
     return SALES_SYSTEM_TEMPLATE.format(
@@ -353,16 +465,19 @@ def generate(cfg, contact, intent, extra_context="", timeout=60):
     base_url, api_key, model, system_prompt, temperature, max_tokens, provider = _resolve(cfg)
     ai_cfg = cfg.get("ai") or {}
     if not system_prompt:
-        # 走内置销售模板：按相关度从 knowledge/ 检索产品资料注入
-        kcfg = cfg.get("knowledge") or {}
+        # 走内置销售模板：把选中的产品资料原文拼进 system（模型唯一的知识来源）
+        kcfg = load_kb_config(cfg)
         units = load_knowledge(kcfg.get("dir", "knowledge"))
         query = " ".join([
             intent or "", extra_context or "",
             contact.get("name", ""), ",".join(contact.get("tags", []) or []),
             contact.get("note", "") or "",
         ])
-        hits = retrieve(units, query, int(kcfg.get("top_k", 3)))
-        system_prompt = build_system(ai_cfg, hits)
+        hits, info = select_units(units, query, kcfg)
+        log.info("知识库注入: mode=%s/%s %d/%d 段 %d/%d 字",
+                 info["mode"], info["effective"], len(hits),
+                 info["total_units"], info["injected_chars"], info["total_chars"])
+        system_prompt = build_system(ai_cfg, hits, kcfg.get("max_chars"))
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": build_user_prompt(contact, intent)},
