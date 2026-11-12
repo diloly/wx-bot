@@ -53,6 +53,7 @@ auto_reply.py —— 自动回复闭环：实时收消息 -> 大模型生成 -> 
 """
 import argparse
 import json
+import os
 import queue
 import random
 import re
@@ -86,10 +87,12 @@ class ReplyTask:
     排了别人就无限期挂着。
     """
     __slots__ = ("id", "conv_id", "name", "text", "created", "deadline", "reply",
-                 "kind", "at_name", "variant", "by", "campaign_id")
+                 "kind", "at_name", "variant", "by", "campaign_id",
+                 "image", "image_note")
 
     def __init__(self, conv_id, name, text, timeout, task_id=None, kind="reply",
-                 at_name=None, variant="revive", by="ai", campaign_id=None):
+                 at_name=None, variant="revive", by="ai", campaign_id=None,
+                 image=None, image_note=""):
         self.id = task_id          # reply_task 表主键（落库后回填；None=未落库）
         self.conv_id = conv_id
         self.name = name
@@ -106,6 +109,13 @@ class ReplyTask:
         self.by = by
         # 活动触达：发完要把结果回写到 campaign.result（None=普通任务）
         self.campaign_id = campaign_id
+        # 可选配图：与正文**同一次 Enter** 一起进输入框（微信拆成两个紧挨着的
+        # 气泡），不是发完正文再点一次发送。存的是**绝对路径**（发送前已 resolve），
+        # 不是素材 id；素材被删就没图。
+        self.image = image
+        # 配图没跟上的原因（素材已删 / 排队期间失效）。非空时活动结果按「失败」
+        # 回写并在详情里写明「正文已发出」，绝不把缺图藏起来。
+        self.image_note = image_note or ""
 
     def remaining(self):
         return self.deadline - time.time()
@@ -165,6 +175,13 @@ class AutoReplier:
         self.context_turns = ar.get("context_turns", 3)    # 带给AI的最近对话轮数（1轮=1来1回）
         self.context_hours = ar.get("context_hours", 6)    # 上下文时间窗：更早的历史不带
         self.reply_types = set(ar.get("reply_types", ["文本"]))
+        # 表情（默认关）：只改 system prompt 让模型自己用 emoji / 微信表情代码，
+        # 文本发送链路一行不动——表情本质就是正文里的字符，回读校验照常生效。
+        self.emoji_enabled = bool(ar.get("emoji_enabled", False))
+        # 自动回复配图规则（默认空）：按「客户原话关键词」命中一张素材库图片。
+        # 形如 [{"keywords": ["报价", "价目表"], "asset_id": "<素材库 id>"}]。
+        # asset_id 是本机素材库生成的随机 id，属于本机数据，配置模板保持空数组。
+        self.image_rules = ar.get("image_rules") or []
         self.enabled = ar.get("enabled", False)   # 总开关：false 时只监控上屏，不回复任何人
         self.dry_run = ar.get("dry_run", True)
         # 单条回复任务的时间预算（秒）：覆盖 AI 生成 + 排队 + 发送三段。
@@ -385,6 +402,46 @@ class AutoReplier:
                        "不要冒充真人；必要时可以用半句话自报（例如「我是 AI 助手小光」）。")
         return intent
 
+    # ---------- 自动回复配图（关键词 → 素材库图片） ----------
+    @staticmethod
+    def _resolve_asset(aid):
+        """素材 id -> 绝对路径；没装 Pillow / 索引坏了 / 文件删了都返回 None。
+
+        这里只做解析，不写库、不碰微信 UI，所以放在 worker 门外随便调。
+        """
+        try:
+            import media_assets
+            return media_assets.resolve(aid)
+        except Exception:           # noqa: BLE001
+            return None
+
+    def _match_image(self, text):
+        """按客户原话里的关键词挑一张配图，返回 ``(绝对路径, 缺图原因)``。
+
+        只认**客户说的话**：AI 生成了什么、会不会答非所问都不影响，规则由人在
+        config 里写死，命中就发、没命中就不发。素材中途被删不拖垮回复——正文
+        照发，note 里写明原因，活动触达会把这条原因回写到详情里。
+        """
+        if not self.image_rules or not text:
+            return None, ""
+        for rule in self.image_rules:
+            if not isinstance(rule, dict):
+                continue
+            kws = rule.get("keywords") or []
+            if isinstance(kws, str):
+                kws = [kws]
+            if not any(str(k).strip() and str(k).strip() in text for k in kws):
+                continue
+            aid = str(rule.get("asset_id") or "").strip()
+            if not aid:
+                continue
+            path = self._resolve_asset(aid)
+            if path:
+                return path, ""
+            print("[auto] 配图规则命中，但素材 %s 已不存在 → 本次只发正文" % aid[:16])
+            return None, "配图素材已删除，本次只发了正文"
+        return None, ""
+
     # ---------- 任务状态账本（内存队列的持久化镜像，仅供看板「看得见」） ----------
     # 内存 queue 才是真正的工作队列（worker 靠它阻塞取值、保证 FIFO）；reply_task
     # 表是状态账本。两个进程不共享内存，看板（另一个进程）只能通过库看见队列。
@@ -500,8 +557,14 @@ class AutoReplier:
             return
         self._hour_window.append(now)
         merged = "\n".join(t for t in texts if t)   # 多条按收到顺序拼接，喂给 AI
+        # 配图规则在这里判（客户原话已经齐了），只挂到任务上；真正发图与正文
+        # 共用同一次 Enter，见 wechat_ui.send_to_contact(image_path=...)。
+        # 群聊 @ 走 _at_member 的另一套按键序列，塞不进图片，这类任务不挂图，
+        # 免得配图被静默忽略、规则形同虚设。
+        at_name = buf.get("at_name")
+        img_path, img_note = (None, "") if at_name else self._match_image(merged)
         task = ReplyTask(conv_id, name, merged, self.task_timeout,
-                         at_name=buf.get("at_name"))
+                         at_name=at_name, image=img_path, image_note=img_note)
         task.id = self._task_open(task)        # 状态账本（看板可观测）
         try:
             self._ai_q.put_nowait(task)
@@ -966,6 +1029,14 @@ class AutoReplier:
                 intent = self._build_outreach_intent(task.text, task.variant)
             else:
                 intent = self._build_intent(task.conv_id)
+            # 表情只是正文里的字符，不需要碰发送链路：在 system prompt 里放开
+            # 口子让模型自己适量用，回读校验 / 三态确认全部照旧生效。
+            if self.emoji_enabled:
+                intent += (
+                    "\n【表达】可以适度用 1 个 emoji（如 🙂）或微信表情代码"
+                    "（如 [微笑]、[握手]）让语气自然，最多一条用一个，不要堆砌；"
+                    "微信表情代码可能被客户端转成黄脸表情，也可能原样以文字发出，"
+                    "两种都属正常，不要因此重复发一条。")
             reply = ai_generate(
                 self.cfg, self._contact_of(task.conv_id, task.name),
                 intent,
@@ -1090,12 +1161,21 @@ class AutoReplier:
             if self._send_q.qsize():
                 print("[auto] 发送 %s（后面还排着 %d 条）" % (task.name, self._send_q.qsize()))
             self._task_set(task, "sending")    # 账本：发送线程已接手
+            # 配图和正文要在**同一次 Enter** 里一起进输入框。素材可能在这条任务
+            # 排队期间被删：这时别让整条任务中止，降级成「只发正文」并把原因带到
+            # 活动结果里（按失败回写，不静默降级）。
+            image_path = task.image
+            if image_path and not os.path.isfile(image_path):
+                print("[auto] %s 的配图在排队期间失效 → 本次只发正文" % task.name)
+                image_path = None
+                task.image_note = task.image_note or "配图素材已删除或已失效"
             try:
                 self.bot.send_to_contact(task.name, task.reply,
                                          conv_id=task.conv_id, ui_timeout=rem,
                                          by=task.by,   # ai / manual / handoff / campaign
                                          confirm=self._confirm_sent,
-                                         at_name=task.at_name)   # 群聊：发送前先 @ 提问者
+                                         at_name=task.at_name,  # 群聊：发送前先 @ 提问者
+                                         image_path=image_path)
             except ui_gate.UITimeoutError as e:
                 print("[auto] 发送排队超时（本条 %.0fs 预算内没排到）: %s —— %s"
                       % (task.name, rem, e))
@@ -1140,9 +1220,17 @@ class AutoReplier:
                 self._campaign_result(task, False, reason)
                 continue
             # 发送成功（dry-run 下 send_to_contact 不真发，账本注明，免得看板误判）
+            # 配图和正文是**同一次 Enter** 一起进输入框的（微信自己拆成两个紧挨着的
+            # 气泡），所以这里不再有第二次发送：图片阶段任何失败都在按发送键之前
+            # 抛 SendAborted，走上面的 except 分支，正文和图一起没发出。
+            # 唯一「图没成但正文发了」的情况 = 素材在发送前就失效（image_note），
+            # 这时仍按失败回写并在详情里写明「正文已发出」，绝不静默降级。
+            fail_note = "" if self.dry_run else task.image_note
+            camp_reason = ("正文已发出，但配图未发：%s" % fail_note) if fail_note else ""
             self._task_set(task, "sent", reply=task.reply,
-                           reason=("dry-run：未真发" if self.dry_run else None))
-            self._campaign_result(task, True)
+                           reason=("dry-run：未真发" if self.dry_run
+                                   else (camp_reason or None)))
+            self._campaign_result(task, not bool(fail_note), camp_reason)
             # 主动触达发出去之后，顺手把该会话的自动回复打开：我们主动找的人
             # 回话了我们却不接，比不发还糟。dry-run 不真发，也就不该改开关。
             if task.kind == "outreach" and not self.dry_run:
@@ -1201,11 +1289,22 @@ class AutoReplier:
                 monitor_store.record_campaign_result(
                     cid, "", "", False, "内容为空或没选对象")
                 continue
+            # 配图在创建时校验过 id，但素材可能在这期间被删：整条活动只解析一次
+            # 复用。缺图只记原因、正文照发，绝不把活动卡住或静默降级不告知。
+            img_path, img_note = "", ""
+            img_id = str(c.get("image") or "").strip()
+            if img_id:
+                img_path = self._resolve_asset(img_id) or ""
+                if not img_path:
+                    img_note = "配图素材已删除或已失效"
+                    print("[campaign] 「%s」%s → 本次只发正文"
+                          % (c.get("name") or cid, img_note))
             with self._campaign_lock:
                 self._campaign_active[cid] = {
                     "content": content, "targets": targets,
                     "ids": [t.get("conv_id") for t in targets],
                     "queued": set(),
+                    "image": img_path, "image_note": img_note,
                 }
             print("[campaign] 开始执行「%s」（%d 个对象）"
                   % (c.get("name") or cid, len(targets)))
@@ -1231,7 +1330,9 @@ class AutoReplier:
                 st["queued"].add(cid2)   # 先占名额，投递失败再释放
             name = (nxt.get("name") or cid2).strip()
             task = ReplyTask(cid2, name, "", max(self.task_timeout, 300),
-                             kind="campaign", by="campaign", campaign_id=cid)
+                             kind="campaign", by="campaign", campaign_id=cid,
+                             image=st.get("image") or None,
+                             image_note=st.get("image_note") or "")
             task.reply = st["content"]
             task.id = self._task_open(task)
             try:
@@ -1379,6 +1480,34 @@ class AutoReplier:
             return self.ou_enabled
         return (v == "1")
 
+    def _ou_include_new(self):
+        """破冰开关的生效值：看板设置（app_setting）优先，没有才用 config。
+
+        和 `_ou_enabled` 同一个道理——config.json 只在启动时读一次，而看板上
+        「没聊过也破冰」点一下应该当轮就生效，不能让人为了改个开关去重启主进程。
+        """
+        try:
+            v = monitor_store.get_setting("outreach_include_new")
+        except Exception:           # noqa: BLE001
+            v = None
+        if v is None or v == "":
+            return self.ou_include_new
+        return (v == "1")
+
+    def _ou_require_switch(self):
+        """「只碰已开托管的客户」的生效值：看板设置优先，没有才用 config。
+
+        开着它，主动触达就变成**正向白名单**——只有你在看板上显式开了托管的人
+        才会被主动搭话，其余一律跳过。
+        """
+        try:
+            v = monitor_store.get_setting("outreach_require_switch")
+        except Exception:           # noqa: BLE001
+            v = None
+        if v is None or v == "":
+            return bool(self.ou_cfg.get("require_switch", False))
+        return (v == "1")
+
     def _outreach_tick(self):
         """一轮巡检：闸门全部通过才挑一个人发一条。任何一环不满足就安静退出。"""
         if not self._ou_enabled():
@@ -1420,7 +1549,13 @@ class AutoReplier:
         try:
             # 候选规则统一走 outreach_core（与 activate.py 同一份实现）：
             # 沉默客户在前、没聊过的破冰在后，冷却/累计次数都在那边卡。
-            cands = oc.pick_targets(self.ou_cfg, limit=3, now=int(now))
+            # 三个开关（破冰 / 只碰托管 / 不打扰名单）里前两个**看板可改**，
+            # 所以每轮把库里的生效值合进 cfg 再算候选——不这么做，看板点了开关
+            # 还要等重启才认，等于白给一个按钮。
+            ou = dict(self.ou_cfg)
+            ou["include_new_contacts"] = self._ou_include_new()
+            ou["require_switch"] = self._ou_require_switch()
+            cands = oc.pick_targets(ou, limit=3, now=int(now))
         except Exception as e:          # noqa: BLE001
             print("[auto] 主动触达取候选失败（本轮跳过）: %s" % e)
             return
@@ -1428,7 +1563,7 @@ class AutoReplier:
             conv_id = c.get("conv_id") or ""
             variant = c.get("kind") or "revive"
             if variant == "icebreak":
-                if not self.ou_include_new:
+                if not self._ou_include_new():
                     continue            # 没显式授权，就不给没说过话的人发消息
                 ctx = ""                # 破冰没有旧话题可承接，靠自我介绍开场
             else:
@@ -1589,7 +1724,7 @@ class AutoReplier:
                      self.ou_work_start, self.ou_work_end,
                      self.ou_silent_days, self.ou_min_gap_days,
                      self.ou_max_per_contact, cycle_txt,
-                     "开" if self.ou_include_new else "关"))
+                     "开" if self._ou_include_new() else "关"))
         else:
             print("[auto] 主动触达未启用（看板已关或 config.outreach.enabled=false）："
                   "不会主动给客户发消息；开关状态存在数据库，重启不会自动打开")
@@ -1632,7 +1767,10 @@ class AutoReplier:
         为什么独立成线程（2026-10-16）：这一整套含 UI 刷新（带 4s 停留）和逐条
         点赞，一轮能占几十秒。留在主线程里会把「收到消息 → 立刻发起 AI 请求」
         整条流水线一起冻住，正好抵消本轮流水线改造的意义。
-        节奏：每 `interval × 6` 秒一轮（与原来「每 6 轮约 60s」等效）。
+        节奏：每 `interval × 6` 秒一轮（与原来「每 6 轮约 60s」等效；
+        当前 config 的 interval_seconds=5 → 30s 一轮，纯读库、零 UI）。
+        真正会抢微信前台的 UI 刷新另有自己的定时（moment.refresh_interval，
+        当前 3600s = 1 小时），见 _poll_moments，别把两层节奏混为一谈。
         """
         period = max(10.0, float(self.interval) * 6)
         while not self._stop.is_set():
@@ -1663,9 +1801,11 @@ class AutoReplier:
                 self._moment_ops = moment_ops.MomentOps(self.cfg)
             # 定期 UI 刷新：微信 PC 只在用户点朋友圈页「刷新」按钮时才同步
             # 新圈，纯解密库读只能看到同步过的数据（2026-10-16 实测）。
-            # interval=0 可关闭（只读库里已有的）。
+            # interval=0 可关闭（只读库里已有的）。默认 3600s=1 小时：这动作要
+            # 抢占微信前台并停留几秒，太频繁会打断人用电脑（2026-11-12 用户拍板
+            # 从 180s 调大）。实际刷新点仍对齐到 _moment_worker 的周期粒度。
             mcfg = self.cfg.get("moment", {}) or {}
-            interval = float(mcfg.get("refresh_interval", 180))
+            interval = float(mcfg.get("refresh_interval", 3600))
             now = time.time()
             if interval > 0 and now - self._last_moment_refresh >= interval:
                 self._last_moment_refresh = now

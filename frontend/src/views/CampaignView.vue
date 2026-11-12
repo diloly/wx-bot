@@ -1,19 +1,64 @@
 <script setup>
-import { computed, inject, reactive, ref } from 'vue'
+import { computed, inject, nextTick, reactive, ref } from 'vue'
 import { ElMessageBox } from 'element-plus'
 import { api } from '../api'
 import { fmtTime, CAMPAIGN_STATUS } from '../utils'
 import ContactPicker from '../components/ContactPicker.vue'
+import EmojiPicker from '../components/EmojiPicker.vue'
 
 const store = inject('store')
 const toast = inject('toast')
 const refreshPage = inject('refreshPage')
 
-const form = reactive({ name: '', content: '', send_at: '', grace_minutes: 60 })
+const form = reactive({ name: '', content: '', send_at: '', grace_minutes: 60, image: '' })
 const selected = ref([])
 const creating = ref(false)
 const contacts = computed(() => store.campaigns.contacts || [])
 const campaigns = computed(() => store.campaigns.campaigns || [])
+// 素材库列表随 /api/campaigns 一起返回，id -> 预览 URL 的反查就在这里做
+const assets = computed(() => store.campaigns.media || [])
+const pickedAsset = computed(() => assets.value.find((a) => a.id === form.image) || null)
+
+function assetOf(id) { return assets.value.find((a) => a.id === id) || null }
+function mediaUrl(id) { const it = assetOf(id); return it ? it.url : '' }
+function assetName(id) { const it = assetOf(id); return it ? it.name : '素材已删除' }
+
+// 表情 / 微信表情代码只是插进正文的字符，发送时走原有文本链路
+const contentInput = ref(null)
+function insertEmoji(s) {
+  const ta = contentInput.value?.$el?.querySelector?.('textarea')
+  const cur = form.content || ''
+  const pos = (ta && ta.selectionStart != null) ? ta.selectionStart : cur.length
+  form.content = cur.slice(0, pos) + s + cur.slice(pos)
+  nextTick(() => {
+    if (!ta) return
+    ta.focus()
+    try { ta.setSelectionRange(pos + s.length, pos + s.length) } catch (_) { /* 忽略 */ }
+  })
+}
+
+const assetOpen = ref(false)
+const assetBusy = ref(false)
+const assetFile = ref(null)
+function openAssetFile() { assetFile.value?.click?.() }
+function pickAsset(it) { form.image = it.id; assetOpen.value = false }
+function clearImage() { form.image = ''; assetOpen.value = false }
+async function uploadAsset(e) {
+  const f = e.target.files?.[0]
+  e.target.value = ''
+  if (!f || assetBusy.value) return
+  assetBusy.value = true
+  try {
+    const r = await api.mediaUpload(f)
+    if (r.ok === false) throw new Error(r.error || '上传失败')
+    // 局部补进素材列表，不用整页刷新（会冲掉刚写好的正文和已选对象）
+    const list = Array.isArray(store.campaigns.media) ? store.campaigns.media : []
+    store.campaigns.media = [r.item, ...list.filter((a) => a.id !== r.item.id)]
+    form.image = r.item.id
+    toast('图片已上传并设为配图')
+  } catch (err) { toast('上传失败：' + err.message, 'error') }
+  finally { assetBusy.value = false }
+}
 
 // 详情弹窗：数据本来就在 /api/campaigns 里，不需要新接口。
 // 用 id 从 store 里实时取，操作（立即发送/取消）刷新后弹窗内容会跟着更新。
@@ -110,7 +155,7 @@ async function create() {
     const r = await api.campaignCreate({ ...form, targets })
     if (r.ok === false) throw new Error(r.error || '创建失败')
     toast('活动已排期')
-    Object.assign(form, { name: '', content: '', send_at: '', grace_minutes: 60 })
+    Object.assign(form, { name: '', content: '', send_at: '', grace_minutes: 60, image: '' })
     selected.value = []
     await refreshPage('campaign')
   } catch (e) { toast('创建失败：' + e.message, 'error') }
@@ -159,7 +204,34 @@ async function action(c, act) {
           </el-form-item>
           <el-form-item label="过点宽限(分)"><el-input-number v-model="form.grace_minutes" :min="1" :max="1440" /></el-form-item>
           <el-form-item label="正文">
-            <el-input v-model="form.content" type="textarea" :rows="4" maxlength="2000" show-word-limit placeholder="写死要发的文案，≤2000 字" />
+            <div style="width: 100%">
+              <el-input ref="contentInput" v-model="form.content" type="textarea" :rows="4"
+                        maxlength="2000" show-word-limit placeholder="写死要发的文案，≤2000 字" />
+              <div class="cd-tools"><EmojiPicker @pick="insertEmoji" /></div>
+            </div>
+          </el-form-item>
+          <el-form-item label="配图">
+            <div style="width: 100%">
+              <div v-if="pickedAsset" class="cd-picked">
+                <img :src="pickedAsset.url" alt="配图预览"
+                     @error="(e) => { e.target.style.display = 'none' }" />
+                <span class="wb-hint">{{ pickedAsset.name }}</span>
+                <el-button link type="danger" size="small" @click="clearImage">移除</el-button>
+              </div>
+              <div class="cd-tools">
+                <el-button size="small" @click="assetOpen = true">
+                  {{ form.image ? '换一张' : '从素材库选图' }}
+                </el-button>
+                <el-button size="small" :loading="assetBusy" @click="openAssetFile">上传新图</el-button>
+                <input ref="assetFile" type="file" accept="image/*" style="display: none"
+                       @change="uploadAsset" />
+              </div>
+              <div class="wb-hint" style="margin-top: 6px; line-height: 1.6">
+                配图和正文一起进输入框、只按一次发送，微信会自动拆成「文字 + 图片」
+                两个紧挨着的气泡，中间不再有等待。正文不能为空；图片由消息回执上屏，
+                不写假消息。素材只存在本机，不进仓库。
+              </div>
+            </div>
           </el-form-item>
         </el-form>
       </div>
@@ -181,6 +253,7 @@ async function action(c, act) {
         <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
           <b style="font-size: 15px">{{ c.name || '未命名活动' }}</b>
           <el-tag size="small" effect="plain" :type="statusType(c.status)">{{ CAMPAIGN_STATUS[c.status] || c.status }}</el-tag>
+          <el-tag v-if="c.image" size="small" effect="plain" type="info">含配图</el-tag>
           <span class="wb-hint">计划 {{ fmtTime(c.send_at) }} · {{ cstat(c).total }} 个对象</span>
           <div style="margin-left: auto; display: flex; gap: 6px">
             <el-button size="small" type="primary" plain @click="openDetail(c)">详情</el-button>
@@ -223,6 +296,16 @@ async function action(c, act) {
         </div>
         <pre class="cd-content">{{ detail.content }}</pre>
 
+        <div class="cd-section">活动配图</div>
+        <div v-if="detail.image" class="cd-image">
+          <img v-if="mediaUrl(detail.image)" :src="mediaUrl(detail.image)" alt="活动配图" />
+          <div v-else class="wb-hint">
+            配图素材已删除。执行时会只发正文，并在逐条结果里注明「正文已发出，但配图未发」。
+          </div>
+          <div class="wb-hint">{{ assetName(detail.image) }}</div>
+        </div>
+        <div v-else class="wb-hint">本次活动没有配图。</div>
+
         <div class="cd-section">
           发送对象与逐条结果
           <span class="wb-hint">
@@ -251,10 +334,46 @@ async function action(c, act) {
         <el-button @click="detailVisible = false">关闭</el-button>
       </template>
     </el-dialog>
+
+    <el-dialog v-model="assetOpen" width="620px" top="8vh" title="选择活动配图">
+      <div class="wb-hint" style="margin-bottom: 10px">
+        点一张设为本次活动的配图；与正文一次发送，微信会自动拆成两个气泡。素材只存在本机。
+      </div>
+      <div v-if="assets.length" class="cd-assets">
+        <div v-for="a in assets" :key="a.id" class="cd-asset"
+             :class="{ on: form.image === a.id }" @click="pickAsset(a)">
+          <img :src="a.url" :alt="a.name"
+               @error="(e) => { e.target.style.display = 'none' }" />
+          <span :title="a.name">{{ a.name }}</span>
+        </div>
+      </div>
+      <div v-else class="wb-empty">素材库还是空的，先上传一张图片</div>
+      <template #footer>
+        <el-button :loading="assetBusy" @click="openAssetFile">上传新图</el-button>
+        <el-button @click="clearImage">不使用配图</el-button>
+        <el-button type="primary" @click="assetOpen = false">完成</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <style scoped>
+.cd-tools { display: flex; align-items: center; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
+.cd-picked { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.cd-picked img { width: 46px; height: 46px; object-fit: cover; border-radius: 6px; border: 1px solid var(--wb-border); }
+.cd-image img {
+  max-width: 260px; max-height: 180px; border-radius: 8px;
+  border: 1px solid var(--wb-border); display: block; margin-bottom: 6px;
+}
+.cd-assets { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; max-height: 380px; overflow-y: auto; }
+.cd-asset {
+  border: 2px solid transparent; border-radius: 8px; padding: 5px; cursor: pointer;
+  background: var(--wb-surface-2); overflow: hidden;
+}
+.cd-asset.on { border-color: var(--wb-accent); }
+.cd-asset img { width: 100%; height: 84px; object-fit: cover; border-radius: 5px; display: block; }
+.cd-asset span { display: block; font-size: 12px; color: var(--wb-muted); margin-top: 4px;
+                 white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .cd-row { padding: 12px 0; border-bottom: 1px solid var(--wb-border); }
 .cd-content-clamp {
   font-size: 14px; color: var(--wb-muted); margin-top: 6px; white-space: pre-wrap;

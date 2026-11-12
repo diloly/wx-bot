@@ -44,6 +44,9 @@ const store = reactive({
   outreach: {
     enabled: false, persisted: false, source: '', config_enabled: false,
     sent_today: 0, daily_limit: 0, daily_unlimited: true, candidates: [],
+    // 两个可改的行为开关 + 不打扰名单（私人联系人）
+    include_new_contacts: false, require_switch: false,
+    skip_count: 0, skip_list: [],
   },
   handoff: { ok: false, config: {}, contacts: [], recent: [] },
   campaigns: { ok: false, campaigns: [], contacts: [] },

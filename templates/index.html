@@ -177,6 +177,15 @@
     font-family: inherit;
   }
   .cp-form textarea { resize: vertical; line-height: 1.6; }
+  .cp-image-box {
+    display: flex; align-items: center; gap: 8px; min-height: 34px;
+    font-size: 12px; color: #576b95;
+  }
+  .cp-image-box img {
+    width: 34px; height: 34px; object-fit: cover;
+    border-radius: 5px; border: 1px solid #dcdfe4;
+  }
+  .cp-image-box span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
   .cp-list { max-height: 210px; overflow: auto; border: 1px solid #e6e8eb; border-radius: 8px; }
   .cp-note { font-size: 11px; color: #9aa0a8; line-height: 1.6; }
   .cp-badge { font-size: 11px; padding: 2px 7px; border-radius: 4px; background: #eef0f2; color: #576b95; }
@@ -277,8 +286,88 @@
   }
   .tagchip:hover { background: #e9ebee; }
   .tagchip.on { background: #e7f9d9; color: #12864a; border-color: #bfe0a8; }
+  /* 批量勾选：接管「通知谁」/ 活动「发给谁」共用，只作用于当前筛选 + 搜索结果 */
+  .bulk-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+  .bulk-btn {
+    padding: 4px 10px; border-radius: 6px; border: 1px solid #dcdfe3;
+    background: #fff; color: #12864a; font-size: 12px; cursor: pointer;
+  }
+  .bulk-btn:hover { background: #e7f9d9; border-color: #bfe0a8; }
+  .bulk-row .muted { font-size: 11px; }
+  /* 多媒体输入：表情面板 / 图片 / 素材库（新版旧版共用同一组接口） */
+  .composer-tools { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 6px 0; }
+  .composer-tools button {
+    padding: 3px 9px; border-radius: 5px; border: 1px solid #dcdfe3;
+    background: #fff; color: #5b6068; font-size: 12px; cursor: pointer;
+  }
+  .composer-tools button:hover { background: #e7f9d9; border-color: #bfe0a8; }
+  .composer-tools .muted { font-size: 11px; }
+  .emoji-panel {
+    position: fixed; z-index: 90; width: 300px; max-height: 270px; overflow-y: auto;
+    background: #fff; border: 1px solid #dcdfe3; border-radius: 8px;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, .18); padding: 10px; box-sizing: border-box;
+  }
+  .emoji-panel .tabs { display: flex; gap: 12px; border-bottom: 1px solid #eee; margin-bottom: 8px; }
+  .emoji-panel .tabs span { cursor: pointer; font-size: 12px; color: #9aa0a8; padding-bottom: 6px; }
+  .emoji-panel .tabs span.on { color: #07c160; font-weight: 600; border-bottom: 2px solid #07c160; }
+  .emoji-panel .grid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 2px; }
+  .emoji-panel .grid.wx { grid-template-columns: repeat(3, 1fr); }
+  .emoji-panel .grid button {
+    border: 0; background: transparent; cursor: pointer; font-size: 18px;
+    padding: 4px 0; border-radius: 4px; color: #333;
+  }
+  .emoji-panel .grid.wx button { font-size: 11px; white-space: nowrap; }
+  .emoji-panel .grid button:hover { background: #f2f3f5; }
+  .emoji-panel .tip { font-size: 11px; color: #9aa0a8; margin-top: 8px; line-height: 1.5; }
+  .asset-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .asset-grid .item {
+    cursor: pointer; border: 1px solid #dcdfe3; border-radius: 6px;
+    padding: 5px; text-align: center; font-size: 11px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .asset-grid .item:hover { border-color: #07c160; background: #e7f9d9; }
+  .asset-grid img { width: 100%; height: 68px; object-fit: cover; border-radius: 4px; }
   .picker-hint { font-size: 11px; color: #9aa0a8; line-height: 1.6; }
   .picker-list { flex: 1; overflow-y: auto; min-height: 140px; max-height: 46vh; }
+  /* 批量托管：已选对象固定在上方，不随下面的筛选 / 滚动消失 */
+  .picker-selected {
+    background: #f7f8fa; border: 1px solid #ebeef2; border-radius: 8px;
+    padding: 8px 10px; max-height: 116px; overflow-y: auto; flex-shrink: 0;
+  }
+  .picker-selected .hd {
+    display: flex; align-items: center; gap: 10px;
+    font-size: 12px; color: #5b6068; margin-bottom: 6px;
+  }
+  .picker-selected .hd b { color: #07c160; font-size: 14px; }
+  .picker-selected .hd .clr {
+    color: #e64340; cursor: pointer; font-size: 12px;
+  }
+  .picker-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .picker-chip {
+    display: flex; align-items: center; gap: 5px; max-width: 220px;
+    background: #fff; border: 1px solid #dcdfe3; border-radius: 999px;
+    padding: 3px 6px 3px 9px; font-size: 12px; color: #333;
+  }
+  .picker-chip .nm { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 150px; }
+  .picker-chip .x {
+    border: 0; background: transparent; color: #999; cursor: pointer;
+    font-size: 16px; line-height: 1; padding: 0 2px;
+  }
+  .picker-chip .x:hover { color: #e64340; }
+  .picker-selected .empty { font-size: 12px; color: #9aa0a8; line-height: 1.6; }
+  .pick-row .ck { flex-shrink: 0; width: 15px; height: 15px; margin-right: 10px; cursor: pointer; }
+  .pick-row.picked { background: #e7f9d9; }
+  .picker-actions { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+  .picker-actions button {
+    padding: 6px 12px; border-radius: 6px; border: 1px solid #dcdfe3;
+    background: #fff; color: #5b6068; font-size: 12px; cursor: pointer;
+  }
+  .picker-actions button:hover { background: #f2f3f5; }
+  .picker-actions .go {
+    margin-left: auto; background: #07c160; border-color: #07c160; color: #fff; font-weight: 600;
+  }
+  .picker-actions .go:hover { background: #06ad56; }
+  .picker-actions .go:disabled { opacity: .5; cursor: not-allowed; }
   .pick-row {
     display: flex; align-items: center; padding: 9px 4px;
     border-bottom: 1px solid #f2f3f5; cursor: pointer;
@@ -696,6 +785,11 @@
             <input class="q" id="hoSearch" placeholder="搜索名字" oninput="renderHoTargets()"
                    style="width:100%;box-sizing:border-box;margin-top:8px">
             <div class="picker-tags" id="hoFilters"></div>
+            <div class="bulk-row">
+              <button type="button" class="bulk-btn" onclick="hoSelectVisible()">全选当前筛选</button>
+              <button type="button" class="bulk-btn" onclick="hoDeselectVisible()">取消当前筛选</button>
+              <span class="muted" id="hoVisibleHint"></span>
+            </div>
             <div class="ho-list" id="hoTargets"></div>
           </section>
           <section class="pcard">
@@ -756,9 +850,26 @@
                 <span>分</span></div>
               <div class="f" style="align-items:flex-start"><label style="padding-top:6px">发送内容</label>
                 <textarea id="cpContent" rows="5" placeholder="直接写在微信里要发的原文，支持换行。确认无误再创建。"></textarea></div>
+              <div class="f"><label>表情</label>
+                <button type="button" class="btn ghost" style="padding:3px 9px;font-size:12px"
+                        onclick="cpEmoji(this)">插入表情</button>
+                <span class="muted" style="font-size:11px">Emoji / 微信表情代码，插到光标处</span></div>
+              <div class="f"><label style="padding-top:6px">配图</label>
+                <div style="flex:1;min-width:0">
+                  <div id="cpImageBox" class="cp-image-box"><span class="muted">未配图</span></div>
+                  <div class="row-btns" style="margin-top:6px">
+                    <button type="button" class="btn ghost" style="padding:3px 9px;font-size:12px"
+                            onclick="legacyPickCampaignAsset(this)">从素材库选图</button>
+                    <button type="button" class="btn ghost" style="padding:3px 9px;font-size:12px"
+                            onclick="document.getElementById('cpImageFile').click()">上传并设为配图</button>
+                    <input type="file" id="cpImageFile" accept="image/*" style="display:none"
+                           onchange="legacyUploadCpImage(this)">
+                  </div>
+                </div></div>
             </div>
             <p class="cp-note">过点未发（比如当时没开程序）只在宽限期内补发，超时自动作废，
-              避免隔夜突然群发。发送结果逐个回写，失败的不会自动重试。</p>
+              避免隔夜突然群发。配图与正文一起发送，微信会自动拆成「文字 + 图片」两个
+              紧挨着的气泡，正文不能为空；图片由消息回执上屏。发送结果逐个回写，失败的不会自动重试。</p>
             <div class="row-btns">
               <button class="btn" onclick="createCampaign()">创建活动</button>
               <span class="ho-saved" id="cpMsg"></span>
@@ -770,6 +881,11 @@
             <input class="q" id="cpSearch" placeholder="搜索名字" oninput="renderCpTargets()"
                    style="width:100%;box-sizing:border-box;margin-top:8px">
             <div class="picker-tags" id="cpFilters"></div>
+            <div class="bulk-row">
+              <button type="button" class="bulk-btn" onclick="cpSelectVisible()">全选当前筛选</button>
+              <button type="button" class="bulk-btn" onclick="cpDeselectVisible()">取消当前筛选</button>
+              <span class="muted" id="cpVisibleHint"></span>
+            </div>
             <div class="cp-list" id="cpTargets"></div>
           </section>
         </div>
@@ -786,15 +902,23 @@
 <div class="picker-mask" id="pickerMask" onclick="if(event.target===this)closePicker()">
   <div class="picker">
     <div class="picker-head">
-      <h3>选择要开启托管的聊天</h3>
+      <h3>批量开启托管</h3>
       <button class="x" onclick="closePicker()" title="关闭">×</button>
     </div>
     <div class="picker-body">
+      <div class="picker-selected" id="pickerSelected"></div>
       <input class="q" id="pickerSearch" placeholder="搜索名字 / 备注 / wxid" oninput="renderPicker()" />
       <div class="picker-tags" id="pickerTags"></div>
       <div class="picker-list" id="pickerList"></div>
     </div>
-    <div class="picker-foot" id="pickerFoot"></div>
+    <div class="picker-foot">
+      <div id="pickerFootStat"></div>
+      <div class="picker-actions">
+        <button type="button" onclick="pickerSelectVisible()">全选当前筛选</button>
+        <button type="button" onclick="closePicker()">取消</button>
+        <button type="button" class="go" id="pickerSubmit" onclick="submitPickerBatch()">开启托管(0)</button>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -812,6 +936,9 @@ let selfAvatarUrl = '';
 let pickerOpen = false;   // 选择器弹层是否打开
 let pickerTag = '';       // 选择器当前标签筛选（''=全部）
 let pickerSig = '';       // 选择器列表签名（2s 轮询重绘时避免打断输入/滚动）
+let pickerPicked = new Set();   // 批量勾选：一次打开内累计，提交成功后清空
+let pickerVisibleIds = [];      // 当前筛选下可见的候选 id，给「全选当前筛选」用
+let pickerSubmitting = false;   // 提交中，防重复点击
 
 // 头像元素：真头像盖在「名字首字」色块上；图片 404/加载失败时 onerror 移除 img，
 // 自然露出首字兜底，不会留破图。
@@ -909,6 +1036,7 @@ async function toggleSwitch(convId, on, swEl) {
 async function openPicker() {
   pickerOpen = true;
   pickerTag = '';
+  pickerPicked = new Set();      // 每次重新打开都是新的一批，不带上次的勾选
   document.getElementById('pickerSearch').value = '';
   document.getElementById('pickerMask').classList.add('show');
   pickerSig = '';                    // 强制先画一次
@@ -972,10 +1100,13 @@ function renderPicker() {
   }
   if (kw) list = list.filter(c => ((c.name || '') + (c.conv_id || '')).includes(kw));
 
-  // 2s 轮询会反复调本函数：内容没变就不动 DOM，免得滚动位置被拉回顶部
+  // 2s 轮询会反复调本函数：内容没变就不动 DOM，免得滚动位置被拉回顶部。
+  // 勾选状态不写进签名 —— 勾选只做局部 DOM 更新（syncPickerPickedUI），
+  // 签名一变就会整表重建、把滚动位置拉回顶部，反而打断连续勾选。
   const sig = JSON.stringify([pickerTag, kw, list.map(c => c.conv_id), tagSet]);
   if (sig === pickerSig) return;
   pickerSig = sig;
+  pickerVisibleIds = list.map(c => c.conv_id);
 
   const tagsBox = document.getElementById('pickerTags');
   let chips = `<span class="tagchip${pickerTag ? '' : ' on'}" data-t="">全部</span>`;
@@ -1004,14 +1135,20 @@ function renderPicker() {
     for (const c of list) {
       const row = document.createElement('div');
       row.className = 'pick-row';
+      row.dataset.id = c.conv_id;
       const tags = (c.tags || []).map(t => `<span class="tg">#${esc(t)}</span>`).join('');
       const noChat = c.has_conv === false ? '<span class="tg">未聊过</span>' : '';
       const badge = (c.unread > 0) ? `<span class="badge">${c.unread}</span>` : '';
       row.innerHTML = `
+        <input class="ck" type="checkbox" aria-label="选择 ${esc(c.name || c.conv_id)}" />
         ${avatarHtml(c.avatar_url, c.name)}
         <div class="nm">${esc(c.name || c.conv_id)}${tags}${noChat}${badge}</div>
         <div class="plus">+</div>`;
-      row.onclick = () => enableConv(c.conv_id);
+      // 整行都能点；点小方框时拦住冒泡，交给 change 处理，避免 toggle 两次相互抵消
+      const ck = row.querySelector('input.ck');
+      ck.onclick = (e) => e.stopPropagation();
+      ck.onchange = (e) => setPickerPicked(c.conv_id, e.target.checked);
+      row.onclick = () => setPickerPicked(c.conv_id, !pickerPicked.has(c.conv_id));
       box.appendChild(row);
     }
   }
@@ -1019,27 +1156,112 @@ function renderPicker() {
   const chatCount = pickerAll.filter(c => c.has_conv).length;
   const friendCount = pickerAll.filter(c => c.kind === 'friend').length;
   const groupCount = pickerAll.filter(isGroup).length;
-  document.getElementById('pickerFoot').textContent =
+  document.getElementById('pickerFootStat').textContent =
     `可托管 ${pickerAll.length} 个（好友 ${friendCount} / 群聊 ${groupCount}，${chatCount} 个聊过），已托管 ${onCount} 个；只列通讯录好友与群聊，群里的陌生人已排除`;
+  // 筛选 / 轮询导致整表重绘后，把勾选状态重新刷回每一行和上方已选区
+  syncPickerPickedUI();
 }
 
-async function enableConv(convId) {
+function setPickerPicked(convId, checked) {
+  if (checked) pickerPicked.add(convId); else pickerPicked.delete(convId);
+  syncPickerPickedUI();
+}
+
+function removePickerPicked(convId) {
+  pickerPicked.delete(convId);
+  syncPickerPickedUI();
+}
+
+function pickerSelectVisible() {
+  pickerVisibleIds.forEach(id => pickerPicked.add(id));
+  syncPickerPickedUI();
+}
+
+// 只更新已选 chips、按钮数字和当前可见行的选中态，不重建列表（保住滚动位置 / 输入）
+function syncPickerPickedUI() {
+  const box = document.getElementById('pickerSelected');
+  if (box) {
+    box.innerHTML = '';
+    const hd = document.createElement('div');
+    hd.className = 'hd';
+    hd.innerHTML = `<span>已选对象 <b>${pickerPicked.size}</b></span>
+      <span style="margin-left:auto">选中的固定在这里</span>`;
+    if (pickerPicked.size) {
+      const clr = document.createElement('span');
+      clr.className = 'clr'; clr.textContent = '清空';
+      clr.onclick = () => { pickerPicked.clear(); syncPickerPickedUI(); };
+      hd.appendChild(clr);
+    }
+    box.appendChild(hd);
+    const chips = document.createElement('div');
+    chips.className = 'picker-chips';
+    if (!pickerPicked.size) {
+      const empty = document.createElement('div');
+      empty.className = 'empty';
+      empty.textContent = '在下面列表勾名字即可多选，选中的会固定显示在这里';
+      chips.appendChild(empty);
+    } else {
+      for (const id of pickerPicked) {
+        const c = pickerAll.find(x => x.conv_id === id) || { conv_id: id, name: id };
+        const chip = document.createElement('span');
+        chip.className = 'picker-chip';
+        chip.title = c.name || c.conv_id;
+        const nm = document.createElement('span');
+        nm.className = 'nm'; nm.textContent = c.name || c.conv_id;
+        const x = document.createElement('button');
+        x.className = 'x'; x.type = 'button'; x.title = '移除'; x.textContent = '×';
+        x.onclick = () => removePickerPicked(id);
+        chip.appendChild(nm); chip.appendChild(x);
+        chips.appendChild(chip);
+      }
+    }
+    box.appendChild(chips);
+  }
+  document.querySelectorAll('#pickerList .pick-row').forEach(row => {
+    const on = pickerPicked.has(row.dataset.id);
+    row.classList.toggle('picked', on);
+    const ck = row.querySelector('input.ck');
+    if (ck) ck.checked = on;
+    const plus = row.querySelector('.plus');
+    if (plus) plus.textContent = on ? '✓' : '+';
+  });
+  const btn = document.getElementById('pickerSubmit');
+  if (btn && !pickerSubmitting) {
+    btn.textContent = `开启托管(${pickerPicked.size})`;
+    btn.disabled = !pickerPicked.size;
+  }
+}
+
+// 一次请求、一个事务写完所有开关；后端开启时会再校验身份，被跳过的如实提示。
+async function submitPickerBatch() {
+  const ids = [...pickerPicked];
+  if (!ids.length || pickerSubmitting) return;
+  pickerSubmitting = true;
+  const btn = document.getElementById('pickerSubmit');
+  btn.disabled = true; btn.textContent = '提交中…';
   try {
-    const r = await fetch('/api/switch', {
+    const r = await fetch('/api/switch/batch', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({conv: convId, enabled: true})
+      body: JSON.stringify({convs: ids, enabled: true})
     });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    // 两个列表都先本地标上，弹层立刻少一行，不用等下一次轮询
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.ok === false) throw new Error(d.error || ('HTTP ' + r.status));
+    const done = new Set(d.updated || []);
     [allConvs, pickerAll].forEach(arr => {
-      const it = arr.find(x => x.conv_id === convId);
-      if (it) it.auto_reply = 1;
+      arr.forEach(it => { if (done.has(it.conv_id)) it.auto_reply = 1; });
     });
+    const skipped = (d.skipped || []).length;
+    pickerPicked.clear();
     pickerSig = '';
-    renderPicker();
+    closePicker();
     loadConversations();
+    if (skipped) alert(`已开启托管 ${done.size} 个；${skipped} 个不在通讯录好友 / 群聊里，已跳过。`);
   } catch (err) {
     alert('开启失败：' + err.message);
+  } finally {
+    pickerSubmitting = false;
+    if (btn) { btn.disabled = false; }
+    syncPickerPickedUI();
   }
 }
 
@@ -1070,6 +1292,13 @@ function renderChatHeader(name, convId) {
     <div class="header"><div class="havatar">${first}${img}</div>${esc(name)}</div>
     <div class="messages" id="messages"></div>
     <div class="hint">在此发送将调用键盘驱动真实发出（需微信在前台）。也可直接用 wechat_ui.py。</div>
+    <div class="composer-tools">
+      <button type="button" id="emojiBtn">表情</button>
+      <button type="button" id="imageBtn">图片</button>
+      <button type="button" id="assetBtn">素材库</button>
+      <input type="file" id="imageFile" accept="image/*" style="display:none">
+      <span class="muted">图片发出后由消息回执上屏</span>
+    </div>
     <div class="composer">
       <input id="input" placeholder="输入消息，回车发送" />
       <button id="sendBtn">发送</button>
@@ -1078,7 +1307,140 @@ function renderChatHeader(name, convId) {
   document.getElementById('input').addEventListener('keydown', e => {
     if (e.key === 'Enter') sendMessage();
   });
+  document.getElementById('emojiBtn').onclick = e => openEmojiPanel('input', e.currentTarget);
+  document.getElementById('imageBtn').onclick = () => document.getElementById('imageFile').click();
+  document.getElementById('imageFile').onchange = e => legacyUploadImage(e.target);
+  document.getElementById('assetBtn').onclick = e => legacyOpenAssets(e.currentTarget);
 }
+
+/* ==================== 多媒体输入：表情 / 图片 ==================== */
+// 两种表情口径与新版 EmojiPicker 一致：Unicode emoji 走普通文本发送；
+// 微信表情代码只是插进输入框的文本，可能被微信转成黄脸、也可能原样发出。
+const LEGACY_EMOJIS = [
+  '😀','😄','😊','🙂','😉','😍','🥰','😎','🤔','😐','😅','😂','😭','😡','😱','🥺',
+  '👍','👏','🙏','🤝','💪','👌','🙌','👋','❤️','🌹','🎉','🎊','✨','🔥','💡','✅',
+  '🎯','🚀','🌟','💯','📌','📅','☀️','🍀'
+];
+const LEGACY_WX_CODES = [
+  '[微笑]','[憨笑]','[愉快]','[偷笑]','[呲牙]','[捂脸]','[奸笑]','[机智]',
+  '[害羞]','[闭嘴]','[睡]','[大哭]','[尴尬]','[发怒]','[调皮]','[惊讶]',
+  '[难过]','[抓狂]','[疑问]','[晕]','[衰]','[敲打]','[再见]','[擦汗]',
+  '[鼓掌]','[坏笑]','[委屈]','[快哭了]','[亲亲]','[可怜]','[笑脸]','[破涕为笑]',
+  '[嘿哈]','[吃瓜]','[加油]','[旺柴]','[好的]','[哇]','[握手]','[OK]',
+  '[玫瑰]','[凋谢]','[爱心]','[心碎]','[拥抱]','[强]','[拳头]','[666]'
+];
+let emojiTargetId = null;
+
+function closeEmojiPanel() {
+  const p = document.getElementById('emojiPanel');
+  if (p) p.remove();
+  emojiTargetId = null;
+}
+
+function insertAtCursor(id, s) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const a = el.selectionStart != null ? el.selectionStart : el.value.length;
+  const b = el.selectionEnd != null ? el.selectionEnd : a;
+  el.value = el.value.slice(0, a) + s + el.value.slice(b);
+  const p = a + s.length;
+  el.focus();
+  try { el.setSelectionRange(p, p); } catch (e) { /* 老浏览器不支持就算了 */ }
+}
+
+function emojiPanelBox(anchor) {
+  closeEmojiPanel();
+  const r = anchor.getBoundingClientRect();
+  const box = document.createElement('div');
+  box.className = 'emoji-panel'; box.id = 'emojiPanel';
+  box.style.left = Math.max(8, Math.min(r.left, window.innerWidth - 310)) + 'px';
+  box.style.top = Math.max(8, r.top - 280) + 'px';
+  document.body.appendChild(box);
+  return box;
+}
+
+function openEmojiPanel(targetId, anchor) {
+  const box = emojiPanelBox(anchor);
+  emojiTargetId = targetId;                 // closeEmojiPanel 会清空，所以要放在后面
+  let tab = 'emoji';
+  const draw = () => {
+    const list = tab === 'emoji' ? LEGACY_EMOJIS : LEGACY_WX_CODES;
+    box.innerHTML = `<div class="tabs">
+        <span class="${tab === 'emoji' ? 'on' : ''}" data-t="emoji">Emoji</span>
+        <span class="${tab === 'wx' ? 'on' : ''}" data-t="wx">微信表情代码</span>
+        <span style="margin-left:auto" data-t="close">关闭</span></div>
+      <div class="grid ${tab === 'wx' ? 'wx' : ''}">${list.map(e =>
+        `<button type="button" data-e="${esc(e)}">${esc(e)}</button>`).join('')}</div>
+      <div class="tip">点一下插到光标处。微信表情代码可能被转成黄脸表情，也可能原样以文字发出。</div>`;
+    box.querySelectorAll('.tabs span').forEach(el => el.onclick = () => {
+      const t = el.dataset.t;
+      if (t === 'close') { closeEmojiPanel(); return; }
+      tab = t; draw();
+    });
+    box.querySelectorAll('.grid button').forEach(el => el.onclick = () => {
+      insertAtCursor(emojiTargetId, el.dataset.e);
+    });
+  };
+  draw();
+}
+
+async function legacySendAsset(id) {
+  if (!activeConv) { alert('先在左边选一个会话'); return; }
+  closeEmojiPanel();
+  try {
+    const res = await fetch('/api/send/image', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({conv: activeConv, asset_id: id})
+    });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok || d.ok === false) throw new Error(d.error || ('HTTP ' + res.status));
+    // 图片没有正文可回读，后端也不写看板库：真实消息由收消息桥补录上屏
+    alert('图片按键序列已跑完；请在微信里确认，稍后会由消息回执上屏。');
+  } catch (e) { alert('图片发送失败：' + e.message); }
+}
+
+async function legacyUploadImage(input) {
+  const f = input.files && input.files[0];
+  input.value = '';
+  if (!f) return;
+  if (!activeConv) { alert('先在左边选一个会话'); return; }
+  try {
+    const fd = new FormData(); fd.append('file', f);
+    const r = await fetch('/api/media', {method: 'POST', body: fd});
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.ok === false) throw new Error(d.error || ('HTTP ' + r.status));
+    await legacySendAsset(d.item.id);
+  } catch (e) { alert('上传失败：' + e.message); }
+}
+
+async function legacyOpenAssets(anchor) {
+  const box = emojiPanelBox(anchor);
+  box.innerHTML = '<div class="tip">正在读取素材…</div>';
+  let items = [];
+  try {
+    const d = await (await fetch('/api/media')).json();
+    items = d.items || [];
+  } catch (e) { box.innerHTML = '<div class="tip">读取素材失败</div>'; return; }
+  if (!items.length) {
+    box.innerHTML = '<div class="tip">素材库还是空的，点「图片」上传一张。</div>';
+    return;
+  }
+  box.innerHTML = '<div class="tip">点一张立即发给当前会话</div><div class="asset-grid" id="assetGrid"></div>';
+  const grid = document.getElementById('assetGrid');
+  items.forEach(it => {
+    const cell = document.createElement('div');
+    cell.className = 'item'; cell.title = it.name;
+    const img = document.createElement('img');
+    img.src = it.url; img.alt = it.name;
+    img.onerror = () => { img.style.display = 'none'; };
+    const cap = document.createElement('div'); cap.textContent = it.name;
+    cell.appendChild(img); cell.appendChild(cap);
+    cell.onclick = () => legacySendAsset(it.id);
+    grid.appendChild(cell);
+  });
+}
+
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeEmojiPanel(); });
 
 function mediaExt(rel) {
   const m = (rel || '').match(/\.([a-z0-9]+)$/i);
@@ -1945,13 +2307,31 @@ function renderHoFilters() {
   ).join('');
 }
 
-function renderHoTargets() {
+// 当前筛选 + 搜索看得见的人。全选 / 取消 / 列表渲染共用这一份判据，
+// 免得「全选」选中的对象和屏幕上看到的不一致。
+function hoVisibleRows() {
   const q = (document.getElementById('hoSearch').value || '').trim().toLowerCase();
-  const rows = hoContacts.filter(c => {
+  return hoContacts.filter(c => {
     if (hoFilter === 'selected' && !hoSel.has(c.conv_id)) return false;
     if ((hoFilter === 'group' || hoFilter === 'friend') && c.kind !== hoFilter) return false;
     return !q || (c.name || '').toLowerCase().includes(q) || c.conv_id.toLowerCase().includes(q);
   });
+}
+
+function hoSelectVisible() {
+  hoVisibleRows().forEach(c => hoSel.add(c.conv_id));
+  renderHoFilters(); renderHoTargets(); updateHoState();
+}
+
+function hoDeselectVisible() {
+  hoVisibleRows().forEach(c => hoSel.delete(c.conv_id));
+  renderHoFilters(); renderHoTargets(); updateHoState();
+}
+
+function renderHoTargets() {
+  const rows = hoVisibleRows();
+  const hint = document.getElementById('hoVisibleHint');
+  if (hint) hint.textContent = `当前结果 ${rows.length} 个`;
   const box = document.getElementById('hoTargets');
   if (!rows.length) { box.innerHTML = '<div class="blank" style="padding:14px">没有匹配的联系人</div>'; return; }
   box.innerHTML = rows.map(c => `<label class="ho-row">
@@ -2029,7 +2409,73 @@ const CP_LABEL = {
   scheduled: '待发送', running: '发送中', sent: '已完成',
   partial: '部分失败', expired: '已过期', canceled: '已取消'
 };
-let cpContacts = [], cpSel = new Set(), cpFilter = 'all';
+let cpContacts = [], cpSel = new Set(), cpFilter = 'all', cpImage = '', cpAssets = [];
+
+async function loadCpAssets() {
+  try {
+    const d = await (await fetch('/api/media')).json();
+    cpAssets = d.items || [];
+  } catch (e) { cpAssets = []; }
+  renderCpImage();
+}
+
+function renderCpImage() {
+  const box = document.getElementById('cpImageBox');
+  if (!box) return;
+  if (!cpImage) { box.innerHTML = '<span class="muted">未配图</span>'; return; }
+  const it = cpAssets.find(a => a.id === cpImage);
+  const thumb = it ? `<img src="${esc(it.url)}" alt="" onerror="this.style.display='none'">` : '';
+  box.innerHTML = `${thumb}<span>${esc(it ? it.name : '素材已删除')}</span>
+    <button type="button" class="btn ghost" style="padding:2px 7px;font-size:11px" onclick="clearCpImage()">移除</button>`;
+}
+
+function clearCpImage() { cpImage = ''; renderCpImage(); }
+
+// 复用表情面板：targetId 传 cpContent，就把 emoji / 微信表情代码插进活动正文
+function cpEmoji(anchor) { openEmojiPanel('cpContent', anchor); }
+
+// 选活动配图：复用素材弹层容器，但点击是「设为配图」而不是立刻发给当前会话
+async function legacyPickCampaignAsset(anchor) {
+  const box = emojiPanelBox(anchor);
+  box.innerHTML = '<div class="tip">正在读取素材…</div>';
+  try {
+    const d = await (await fetch('/api/media')).json();
+    cpAssets = d.items || [];
+  } catch (e) { box.innerHTML = '<div class="tip">读取素材失败</div>'; return; }
+  if (!cpAssets.length) {
+    box.innerHTML = '<div class="tip">素材库还是空的，点「上传并设为配图」先传一张。</div>';
+  } else {
+    box.innerHTML = '<div class="tip">点一张设为活动配图（不会立刻发送）</div><div class="asset-grid" id="cpAssetGrid"></div>';
+    const grid = document.getElementById('cpAssetGrid');
+    cpAssets.forEach(it => {
+      const cell = document.createElement('div');
+      cell.className = 'item'; cell.title = it.name;
+      const img = document.createElement('img');
+      img.src = it.url; img.alt = it.name;
+      img.onerror = () => { img.style.display = 'none'; };
+      const cap = document.createElement('div'); cap.textContent = it.name;
+      cell.appendChild(img); cell.appendChild(cap);
+      cell.onclick = () => { cpImage = it.id; renderCpImage(); closeEmojiPanel(); };
+      grid.appendChild(cell);
+    });
+  }
+}
+
+// 上传一张新图并直接设为本次活动的配图
+async function legacyUploadCpImage(input) {
+  const f = input.files && input.files[0];
+  input.value = '';
+  if (!f) return;
+  try {
+    const fd = new FormData(); fd.append('file', f);
+    const r = await fetch('/api/media', { method: 'POST', body: fd });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.ok === false) throw new Error(d.error || ('HTTP ' + r.status));
+    cpAssets = [d.item, ...cpAssets.filter(a => a.id !== d.item.id)];
+    cpImage = d.item.id; renderCpImage();
+    document.getElementById('cpMsg').textContent = '已设为活动配图';
+  } catch (e) { document.getElementById('cpMsg').textContent = '上传失败：' + e.message; }
+}
 
 function localDateTime(d) {
   const p = n => String(n).padStart(2, '0');
@@ -2044,6 +2490,7 @@ async function loadCampaigns() {
       document.getElementById('cpTime').value = localDateTime(new Date(Date.now() + 3600e3));
     }
     renderCpFilters(); renderCpTargets(); renderCpList(d.campaigns || []);
+    loadCpAssets();
   } catch (e) {
     document.getElementById('cpMsg').textContent = '读取活动失败: ' + e;
   }
@@ -2069,13 +2516,30 @@ function updateCpCount() {
   document.getElementById('cpCount').textContent = cpSel.size ? `（已选 ${cpSel.size} 个）` : '（还没选）';
 }
 
-function renderCpTargets() {
+// 同 hoVisibleRows：全选只作用于当前筛选 + 搜索看得见的人
+function cpVisibleRows() {
   const q = (document.getElementById('cpSearch').value || '').trim().toLowerCase();
-  const rows = cpContacts.filter(c => {
+  return cpContacts.filter(c => {
     if (cpFilter === 'selected' && !cpSel.has(c.conv_id)) return false;
     if ((cpFilter === 'group' || cpFilter === 'friend') && c.kind !== cpFilter) return false;
     return !q || (c.name || '').toLowerCase().includes(q) || c.conv_id.toLowerCase().includes(q);
   });
+}
+
+function cpSelectVisible() {
+  cpVisibleRows().forEach(c => cpSel.add(c.conv_id));
+  renderCpFilters(); renderCpTargets(); updateCpCount();
+}
+
+function cpDeselectVisible() {
+  cpVisibleRows().forEach(c => cpSel.delete(c.conv_id));
+  renderCpFilters(); renderCpTargets(); updateCpCount();
+}
+
+function renderCpTargets() {
+  const rows = cpVisibleRows();
+  const hint = document.getElementById('cpVisibleHint');
+  if (hint) hint.textContent = `当前结果 ${rows.length} 个`;
   const box = document.getElementById('cpTargets');
   if (!rows.length) { box.innerHTML = '<div class="blank" style="padding:14px">没有匹配的联系人</div>'; return; }
   box.innerHTML = rows.map(c => `<label class="ho-row">
@@ -2094,7 +2558,8 @@ async function createCampaign() {
   if (!content) { $('cpMsg').textContent = '请先写发送内容'; return; }
   if (!targets.length) { $('cpMsg').textContent = '请先选发送对象'; return; }
   if (!$('cpTime').value) { $('cpMsg').textContent = '请填发送时间'; return; }
-  if (!confirm(`确认创建？\n\n将在 ${$('cpTime').value} 给 ${targets.length} 个对象发送：\n\n${content.slice(0, 80)}${content.length > 80 ? '…' : ''}`)) return;
+  const imgTip = cpImage ? '\n（带一张配图，与正文一次发送，微信会自动拆成两个气泡）' : '';
+  if (!confirm(`确认创建？\n\n将在 ${$('cpTime').value} 给 ${targets.length} 个对象发送：\n\n${content.slice(0, 80)}${content.length > 80 ? '…' : ''}${imgTip}`)) return;
   $('cpMsg').textContent = '创建中…';
   try {
     const r = await fetch('/api/campaigns', {
@@ -2103,6 +2568,7 @@ async function createCampaign() {
         name: $('cpName').value.trim() || '未命名活动',
         content, send_at: $('cpTime').value,
         grace_minutes: Number($('cpGrace').value) || 60,
+        image: cpImage,
         targets
       })
     });
@@ -2110,6 +2576,7 @@ async function createCampaign() {
     if (!d.ok) throw new Error(d.error || '创建失败');
     $('cpMsg').textContent = '已创建，到点自动发';
     $('cpName').value = ''; $('cpContent').value = '';
+    cpImage = ''; renderCpImage();
     cpSel.clear(); renderCpFilters(); renderCpTargets();
     loadCampaigns();
   } catch (e) { $('cpMsg').textContent = '创建失败: ' + e; }
@@ -2143,7 +2610,7 @@ function renderCpList(rows) {
       : `<button class="btn ghost" style="padding:3px 8px;font-size:11px" onclick="cpAction(${r.id},'delete')">删除</button>`;
     const content = String(r.content || '').replace(/\n/g, ' ').slice(0, 40);
     return `<div class="tr">
-      <span class="name">${esc(r.name || '')}<br><span class="muted" style="font-size:11px">${esc(content)}</span></span>
+      <span class="name">${esc(r.name || '')}<br><span class="muted" style="font-size:11px">${esc(content)}${r.image ? ' · 含配图' : ''}</span></span>
       <span class="sub2">${esc(fmtTime(r.send_at))}<br><span class="cp-badge ${esc(r.status)}">${esc(st)}</span></span>
       <span class="sub2">${n} 个对象 · 成功 ${ok}<br><span class="muted" style="font-size:11px">宽限 ${r.grace_minutes} 分钟内补发</span></span>
       <span class="time" style="display:flex;gap:5px;justify-content:flex-end">${ops}</span>

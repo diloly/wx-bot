@@ -32,11 +32,15 @@
 - 加好友：PC 微信（尤其 Qt 版）普遍无法稳定发出好友申请，本骨架 --add-friend 仅作
   提示并建议回手机端，不强行模拟（避免误操作和风控）。
 
-依赖：pyautogui（发键）、pyperclip（剪贴板，用于输入中文）、APScheduler（定时）。
+依赖：pyautogui（发键）、pyperclip（剪贴板文本，用于输入中文）、APScheduler（定时）。
+发图片另需 win32clipboard（pywin32）与 Pillow，只在调用 send_image_to_contact 时才导入，
+没装它们不影响纯文本发送。
 """
 import argparse
+import io
 import json
 import logging
+import os
 import re
 import time
 import ctypes
@@ -403,6 +407,46 @@ class WeChatPCBot:
         pyautogui.hotkey("ctrl", "v")
         time.sleep(_STEP_GAP)
 
+    @staticmethod
+    def _image_to_dib(path):
+        """图片 -> CF_DIB 字节：Pillow 存成 BMP，去掉前 14 字节 BITMAPFILEHEADER。
+
+        Windows 剪贴板的 CF_DIB 要的就是「文件头之后的 DIB」，直接把整个 BMP
+        塞进去微信认不出来。统一转 RGB，避开带 alpha / 调色板格式的兼容坑。
+        """
+        from PIL import Image
+        with Image.open(path) as im:
+            buf = io.BytesIO()
+            im.convert("RGB").save(buf, format="BMP")
+        return buf.getvalue()[14:]
+
+    def _paste_image(self, path):
+        """把图片写进 Windows 剪贴板再 Ctrl+V（pyperclip 只能放文本，放不了图）。
+
+        只在真正要发图时才 import pywin32：没装它的机器上，纯文本发送链路
+        仍然能照常跑，不会因为一个可选功能把整个自动回复拖垮。
+        """
+        if self.dry_run:
+            return
+        import win32clipboard
+        import win32con
+        dib = self._image_to_dib(path)
+        win32clipboard.OpenClipboard()
+        try:
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardData(win32con.CF_DIB, dib)
+        finally:
+            # 某些 pywin32 版本在 Set/Get 之后会自行关闭剪贴板，再 Close 会抛
+            # 1418「线程没有打开的剪贴板」。这时剪贴板其实已经关好了，忽略即可。
+            try:
+                win32clipboard.CloseClipboard()
+            except Exception:              # noqa: BLE001
+                pass
+        if not win32clipboard.IsClipboardFormatAvailable(win32con.CF_DIB):
+            raise SendAborted("剪贴板里没写入图片，已在发送前中止")
+        pyautogui.hotkey("ctrl", "v")
+        time.sleep(_STEP_GAP)
+
     # 剪贴板哨兵：不要用 \x00 之类的字符——Windows 剪贴板按 NUL 截断，
     # 写进去会变成空串，哨兵就失去意义了。
     _CLIP_SENTINEL = "__wechatbot_clip_sentinel__"
@@ -571,7 +615,7 @@ class WeChatPCBot:
 
     # ---------- 业务动作 ----------
     def send_to_contact(self, name, message, conv_id=None, ui_timeout=None, by="manual",
-                        confirm=None, at_name=None):
+                        confirm=None, at_name=None, image_path=None):
         """对一个联系人：搜索→进会话→发消息。execute 由 dry_run 控制。
         conv_id 传入微信 wxid 时，看板消息库按 wxid 归并会话（与收消息桥一致）；
         省略时按 name 归并（手动 CLI 发送的兼容行为）。
@@ -588,6 +632,17 @@ class WeChatPCBot:
         at_name：**群聊专用**——把「@昵称 」和正文合进**同一条消息**发出（群里
         要让人看出在回谁，但用户不想要「先 @ 一条、正文再一条」）。None 表示
         私聊或不需要 @。两条路径都只产生一个气泡，见 `_at_member` 的说明。
+        image_path：**可选配图（已 resolve 的绝对路径）**。给了就在**同一次
+        Enter** 前把图片也粘进输入框：粘正文 → 回读校验 → 取消全选 → 粘图 →
+        一次发送键。微信 PC 客户端会自己把「文字 + 图片」拆成紧挨着的两个气泡
+        （一条纯文本 + 一条图片），所以：
+          · 文字那条在微信库里仍是纯文本，confirm() 按正文比对的三态校验照常有效；
+          · 图片那条仍由收消息桥补录，本函数不写假库；
+          · 只按一次发送键 = 两次发送之间**不再抢 UI 门、不再 Ctrl+F 搜一次会话、
+            不再等 confirm 回读**，间隔从十几秒压到一次按键。
+        只在非 @ 路径生效（_at_member 内部有自己的按键序列，塞不进图片）；
+        调用方应保证群聊 @ 的任务不带图。图片阶段任何失败都在**按发送键之前**
+        收敛成 SendAborted —— 此时正文也还没发出，确定性最高。
 
         **整个键盘流程在 UI 门内串行执行**（2026-10-16 并发加固）：微信只有
         一份 UI，auto_reply 自动回复与看板手动发送是**两个进程**，不加跨进程
@@ -641,7 +696,10 @@ class WeChatPCBot:
                         "没打开搜索结果）。已在粘贴正文之前中止，本次没有发出任何内容。"
                         % name)
                 if at_name:
-                    # 群聊：@ + 正文合并成同一条（内部含最后一次发送）
+                    # 群聊：@ + 正文合并成同一条（内部含最后一次发送）。
+                    # _at_member 有自己的一套按键序列，没法把图片插进去，忽略配图。
+                    if image_path:
+                        log.warning("群聊 @ 与配图不能同一次发送，本次忽略配图: %s", name)
                     self._at_member(at_name, message)
                 else:
                     self._paste(message)    # 粘贴消息到会话输入框
@@ -655,6 +713,28 @@ class WeChatPCBot:
                         raise SendAborted(
                             "正文没粘进「%s」的输入框，未按发送键（本次没有发出任何内容）"
                             % name)
+                    if image_path:
+                        # 上面回读用了 Ctrl+A，此刻正文还是**全选**状态。先按右方向键
+                        # 取消选择、把光标挪到正文末尾，否则 Ctrl+V 图片会整段替换掉
+                        # 正文（微信里就只剩一张图、文字丢了）。
+                        pyautogui.press("right")
+                        time.sleep(_STEP_GAP)
+                        if not os.path.isfile(image_path):
+                            raise SendAborted(
+                                "配图文件不存在或已被删除，已在按发送键前中止，"
+                                "正文和图片都没发出")
+                        try:
+                            self._paste_image(image_path)
+                        except SendAborted:
+                            raise
+                        except Exception as e:      # noqa: BLE001
+                            # 不能落到函数末尾那个「吞掉所有 Exception」的分支：
+                            # 那会静默返回，调用方把「什么都没发」记成已发送。
+                            raise SendAborted(
+                                "配图没能粘进输入框（%s），已在按发送键前中止，"
+                                "正文和图片都没发出" % e)
+                    # 一次发送键：微信 PC 会把输入框里的「文字 + 图片」拆成紧挨着的
+                    # 两个气泡，中间不再有第二次抢 UI 门 / Ctrl+F / 回读等待。
                     self._send_keystroke()  # 发送
             # 注意：这里**不**打「已发送」——键盘动作跑完只代表按了键，
             # 真正算不算发出去要看下面的回读校验。日志必须与真实结果一致，
@@ -707,6 +787,56 @@ class WeChatPCBot:
             raise
         except Exception as e:
             log.error("发送失败(%s): %s", name, e)
+
+    def send_image_to_contact(self, name, image_path, conv_id=None,
+                              ui_timeout=None, by="manual"):
+        """给指定联系人发**一张图片**：剪贴板 CF_DIB → Ctrl+V → 发送键。
+
+        和 send_to_contact 有三个刻意保留的差别，别「顺手统一」：
+        1. 图片没有正文，**不能**用 _read_edit_text 回读前 16 字确认粘进去了；
+           微信是 Qt 自绘，也读不到「图片预览是否在输入框里」。
+        2. 因此**不写看板消息库、也不预写 sent_log**：宁可等收消息桥把微信里
+           真实存在的图片消息补录上屏，也不凭一次按键记一条假成功。
+        3. 不做文本发送那套 confirm 三态校验。调用方拿到的是「按键序列跑完」，
+           是否真的发出以微信客户端 / 看板随后出现的回执为准，绝不自动重试。
+
+        但会话定位的安全闸一步不少：UI 门 → 聚焦微信 → 前台校验 → 切回聊天页
+        → Ctrl+F 全等校验昵称 → 才粘贴，避免图片发进错误的会话。
+
+        **这个方法只负责「单独发一张图」**（看板手发，POST /api/send/image）。
+        带正文的活动 / AI 回复请走 `send_to_contact(image_path=...)`：那会在同一次
+        Enter 前把文字和图一起放进输入框，微信自己拆成两个紧挨着的气泡，不用
+        再抢一次 UI 门、也不用再 Ctrl+F 搜一遍会话。
+
+        conv_id / by 只是为了让调用形态和 send_to_contact 一致；这里不写库，
+        所以两个参数都用不上。
+        """
+        if self.dry_run:
+            log.info("[DRY-RUN] 计划给 %s 发图片 %s", name, image_path)
+            return
+        if not image_path or not os.path.isfile(image_path):
+            raise ValueError("图片不存在或已被删除，未发送")
+        try:
+            with ui_gate.hold("发送图片给 %s" % name, timeout=ui_timeout):
+                hwnd, _ = focus_wechat()
+                _require_foreground(hwnd)
+                if not switch_to_chat_page():
+                    log.warning("切回聊天页未确认，再试一次（%s）", name)
+                    time.sleep(0.5)
+                    switch_to_chat_page()
+                _require_foreground(hwnd)
+                if not self._open_conversation(name):
+                    raise SendAborted(
+                        "没能进入「%s」的会话，已在粘贴图片之前中止，本次没有发出任何内容"
+                        % name)
+                self._paste_image(image_path)
+                self._send_keystroke()
+            log.info("图片按键序列已完成(%s)，等收消息桥把真实消息补录上屏", name)
+        except (ui_gate.UITimeoutError, SendAborted):
+            raise
+        except Exception as e:
+            log.error("发送图片失败(%s): %s", name, e)
+            raise
 
     def add_friend(self, account, verify_msg=""):
         """

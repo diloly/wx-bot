@@ -192,6 +192,16 @@ def _init_schema(path=None):
             kind    TEXT,               -- friend / group / official / system
             ts      INTEGER
         );
+        -- 主动触达「不打扰」名单（2026-11-10，用户明确）：微信通讯录里混着家人、
+        -- 朋友、同事这类私人联系人，AI 主动搭话既没必要也很危险。这张表是**硬排除**，
+        -- 优先级高于一切候选规则（沉默天数、冷却、破冰、只看托管都不例外），
+        -- 谁进了名单，主动触达和破冰都不会再碰。人工 activate.py 也认这份名单。
+        CREATE TABLE IF NOT EXISTS outreach_skip (
+            conv_id TEXT PRIMARY KEY,
+            name    TEXT,               -- 存一份当时的显示名，撤掉好友也还认得出是谁
+            note    TEXT,               -- 为什么排除（私人 / 客户要求不打扰…）
+            created INTEGER
+        );
         -- 人工接管记录（2026-11-09）：客户有意向 → 通知真人 → 留一条账。
         -- 兼做「同一会话冷却期」判据，防止客户连说两句就刷屏通知内部群。
         CREATE TABLE IF NOT EXISTS handoff_log (
@@ -213,6 +223,7 @@ def _init_schema(path=None):
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
             name          TEXT,
             content       TEXT,           -- 固定正文（不经过 AI）
+            image         TEXT,           -- 可选配图的素材 id（media_assets），空=只发正文
             send_at       INTEGER,        -- 计划发送时刻（Unix 秒）
             targets       TEXT,           -- JSON [{conv_id, name, kind}]
             status        TEXT DEFAULT 'scheduled',
@@ -246,6 +257,11 @@ def _init_schema(path=None):
             conn.execute("ALTER TABLE handoff_log ADD COLUMN %s %s" % (col, decl))
         except sqlite3.OperationalError:
             pass
+    # 活动触达配图是后加的列，老库补齐（历史活动本来就没有图，保持 NULL）。
+    try:
+        conn.execute("ALTER TABLE campaign ADD COLUMN image TEXT")
+    except sqlite3.OperationalError:
+        pass
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_hash ON messages(msg_hash)"
     )
@@ -499,6 +515,35 @@ def set_switch(conv_id, enabled):
     conn.commit()
     conn.close()
     ensure_switch_conversations()
+
+
+def set_switch_batch(conv_ids, enabled):
+    """批量写托管开关：一个事务写完，最后只补一次会话占位。
+
+    前端一次勾选几十个人时，逐个调 set_switch 会重复 N 次开连接 +
+    N 次 ensure_switch_conversations()（里面有全表扫描），还容易在并发下
+    撞 SQLite 写锁、中途失败留半截状态。这里合并成一次 executemany。
+    返回去重后真正写入的 conv_id 列表。
+    """
+    ids = []
+    for c in conv_ids or []:
+        cid = str(c or "").strip()
+        if cid and cid not in ids:
+            ids.append(cid)
+    if not ids:
+        return []
+    conn = init()
+    now = int(time.time())
+    conn.executemany(
+        "INSERT INTO conv_switch(conv_id, enabled, updated_at) VALUES(?, ?, ?) "
+        "ON CONFLICT(conv_id) DO UPDATE SET enabled=excluded.enabled, "
+        "updated_at=excluded.updated_at",
+        [(cid, 1 if enabled else 0, now) for cid in ids],
+    )
+    conn.commit()
+    conn.close()
+    ensure_switch_conversations()
+    return ids
 
 
 def ensure_switch_conversations():
@@ -1316,6 +1361,59 @@ def expire_stale_friend_tasks(days=7, reason="超过 %d 天未通过"):
 # 「看到您发的那个…」结果说错对象，比不发更糟。真正可靠的由头只有两类，
 # 都在 messages 里：① 对方最后说了一句、我们没接（欠一个回应）；② 上次聊到
 # 的具体内容（接着聊）。这两条都不依赖朋友圈。
+def list_outreach_skip():
+    """主动触达「不打扰」名单：[{conv_id, name, note, created}]，新的在前。"""
+    conn = init()
+    try:
+        rows = conn.execute(
+            "SELECT conv_id, name, note, created FROM outreach_skip "
+            "ORDER BY created DESC, conv_id").fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def set_outreach_skip(conv_ids, skip=True, note=""):
+    """批量加入 / 移出「不打扰」名单，返回处理条数。
+
+    加入时如果调用方没给名字，就从 contacts 抄一份当时的显示名存下来——
+    以后把人删了、改了备注，名单里还认得出这是谁。
+    """
+    ids = [c for c in (conv_ids or []) if c]
+    if not ids:
+        return 0
+    conn = init()
+    try:
+        now = int(time.time())
+        n = 0
+        for cid in ids:
+            if skip:
+                row = conn.execute(
+                    "SELECT name FROM contacts WHERE conv_id=?", (cid,)).fetchone()
+                nm = (row["name"] if row and row["name"] else "") or cid
+                conn.execute(
+                    "INSERT OR REPLACE INTO outreach_skip(conv_id, name, note, created)"
+                    " VALUES(?,?,?,?)", (cid, nm, note or "", now))
+                n += 1        # INSERT OR REPLACE 的 rowcount 在 sqlite 上不稳定，直接记 1
+            else:
+                cur = conn.execute("DELETE FROM outreach_skip WHERE conv_id=?", (cid,))
+                n += (cur.rowcount or 0)
+        conn.commit()
+        return n
+    finally:
+        conn.close()
+
+
+def is_outreach_skipped(conv_id):
+    """这个会话是否在「不打扰」名单里（单条判断用；候选筛选在 SQL 里做）。"""
+    conn = _conn()
+    try:
+        return conn.execute("SELECT 1 FROM outreach_skip WHERE conv_id=?",
+                            (conv_id,)).fetchone() is not None
+    finally:
+        conn.close()
+
+
 def get_outreach_candidates(silent_days=7, max_days=60, min_gap_days=14,
                             max_per_contact=3, limit=5, now=None):
     """沉默客户候选池（主动触达用）。
@@ -1385,7 +1483,7 @@ def get_activation_targets(silent_hours=24, max_days=0, min_gap_days=7,
 
     入选条件：私聊 → 最后一条距今 ≥ silent_hours → （可选）不超过 max_days →
     距上次 outreach 类动作 ≥ min_gap_days → 累计消息数 > 0（revive 类型）→
-    累计触达次数 < max_per_contact（0 = 不限）。
+    累计触达次数 < max_per_contact（0 = 不限）→ **不在 outreach_skip 不打扰名单**。
 
     Returns: [{conv_id, name, kind:'revive'|'icebreak', last_ts, last_role, msg_count}]
     """
@@ -1416,7 +1514,10 @@ def get_activation_targets(silent_hours=24, max_days=0, min_gap_days=7,
                "  COALESCE(s.enabled, 0) AS switched "
                "FROM conversations c "
                "LEFT JOIN conv_switch s ON s.conv_id=c.conv_id "
-               "WHERE c.conv_id NOT LIKE '%@chatroom' AND c.last_ts <= ?")
+               "WHERE c.conv_id NOT LIKE '%@chatroom' AND c.last_ts <= ?"
+               # 「不打扰」名单是硬排除：私人联系人哪怕满足全部规则也绝不碰
+               " AND NOT EXISTS (SELECT 1 FROM outreach_skip k"
+               "                 WHERE k.conv_id=c.conv_id)")
         params = [hi]
         if has_contacts:
             sql += (" AND EXISTS (SELECT 1 FROM contacts ct WHERE ct.conv_id=c.conv_id"
@@ -1467,7 +1568,11 @@ def get_activation_targets(silent_hours=24, max_days=0, min_gap_days=7,
                     "WHERE ct.kind='friend' AND NOT EXISTS ("
                     # 判「从没聊过」要看 messages，不能看 conversations：
                     # 开了托管但没聊过的人现在也会有一条占位会话记录。
-                    "  SELECT 1 FROM messages m WHERE m.conv_id=ct.conv_id)")
+                    "  SELECT 1 FROM messages m WHERE m.conv_id=ct.conv_id)"
+                    # 破冰同样受「不打扰」名单约束：已聊过的人被排除时，
+                    # 这里不补齐就会出现「 revive 不发、icebreak 反倒发了」的漏洞。
+                    " AND NOT EXISTS (SELECT 1 FROM outreach_skip k"
+                    "                 WHERE k.conv_id=ct.conv_id)")
             p2 = []
             if me:                          # 通讯录里有自己，别给自己发破冰消息
                 sql2 += " AND ct.conv_id <> ?"
@@ -1700,14 +1805,19 @@ def _json(s, fallback):
         return fallback
 
 
-def add_campaign(name, content, send_at, targets, grace_minutes=60):
+def add_campaign(name, content, send_at, targets, grace_minutes=60, image=None):
+    """新建一条活动；image 存的是素材库 id（本机私有），不是路径。
+
+    看板创建时已校验过 id 有效；这里只做字符串收敛，不解析文件——真正发送时
+    由 auto_reply 再 resolve 一次（素材可能在这期间被删）。
+    """
     conn = init()
     try:
         now = int(time.time())
         cur = conn.execute(
-            "INSERT INTO campaign(name, content, send_at, targets, status, result, "
-            "grace_minutes, created, updated) VALUES(?,?,?,?, 'scheduled', '[]', ?,?,?)",
-            (name, content, int(send_at),
+            "INSERT INTO campaign(name, content, image, send_at, targets, status, result, "
+            "grace_minutes, created, updated) VALUES(?,?,?,?,?, 'scheduled', '[]', ?,?,?)",
+            (name, content, str(image or "").strip()[:64], int(send_at),
              json.dumps(targets or [], ensure_ascii=False),
              int(grace_minutes), now, now))
         conn.commit()

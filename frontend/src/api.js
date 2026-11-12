@@ -36,12 +36,39 @@ export const api = {
 
   // ---- 主动激活（后台常驻触达）----
   outreachToggle: (enabled) => post('/api/outreach/toggle', { enabled }),
+  // 破冰 / 只碰托管：落 app_setting，主进程下一轮巡检就认，不用重启
+  outreachConfig: (body) => post('/api/outreach/config', body),
+  // 不打扰名单（私人联系人）：列表 + 可选联系人，批量加/删
+  outreachSkip: () => json('/api/outreach/skip'),
+  outreachSkipSet: (conv_ids, skip = true, note = '') =>
+    post('/api/outreach/skip', { conv_ids, skip, note }),
 
   // ---- 消息页 ----
   open: (conv) => post('/api/open', { conv }),
   switch: (conv, enabled) => post('/api/switch', { conv, enabled }),
+  // 批量托管：一次请求单事务写完，避免几十个并发请求撞 SQLite 写锁
+  switchBatch: (convs, enabled) => post('/api/switch/batch', { convs, enabled }),
   send: (conv, text) => post('/api/send', { conv, text }),
+  // 不用通用 post()：微信没开/素材失效时后端返回 500 + {ok:false,error:人话}，
+  // 通用封装会直接抛 "HTTP 500" 把可读提示吞掉。
+  sendImage: async (conv, assetId) => {
+    const r = await fetch('/api/send/image', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conv, asset_id: assetId }),
+    })
+    return r.json().catch(() => ({ ok: false, error: 'HTTP ' + r.status }))
+  },
   deleteMessage: (id) => post('/api/messages/delete', { id }),
+
+  // ---- 图片素材库（本机私有目录，不入库）----
+  mediaList: () => json('/api/media'),
+  mediaDelete: (id) => del('/api/media/' + encodeURIComponent(id)),
+  mediaUpload: (file) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    // 不要手动设 Content-Type，浏览器要自己带 multipart boundary
+    return json('/api/media', { method: 'POST', body: fd })
+  },
 
   // ---- 朋友圈 ----
   // 总「模拟/真跑」开关复用会话开关接口，conv 固定为 __moment_dry__

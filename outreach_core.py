@@ -129,9 +129,10 @@ def icebreak_intent(cfg=None):
 def pick_targets(ou, limit=10, now=None):
     """按 config 的 outreach 块挑候选。
 
-    ou 就是 config.json 里的 `outreach` 字典，键的含义见 config.json 注释版
-    说明（RUNBOOK 六）。这里只做参数换算，规则本身在
-    monitor_store.get_activation_targets（一处实现，两处调用）。
+    ou 就是 config.json 里的 `outreach` 字典（调用方通常已经把看板可改的
+    开关合进来），键的含义见 config.json 注释版说明（RUNBOOK 六）。这里只做
+    参数换算，规则本身在 monitor_store.get_activation_targets（一处实现，
+    两处调用）。「不打扰」名单（outreach_skip）在那边统一排除，这里不用管。
     """
     ou = ou or {}
     return monitor_store.get_activation_targets(

@@ -32,6 +32,12 @@ API：
     GET  /api/friends             开关状态 + 今日用量 + 各状态计数 + 最近 50 条
     POST /api/friends/toggle      {enabled} 开关自动加好友（落库，20 秒内生效，无需重启）
     POST /api/friends/import      导入名单：multipart 字段 file=CSV，或 JSON {text}
+    主动激活（outreach）：
+    GET  /api/outreach            状态 + 节奏参数 + 生效的范围开关 + 候选 + 不打扰名单
+    POST /api/outreach/toggle     {enabled} 总开关（落库，主进程 ≤5 分钟生效）
+    POST /api/outreach/config     {include_new_contacts?, require_switch?} 破冰 / 只看托管
+    GET  /api/outreach/skip       不打扰名单 + 可选联系人（只给好友）
+    POST /api/outreach/skip       {conv_ids[], skip} 批量加入/移出不打扰名单（硬排除）
     知识库（knowledge_store + ai_client）：
     GET    /api/knowledge        资料列表 + 运行参数 + 检索单元统计 + 格式能力
     POST   /api/knowledge/upload      上传文件（multipart files，可多份）并自动文本化
@@ -55,6 +61,7 @@ from flask import (Flask, render_template, jsonify, request, send_from_directory
 
 from monitor_store import (
     init, list_conversations, get_messages, add_message, clear_unread, set_switch,
+    set_switch_batch,
     ensure_switch_conversations,
     get_moments, get_interactions, mark_interactions_read, moment_unread_count,
     get_moment_switches, set_moment_switch, get_tasks, task_counts,
@@ -62,12 +69,14 @@ from monitor_store import (
     count_outreach_since, delete_message, get_avatar,
     list_contacts, get_display_name, list_handoff_log, last_handoff_map,
     last_handoff_state_map,
+    list_outreach_skip, set_outreach_skip,
     add_campaign, list_campaigns, cancel_campaign, send_campaign_now,
     delete_campaign,
 )
 import handoff
 import outreach_core as oc
 import knowledge_store as kb
+import media_assets
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("dashboard")
@@ -282,6 +291,66 @@ def api_switch():
     return jsonify({"ok": True, "conv": conv, "enabled": enabled})
 
 
+@app.route("/api/switch/batch", methods=["POST"])
+def api_switch_batch():
+    """批量开启 / 关闭托管。body: {convs: [...], enabled: bool}。
+
+    「+」选择器一次勾几十个人时走这里：单事务写库，避免前端并发 N 个请求
+    撞 SQLite 写锁、或中途失败留下半截状态。
+
+    **开启时校验身份**：只接受通讯录里的 friend / group，群里见过但没加好友
+    的陌生人、公众号、系统号、自己一律拒掉（合规红线：只托管已知客户）。
+    关闭不校验——把不该托管的人关掉永远是安全的。
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    convs = data.get("convs")
+    if not isinstance(convs, list) or not convs:
+        return jsonify({"ok": False, "error": "convs 不能为空数组"}), 400
+    enabled = bool(data.get("enabled", True))
+    wanted = []
+    for c in convs:
+        cid = str(c or "").strip()
+        if cid and cid not in wanted:
+            wanted.append(cid)
+    if not wanted:
+        return jsonify({"ok": False, "error": "convs 不能为空数组"}), 400
+
+    skipped = []
+    if enabled:
+        allowed = {r["conv_id"] for r in list_contacts()
+                   if (r.get("kind") or "") in ("friend", "group")}
+        me = get_setting("me_wxid") or ""
+        ok_ids = [c for c in wanted if c in allowed and c != me]
+        skipped = [c for c in wanted if c not in ok_ids]
+        if not ok_ids:
+            return jsonify({
+                "ok": False,
+                "error": "所选对象都不在通讯录好友 / 群聊里，未做任何改动",
+                "skipped": skipped,
+            }), 400
+    else:
+        ok_ids = wanted
+
+    updated = set_switch_batch(ok_ids, enabled)
+    return jsonify({"ok": True, "enabled": enabled,
+                    "updated": updated, "skipped": skipped})
+
+
+def _display_name_for(conv):
+    """wxid -> 微信 Ctrl+F 认得的显示名（备注优先）。文本/图片发送共用。"""
+    name = get_display_name(conv)
+    if not name:
+        # 通讯录还没同步过时，最后试一次解密库（get_nickname 通常也是备注优先）
+        try:
+            import db_gate
+            nm = (db_gate.get_db().get_nickname(conv) or "").strip()
+            if nm and nm != conv:
+                name = nm
+        except Exception as e:  # noqa: BLE001
+            log.warning("解密库反查昵称失败: %s", e)
+    return name
+
+
 @app.route("/api/send", methods=["POST"])
 def api_send():
     """通过键盘驱动把消息发给指定联系人（需微信在前台）。
@@ -295,16 +364,7 @@ def api_send():
     if not conv or not text:
         return jsonify({"ok": False, "error": "conv 和 text 不能为空"}), 400
 
-    name = get_display_name(conv)
-    if not name:
-        # 通讯录还没同步过时，最后试一次解密库（get_nickname 通常也是备注优先）
-        try:
-            import db_gate
-            nm = (db_gate.get_db().get_nickname(conv) or "").strip()
-            if nm and nm != conv:
-                name = nm
-        except Exception as e:  # noqa: BLE001
-            log.warning("解密库反查昵称失败: %s", e)
+    name = _display_name_for(conv)
     if not name:
         return jsonify({
             "ok": False,
@@ -323,6 +383,64 @@ def api_send():
         return jsonify({"ok": True, "conv": conv, "name": name})
     except Exception as e:  # noqa: BLE001
         log.exception("发送失败")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ==================== 图片素材库 / 多媒体发送 ====================
+
+@app.route("/api/media", methods=["GET"])
+def api_media_list():
+    """看板选图用的素材列表。文件都在本机 wechat_media/outbox/，不入库。"""
+    return jsonify({"ok": True, "items": media_assets.list_assets()})
+
+
+@app.route("/api/media", methods=["POST"])
+def api_media_upload():
+    """上传一张配图（multipart file）。格式/大小校验在 media_assets 里做。"""
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"ok": False, "error": "没收到文件"}), 400
+    item, err = media_assets.save_upload(f.filename, f.read())
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    return jsonify({"ok": True, "item": item})
+
+
+@app.route("/api/media/<asset_id>", methods=["DELETE"])
+def api_media_delete(asset_id):
+    return jsonify({"ok": media_assets.delete_asset(asset_id)})
+
+
+@app.route("/api/send/image", methods=["POST"])
+def api_send_image():
+    """看板手发一张图片（需微信在前台）。
+
+    图片没有正文，不能像文本那样回读输入框确认，所以**不写看板消息库**：
+    真实图片消息由收消息桥轮询补录上屏，避免凭一次按键记一条假成功。
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    conv = str(data.get("conv") or "").strip()
+    aid = str(data.get("asset_id") or "").strip()
+    if not conv or not aid:
+        return jsonify({"ok": False, "error": "conv 和 asset_id 不能为空"}), 400
+    name = _display_name_for(conv)
+    if not name:
+        return jsonify({
+            "ok": False,
+            "error": "找不到该联系人的备注/昵称，无法在微信里定位会话（Ctrl+F 不认 wxid）。",
+        }), 400
+    path = media_assets.resolve(aid)
+    if not path:
+        return jsonify({"ok": False, "error": "图片素材不存在或已被删除"}), 400
+    try:
+        import wechat_ui
+        cfg = wechat_ui.load_config()
+        cfg["dry_run"] = False
+        wechat_ui.WeChatPCBot(cfg).send_image_to_contact(name, path, conv_id=conv)
+        return jsonify({"ok": True, "conv": conv, "name": name,
+                        "note": "按键序列已完成；真实图片消息由收消息桥补录上屏"})
+    except Exception as e:  # noqa: BLE001
+        log.exception("发送图片失败")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
@@ -498,6 +616,32 @@ def _ou_cfg():
         return {}
 
 
+def _flag(setting_key, config_val):
+    """运行期开关的生效值：库里有就以库为准，没有才回退 config.json。
+
+    与 auto_reply._ou_enabled / _ou_include_new / _ou_require_switch 同一套语义，
+    两边必须一致，否则看板显示的开关和主进程实际行为会对不上。
+    Returns: (生效值 bool, 是否已落库 bool)
+    """
+    v = get_setting(setting_key)
+    persisted = v not in (None, "")
+    return (((v == "1") if persisted else bool(config_val)), persisted)
+
+
+def _outreach_cfg_effective():
+    """config 的 outreach 块 + 库内覆盖项，拼成「主进程实际会用」的那份配置。
+
+    看板的候选列表必须用这份算，不然开关打开了、候选还是旧的，
+    用户会以为开关没生效。
+    """
+    ou = dict(_ou_cfg())
+    ou["include_new_contacts"] = _flag(
+        "outreach_include_new", ou.get("include_new_contacts", False))[0]
+    ou["require_switch"] = _flag(
+        "outreach_require_switch", ou.get("require_switch", False))[0]
+    return ou
+
+
 @app.route("/api/outreach")
 def api_outreach():
     ou = _ou_cfg()
@@ -506,9 +650,20 @@ def api_outreach():
     persisted = setting not in (None, "")
     config_enabled = bool(ou.get("enabled", False))
     enabled = (setting == "1") if persisted else config_enabled
+    inc_new, inc_persisted = _flag(
+        "outreach_include_new", ou.get("include_new_contacts", False))
+    req_sw, req_persisted = _flag(
+        "outreach_require_switch", ou.get("require_switch", False))
     import datetime
     d = datetime.datetime.now()
     day_start = datetime.datetime(d.year, d.month, d.day).timestamp()
+    eff = _outreach_cfg_effective()
+    cands = oc.pick_targets(eff, limit=5)
+    for c in cands:                    # 候选表要显头像，缺 URL 前端就只剩首字色块
+        av = get_avatar(c["conv_id"])
+        c["avatar_url"] = ("/api/avatar/%s?v=%s"
+                           % (quote(c["conv_id"], safe=""), av.get("ts") or 0)) if av else ""
+    skip = list_outreach_skip()
     return jsonify({
         "enabled": enabled,
         "persisted": persisted,
@@ -527,10 +682,67 @@ def api_outreach():
         "interval_min_seconds": int(ou.get("interval_min_seconds", 600) or 0),
         "interval_max_seconds": int(ou.get("interval_max_seconds", 1800) or 0),
         "boot_grace_seconds": int(ou.get("boot_grace_seconds", 600) or 0),
-        "include_new_contacts": bool(ou.get("include_new_contacts", False)),
+        "include_new_contacts": inc_new,
+        "include_new_persisted": inc_persisted,
+        "config_include_new_contacts": bool(ou.get("include_new_contacts", False)),
+        "require_switch": req_sw,
+        "require_switch_persisted": req_persisted,
+        "skip_count": len(skip),
+        "skip_list": skip,
         # 只看不改：与常驻触达同一套规则算出来的候选（排查用）
-        "candidates": oc.pick_targets(ou, limit=5),
+        "candidates": cands,
     })
+
+
+@app.route("/api/outreach/config", methods=["POST"])
+def api_outreach_config():
+    """破冰 / 只碰托管两个开关：落 app_setting，主进程下一轮巡检（≤5 分钟）生效。
+
+    为什么写库不写 config.json：主进程只在启动时读一次配置文件，
+    写文件等于要求用户重启——开关就该点一下立刻管用。
+    """
+    body = request.get_json(silent=True) or {}
+    changed = {}
+    for key, skey in (("include_new_contacts", "outreach_include_new"),
+                      ("require_switch", "outreach_require_switch")):
+        if key in body:
+            on = bool(body.get(key))
+            set_setting(skey, "1" if on else "0")
+            changed[key] = on
+    if not changed:
+        return jsonify({"ok": False, "error": "没有可改的字段"}), 400
+    return jsonify(dict(ok=True, persisted=True, source="看板设置", **changed))
+
+
+@app.route("/api/outreach/skip", methods=["GET"])
+def api_outreach_skip_list():
+    """「不打扰」名单 + 可选的联系人清单（前端选人用，只给好友）。"""
+    items = list_outreach_skip()
+    for it in items:
+        av = get_avatar(it["conv_id"])
+        it["avatar_url"] = ("/api/avatar/%s?v=%s"
+                            % (quote(it["conv_id"], safe=""), av.get("ts") or 0)) if av else ""
+    contacts = [c for c in _handoff_candidates() if c.get("kind") == "friend"]
+    return jsonify({"ok": True, "items": items, "contacts": contacts})
+
+
+@app.route("/api/outreach/skip", methods=["POST"])
+def api_outreach_skip_set():
+    """批量加入 / 移出「不打扰」名单。
+
+    body: {conv_ids:[...], skip:true|false, note:""}
+    进了名单的人，主动触达和破冰都不会再碰他，规则里的冷却、沉默天数一概不再考虑。
+    """
+    body = request.get_json(silent=True) or {}
+    ids = body.get("conv_ids") or []
+    if body.get("conv_id"):
+        ids = list(ids) + [body["conv_id"]]
+    if not isinstance(ids, list):
+        return jsonify({"ok": False, "error": "conv_ids 必须是数组"}), 400
+    skip = bool(body.get("skip", True))
+    n = set_outreach_skip(ids, skip=skip, note=body.get("note") or "")
+    return jsonify({"ok": True, "changed": int(n), "skip": skip,
+                    "count": len(list_outreach_skip())})
 
 
 @app.route("/api/outreach/toggle", methods=["POST"])
@@ -660,6 +872,9 @@ def api_campaigns():
         "ok": True,
         "campaigns": list_campaigns(50),
         "contacts": _handoff_candidates(),   # 与接管页同一份通讯录候选
+        # 顺带带上素材库（只含 id/名字/预览 URL，不含路径），让活动详情能把
+        # campaign.image 的 id 反查成缩略图，不必再开一个接口。
+        "media": media_assets.list_assets(),
     })
 
 
@@ -700,8 +915,13 @@ def api_campaign_create():
         grace = max(1, min(int(body.get("grace_minutes") or 60), 1440))
     except (TypeError, ValueError):
         grace = 60
+    # 配图只认素材库里真实存在的 id：宁可创建时报错，也别排期一个「本来想带图、
+    # 到点只发文字」的活动。素材是本机私有文件，库里只存 id 不存路径。
+    image = str(body.get("image") or "").strip()
+    if image and (not media_assets.get_asset(image) or not media_assets.resolve(image)):
+        return jsonify({"ok": False, "error": "所选配图素材不存在或已被删除，请重新选图"}), 400
     cid = add_campaign(str(body.get("name") or "未命名活动")[:80], content,
-                       send_at, clean, grace)
+                       send_at, clean, grace, image=image)
     return jsonify({"ok": True, "id": cid})
 
 

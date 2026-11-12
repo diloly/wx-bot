@@ -44,6 +44,25 @@ function count(id) {
   return props.contacts.filter((c) => c.kind === id).length
 }
 
+// 「全选」永远只作用于**当前看得见的结果**（筛选 chips + 搜索词），不是通讯录全量。
+// 想一次选所有人，把筛选切回「全部」并清空搜索即可；已选区里原有但被筛掉的
+// 人不会被清掉，方便分几批挑人。
+const visibleIds = computed(() => list.value.map((c) => c.conv_id))
+const allVisiblePicked = computed(() => visibleIds.value.length > 0
+  && visibleIds.value.every((id) => props.modelValue.includes(id)))
+const someVisiblePicked = computed(() => visibleIds.value.some((id) => props.modelValue.includes(id)))
+
+function selectAllVisible() {
+  const next = new Set(props.modelValue)
+  visibleIds.value.forEach((id) => next.add(id))
+  emit('update:modelValue', [...next])
+}
+
+function deselectAllVisible() {
+  const drop = new Set(visibleIds.value)
+  emit('update:modelValue', props.modelValue.filter((id) => !drop.has(id)))
+}
+
 function toggle(id, checked) {
   const next = new Set(props.modelValue)
   if (checked) next.add(id); else next.delete(id)
@@ -112,6 +131,13 @@ async function syncAvatars() {
       </div>
     </div>
     <el-input v-model="kw" size="small" clearable placeholder="搜索名字 / wxid" />
+    <div class="wb-picker-bulk">
+      <el-button size="small" type="primary" plain :disabled="!list.length || allVisiblePicked"
+                 @click="selectAllVisible">全选当前结果 ({{ list.length }})</el-button>
+      <el-button size="small" plain :disabled="!someVisiblePicked"
+                 @click="deselectAllVisible">取消当前结果</el-button>
+      <span class="wb-hint">按筛选 + 搜索的结果批量选；想全选所有人就切回「全部」并清空搜索</span>
+    </div>
     <div class="wb-picker-list">
       <div v-for="c in list" :key="c.conv_id" class="wb-picker-row"
            :class="{ picked: modelValue.includes(c.conv_id) }" @click="rowClick(c, $event)">
@@ -128,7 +154,7 @@ async function syncAvatars() {
       <div v-if="!list.length" class="wb-empty">没有匹配的对象</div>
     </div>
     <div style="margin-top: 6px; font-size: 13px; color: var(--wb-muted)">
-      只列通讯录好友与群聊，群里的陌生人已排除 · 整行可点选
+      只列通讯录好友与群聊，群里的陌生人已排除 · 整行可点选 · 支持全选当前结果
     </div>
   </div>
 </template>
@@ -161,6 +187,10 @@ async function syncAvatars() {
   gap: 8px; flex-wrap: wrap; margin-bottom: 8px;
 }
 .wb-avatar-stat { display: flex; align-items: center; gap: 6px; }
+.wb-picker-bulk {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px;
+}
+.wb-picker-bulk .wb-hint { font-size: 12px; }
 .wb-picker-list { max-height: 220px; overflow-y: auto; margin-top: 8px; }
 .wb-picker-row { cursor: pointer; }
 .wb-picker-row.picked { background: var(--wb-accent-soft); }

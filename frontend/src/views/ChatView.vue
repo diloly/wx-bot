@@ -3,6 +3,8 @@ import { computed, inject, nextTick, ref, watch } from 'vue'
 import { api } from '../api'
 import { fmtClock, avatarUrl } from '../utils'
 import WbAvatar from '../components/WbAvatar.vue'
+import ContactPicker from '../components/ContactPicker.vue'
+import EmojiPicker from '../components/EmojiPicker.vue'
 import MessageBubble from '../components/MessageBubble.vue'
 
 const store = inject('store')
@@ -12,11 +14,70 @@ const refreshPage = inject('refreshPage')
 const kw = ref('')
 const showAll = ref(false)   // 默认只列「托管过」的会话；勾选后才显示全部聊天
 const pickerOpen = ref(false)
-const pickerKw = ref('')
-const pickerKind = ref('all')
+const selectedConvIds = ref([])   // 一次性勾选，关掉弹窗就清空
+const pickerBusy = ref(false)
 const draft = ref('')
 const sending = ref(false)
 const scroller = ref(null)
+const draftInput = ref(null)
+const fileInput = ref(null)
+const imageBusy = ref(false)
+const assetOpen = ref(false)
+const assets = ref([])
+
+// 表情插到光标处，不是无脑追加到末尾：正文写到一半点表情是常态。
+function insertEmoji(s) {
+  const ta = draftInput.value?.$el?.querySelector?.('textarea')
+  const cur = draft.value || ''
+  const pos = (ta && ta.selectionStart != null) ? ta.selectionStart : cur.length
+  draft.value = cur.slice(0, pos) + s + cur.slice(pos)
+  nextTick(() => {
+    if (!ta) return
+    ta.focus()
+    const p = pos + s.length
+    try { ta.setSelectionRange(p, p) } catch (_) { /* 某些浏览器不支持就算了 */ }
+  })
+}
+
+async function doSendImage(assetId) {
+  const r = await api.sendImage(store.activeConv, assetId)
+  if (r.ok === false) throw new Error(r.error || '发送失败')
+  // 图片不走文本回读，后端也不写看板库；真实图片消息由收消息桥补录上屏
+  toast('图片已提交发送；真实消息稍后由回执上屏')
+  assetOpen.value = false
+}
+
+async function uploadAndSendImage(e) {
+  const f = e.target.files?.[0]
+  e.target.value = ''
+  if (!f || !store.activeConv || imageBusy.value) return
+  imageBusy.value = true
+  try {
+    const up = await api.mediaUpload(f)
+    if (up.ok === false) throw new Error(up.error || '上传失败')
+    await doSendImage(up.item.id)
+  } catch (err) {
+    toast('图片发送失败：' + err.message, 'error')
+  } finally { imageBusy.value = false }
+}
+
+function openImageFile() { fileInput.value?.click() }
+
+async function openAssets() {
+  try {
+    const r = await api.mediaList()
+    assets.value = r.items || []
+    assetOpen.value = true
+  } catch (e) { toast('读取素材失败：' + e.message, 'error') }
+}
+
+async function sendAsset(assetId) {
+  if (imageBusy.value || !store.activeConv) return
+  imageBusy.value = true
+  try { await doSendImage(assetId) }
+  catch (e) { toast('图片发送失败：' + e.message, 'error') }
+  finally { imageBusy.value = false }
+}
 
 // 不再按 auto_reply 过滤：人工接管会关掉托管，那个客户不能因此从看板消失。
 // 默认只列「托管过」的会话（switched=1，含已关闭），避免几百个普通聊天糊满左栏；
@@ -32,13 +93,10 @@ const meAvatar = computed(() => avatarUrl(store.me))
 const peerAvatar = computed(() => active.value?.avatar_url || '')
 const isGroup = computed(() => String(store.activeConv).endsWith('@chatroom'))
 
-const pickerList = computed(() => (store.contacts || []).filter((c) => {
-  if (c.auto_reply || !['friend', 'group'].includes(c.kind)) return false
-  if (pickerKind.value === 'group' && c.kind !== 'group') return false
-  if (pickerKind.value === 'friend' && c.kind !== 'friend') return false
-  if (pickerKw.value && !(String(c.name) + String(c.conv_id)).toLowerCase().includes(pickerKw.value.toLowerCase())) return false
-  return true
-}))
+// 只列「还没托管」的通讯录好友 / 群聊。已托管的已经在左边列表里，不重复出现。
+// 直接复用接管页 / 活动页那个选择器：已选固定在上方、头像、整行可点都是现成的。
+const pickerContacts = computed(() => (store.contacts || []).filter(
+  (c) => !c.auto_reply && ['friend', 'group'].includes(c.kind)))
 
 function scrollBottom() {
   nextTick(() => { if (scroller.value) scroller.value.scrollTop = scroller.value.scrollHeight })
@@ -67,22 +125,48 @@ async function toggleConv(c, v) {
   } catch (e) { toast('切换失败：' + e.message, 'error') }
 }
 
-async function enableConv(c) {
+// 勾选完一次提交：后端一个事务写完全部开关，中途失败不会留下半截状态。
+// 后端开启时会再校验一次身份（陌生人 / 公众号 / 自己一律跳过），skipped 要如实告诉用户。
+async function submitBatch() {
+  const ids = [...selectedConvIds.value]
+  if (!ids.length || pickerBusy.value) return
+  pickerBusy.value = true
   try {
-    await api.switch(c.conv_id, true)
-    c.auto_reply = 1
-    c.switched = 1
+    const r = await api.switchBatch(ids, true)
+    if (r.ok === false) throw new Error(r.error || '开启失败')
+    const done = new Set(r.updated || [])
+    const contacts = store.contacts || []
+    contacts.forEach((c) => {
+      if (done.has(c.conv_id)) { c.auto_reply = 1; c.switched = 1 }
+    })
+    const skipped = (r.skipped || []).length
+    toast(`已开启托管 ${done.size} 个${skipped ? `，${skipped} 个不在通讯录好友 / 群聊里，已跳过` : ''}`)
     pickerOpen.value = false
-    toast('已开启托管：' + c.name)
-    refreshPage('chat')
-  } catch (e) { toast('开启失败：' + e.message, 'error') }
+    selectedConvIds.value = []
+    await refreshPage('chat')      // 重新拉会话列表，左侧立刻出现新托管的占位会话
+  } catch (e) {
+    toast('开启失败：' + e.message, 'error')
+  } finally { pickerBusy.value = false }
+}
+
+// 「同步头像」只更新通讯录里的头像字段，不整页刷新 —— 否则会冲掉未提交的勾选。
+function onContactsUpdated(list) {
+  if (!Array.isArray(list)) return
+  const fresh = new Map(list.map((c) => [c.conv_id, c]))
+  const cur = store.contacts || []
+  cur.forEach((c) => {
+    const f = fresh.get(c.conv_id)
+    if (f && f.avatar_url) c.avatar_url = f.avatar_url
+  })
+  const known = new Set(cur.map((c) => c.conv_id))
+  const extra = list.filter((c) => !known.has(c.conv_id)).map((c) => ({ ...c, auto_reply: 0 }))
+  if (extra.length) store.contacts = cur.concat(extra)
 }
 
 async function openPicker() {
+  selectedConvIds.value = []
   pickerOpen.value = true
-  pickerKw.value = ''
-  pickerKind.value = 'all'
-  await refreshPage('chat')
+  await refreshPage('chat')        // 拉最新通讯录 + 托管状态
 }
 
 async function send() {
@@ -176,7 +260,17 @@ async function delMessage(id) {
         </div>
 
         <div class="wb-composer">
+          <div class="wb-composer-tools">
+            <EmojiPicker :disabled="!store.activeConv" @pick="insertEmoji" />
+            <el-button size="small" :loading="imageBusy" :disabled="!store.activeConv"
+                       @click="openImageFile">图片</el-button>
+            <el-button size="small" :disabled="!store.activeConv" @click="openAssets">素材库</el-button>
+            <input ref="fileInput" type="file" accept="image/*" style="display: none"
+                   @change="uploadAndSendImage" />
+            <span class="wb-hint">图片发送后由消息回执上屏，不会立刻显示</span>
+          </div>
           <el-input
+            ref="draftInput"
             v-model="draft" type="textarea" :rows="2" resize="none"
             placeholder="输入消息，Enter 发送（Shift+Enter 换行）"
             @keydown.enter.exact.prevent="send"
@@ -187,35 +281,59 @@ async function delMessage(id) {
       <div v-else class="wb-empty" style="margin: auto">从左边选一个会话开始</div>
     </section>
 
-    <el-dialog v-model="pickerOpen" title="选择要开启托管的会话" width="480px" align-center>
-      <div class="wb-filters">
-        <el-tag
-          v-for="f in [{ id: 'all', label: '全部' }, { id: 'friend', label: '好友' }, { id: 'group', label: '群聊' }]"
-          :key="f.id" size="small" style="cursor: pointer"
-          :effect="pickerKind === f.id ? 'dark' : 'plain'" @click="pickerKind = f.id"
-        >{{ f.label }}</el-tag>
-      </div>
-      <el-input v-model="pickerKw" size="small" clearable placeholder="搜索名字 / 备注 / wxid" />
-      <div style="max-height: 46vh; overflow-y: auto; margin-top: 10px">
-        <div v-for="c in pickerList" :key="c.conv_id" class="wb-picker-row" @click="enableConv(c)">
-          <WbAvatar :url="c.avatar_url" :name="c.name" size="sm" />
-          <span style="flex: 1; min-width: 0; font-size: 14px">{{ c.name }}</span>
-          <el-tag v-if="!c.has_conv" size="small" effect="plain">未聊过</el-tag>
-          <el-tag size="small" effect="plain" :type="c.kind === 'group' ? 'primary' : 'info'">
-            {{ c.kind === 'group' ? '群聊' : '好友' }}
-          </el-tag>
-          <span style="color: var(--wb-accent); font-size: 19px">+</span>
-        </div>
-        <div v-if="!pickerList.length" class="wb-empty">没有可开启的会话</div>
-      </div>
+    <el-dialog v-model="pickerOpen" title="批量开启托管" width="560px" align-center>
+      <ContactPicker
+        v-model="selectedConvIds" :contacts="pickerContacts"
+        @contacts-updated="onContactsUpdated"
+      />
       <template #footer>
-        <span class="wb-hint">只列通讯录好友与群聊，群里的陌生人已排除</span>
+        <div class="wb-picker-foot">
+          <span class="wb-hint">可一次勾选多个，提交时后端一个事务全部写完</span>
+          <div>
+            <el-button size="small" @click="pickerOpen = false">取消</el-button>
+            <el-button
+              type="primary" size="small" :loading="pickerBusy"
+              :disabled="!selectedConvIds.length" @click="submitBatch"
+            >开启托管{{ selectedConvIds.length ? '(' + selectedConvIds.length + ')' : '' }}</el-button>
+          </div>
+        </div>
       </template>
+    </el-dialog>
+
+    <el-dialog v-model="assetOpen" title="从素材库选一张图片发送" width="520px" align-center>
+      <div class="wb-assets">
+        <div v-for="a in assets" :key="a.id" class="wb-asset" @click="sendAsset(a.id)">
+          <img :src="a.url" :alt="a.name" />
+          <span :title="a.name">{{ a.name }}</span>
+        </div>
+        <div v-if="!assets.length" class="wb-empty" style="grid-column: 1 / -1">
+          素材库还是空的 —— 点「图片」上传一张，上传后会自动发给当前会话
+        </div>
+      </div>
     </el-dialog>
   </div>
 </template>
 
 <style scoped>
+.wb-composer-tools {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; width: 100%;
+}
+.wb-composer-tools .wb-hint { font-size: 12px; }
+.wb-assets { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+.wb-asset {
+  cursor: pointer; padding: 6px; text-align: center;
+  border: 1px solid var(--wb-border); border-radius: 8px;
+}
+.wb-asset:hover { border-color: var(--wb-accent); background: var(--wb-accent-soft); }
+.wb-asset img { width: 100%; height: 84px; object-fit: cover; border-radius: 5px; }
+.wb-asset span {
+  display: block; margin-top: 5px; font-size: 12px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.wb-picker-foot {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; flex-wrap: wrap; width: 100%;
+}
 .wb-side-filter {
   display: flex; align-items: center; justify-content: space-between;
   gap: 8px; padding: 0 12px 8px;

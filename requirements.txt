@@ -9,8 +9,13 @@ beautifulsoup4
 openai
 wechatauto-replica
 
+# 图片发送 / 上传：剪贴板 CF_DIB 要 pywin32（仅 Windows），图片格式转换与
+# 上传校验要 Pillow。缺了只会让「发图片」不可用，文本发送链路不受影响。
+pywin32; sys_platform == "win32"
+Pillow
+
 # 知识库上传文件的文本抽取。都是可选增强：缺了不会报错，对应文件会标成
 # 「待补文字」，在看板里人工粘贴正文即可。
 pypdf
 python-docx
-# 图片 OCR 另需 pytesseract + Pillow，且本机要装 Tesseract 与 chi_sim 中文包。
+# 图片 OCR 另需 pytesseract，且本机要装 Tesseract 与 chi_sim 中文包。
