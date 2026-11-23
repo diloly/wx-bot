@@ -41,17 +41,41 @@ class ForwardError(RuntimeError):
     """转发前置条件不满足（依赖/UI/来源消息）。"""
 
 
+def _clear_forward_search(ops):
+    """清空转发窗的搜索框——关键：上一个用搜索找到的人，会把列表过滤住，
+    下一个人翻列表一定翻不到（wechatauto 标签选人模块有同样处理，转发模块漏了）。"""
+    from wechatauto.labels import PICKER_CLEAR, SEARCH_BOX_NAME
+    h, win = ops._forward_window()
+    if win is None:
+        return
+    btn = ops._find(win, (PICKER_CLEAR,), contains=False)
+    if btn is not None:
+        ops._click(h, btn, raise_it=False)
+        return
+    box = ops._find(win, (SEARCH_BOX_NAME,), contains=False)
+    if box is not None:
+        ops.uia._set_text(box, "")
+        time.sleep(0.5)
+
+
 def _select_paced(ops, names):
-    """逐人勾选，每人之间留随机间隔，避免连点卡住。返回同 ops.select 的结构。"""
+    """逐人勾选：每人之间留间隔、**选完清空搜索框**，避免残留搜索词卡住下一个人。
+
+    转发模块 ops.select_one 不像标签模块那样清空上一次搜索词——第一个人用搜索
+    找到后搜索框残留其名字、列表被过滤，第二个人翻列表翻不到、又搜不到 → 卡住。
+    这里在每人之间清一次，返回同 ops.select 的结构。
+    """
+    from wechatauto.labels import _result
     picked, missing = [], []
     for idx, nm in enumerate(names):
         if idx:
+            # 清掉上一人的搜索词（若有），再留随机间隔
+            _clear_forward_search(ops)
             time.sleep(random.uniform(SELECT_GAP_MIN, SELECT_GAP_MAX))
         r = ops.select_one(nm)
         (picked if r.get("ok") else missing).append(
             nm if r.get("ok") else {"name": nm, "reason": r.get("reason", "")})
     _h, win = ops._forward_window()
-    from wechatauto.labels import _result
     return _result(True, "ok", picked=picked, missing=missing,
                    selected=ops.selected(win) if win is not None else [])
 
