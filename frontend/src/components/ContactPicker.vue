@@ -1,5 +1,5 @@
 <script setup>
-import { computed, inject, ref } from 'vue'
+import { computed, inject, ref, watch } from 'vue'
 import WbAvatar from './WbAvatar.vue'
 import { api } from '../api'
 
@@ -12,13 +12,65 @@ const toast = inject('toast')
 
 const kw = ref('')
 const filter = ref('all')
+const tagFilter = ref('')          // '' = 不按标签筛；否则只显示含该标签的对象
 const syncing = ref(false)
+const tagSyncing = ref(false)
+const tagSyncedAt = ref(0)
 const FILTERS = [
   { id: 'all', label: '全部' },
   { id: 'group', label: '群聊' },
   { id: 'friend', label: '好友' },
   { id: 'selected', label: '已选' },
 ]
+
+// 标签清单：优先从候选自带的 tags 汇总（四处入口传进来的候选都带 tags），
+// 候选没带时再向 /api/tags 取一次缓存里的全量标签名。
+const tags = ref([])
+watch(() => props.contacts, (list) => {
+  const s = new Set(tags.value)
+  for (const c of list || []) for (const t of (c.tags || [])) s.add(t)
+  tags.value = [...s].sort()
+}, { immediate: true, deep: false })
+
+async function loadTagMeta() {
+  try {
+    const r = await api.tags()
+    tagSyncedAt.value = r.synced_at || 0
+    const s = new Set([...tags.value, ...(r.names || [])])
+    tags.value = [...s].sort()
+  } catch (e) { /* 标签元数据读不到不影响选人 */ }
+}
+loadTagMeta()
+
+async function syncTags() {
+  tagSyncing.value = true
+  try {
+    const r = await api.tagsSync()
+    if (r.ok === false) { toast(r.error || '同步失败', 'error'); return }
+    tagSyncedAt.value = r.synced_at || 0
+    const s = new Set([...(r.labels || [])])
+    // 用刚同步后的缓存给本地候选补 tags，再 emit 回各页 store
+    // （不整页刷新，不冲掉正在编辑的表单/勾选）
+    const fresh = await api.tags()
+    tagSyncedAt.value = fresh.synced_at || tagSyncedAt.value
+    const map = fresh.mapping || {}
+    for (const c of fresh.names || []) s.add(c)
+    const updated = (props.contacts || []).map((c) => {
+      const native = map[c.conv_id] || []
+      const merged = [...new Set([...(c.tags || []), ...native])]
+      return { ...c, tags: merged }
+    })
+    tags.value = [...s].sort()
+    if (tagFilter.value && !tags.value.includes(tagFilter.value)) tagFilter.value = ''
+    emit('contacts-updated', updated)
+    const skip = r.skipped ? `，${r.skipped} 人没认出来` : ''
+    toast(`标签已同步：${r.labels_count || 0} 个标签、${r.tags_count || 0} 条归属${skip}`)
+  } catch (e) {
+    toast('同步标签失败：' + e.message, 'error')
+  } finally {
+    tagSyncing.value = false
+  }
+}
 
 const byId = computed(() => new Map(props.contacts.map((c) => [c.conv_id, c])))
 
@@ -34,6 +86,7 @@ const withAvatar = computed(() => props.contacts.filter((c) => c.avatar_url).len
 const list = computed(() => props.contacts.filter((c) => {
   if (filter.value === 'selected' && !props.modelValue.includes(c.conv_id)) return false
   if (['group', 'friend'].includes(filter.value) && c.kind !== filter.value) return false
+  if (tagFilter.value && !(c.tags || []).includes(tagFilter.value)) return false
   if (kw.value && !(String(c.name) + String(c.conv_id)).toLowerCase().includes(kw.value.toLowerCase())) return false
   return true
 }))
@@ -130,6 +183,21 @@ async function syncAvatars() {
         <el-button link type="primary" size="small" :loading="syncing" @click="syncAvatars">同步头像</el-button>
       </div>
     </div>
+    <div v-if="tags.length" class="wb-tag-filters">
+      <el-tag size="small" effect="plain" style="cursor: pointer"
+              :effect="tagFilter === '' ? 'dark' : 'plain'" @click="tagFilter = ''">所有标签</el-tag>
+      <el-tag v-for="t in tags" :key="t" size="small" style="cursor: pointer"
+              :effect="tagFilter === t ? 'dark' : 'plain'" @click="tagFilter = tagFilter === t ? '' : t"
+              type="success"># {{ t }}</el-tag>
+      <span class="wb-hint" style="margin-left: auto">
+        缓存{{ tagSyncedAt ? new Date(tagSyncedAt * 1000).toLocaleString() : '未同步' }}
+      </span>
+      <el-button link type="primary" size="small" :loading="tagSyncing" @click="syncTags">同步标签</el-button>
+    </div>
+    <div v-else class="wb-tag-filters">
+      <span class="wb-hint">微信好友标签还没同步——点右边按钮读一次（会短暂占用微信窗口）</span>
+      <el-button link type="primary" size="small" :loading="tagSyncing" @click="syncTags">同步标签</el-button>
+    </div>
     <el-input v-model="kw" size="small" clearable placeholder="搜索名字 / wxid" />
     <div class="wb-picker-bulk">
       <el-button size="small" type="primary" plain :disabled="!list.length || allVisiblePicked"
@@ -150,6 +218,7 @@ async function syncAvatars() {
         <el-tag size="small" effect="plain" :type="c.kind === 'group' ? 'primary' : 'info'">
           {{ c.kind === 'group' ? '群聊' : '好友' }}
         </el-tag>
+        <el-tag v-for="t in (c.tags || [])" :key="t" size="small" effect="plain" type="success"># {{ t }}</el-tag>
       </div>
       <div v-if="!list.length" class="wb-empty">没有匹配的对象</div>
     </div>
@@ -187,6 +256,11 @@ async function syncAvatars() {
   gap: 8px; flex-wrap: wrap; margin-bottom: 8px;
 }
 .wb-avatar-stat { display: flex; align-items: center; gap: 6px; }
+.wb-tag-filters {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  margin-bottom: 8px; padding: 7px 9px;
+  background: var(--wb-surface-2); border: 1px solid var(--wb-border); border-radius: 8px;
+}
 .wb-picker-bulk {
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px;
 }

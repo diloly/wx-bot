@@ -192,6 +192,17 @@ def _init_schema(path=None):
             kind    TEXT,               -- friend / group / official / system
             ts      INTEGER
         );
+        -- 微信好友标签缓存（2026-11-23）：微信 4.x 把标签「定义」存在 contact.db 的
+        -- contact_label，但「谁属于哪个标签」本地库读不到，只能靠驱动界面读一次再缓存。
+        -- 这张表就是那份缓存——选人时纯读它，绝不碰微信界面（零 UI 抢占）。
+        -- 一条 = 一个 (好友, 标签) 归属；同一好友可有多条（多标签）。
+        CREATE TABLE IF NOT EXISTS contact_tag (
+            conv_id   TEXT NOT NULL,     -- 好友 wxid
+            tag_name  TEXT NOT NULL,     -- 标签名（微信里的原文）
+            synced_at INTEGER NOT NULL,  -- 上次同步时刻，用于展示「缓存时间」
+            PRIMARY KEY (conv_id, tag_name)
+        );
+        CREATE INDEX IF NOT EXISTS idx_contact_tag_name ON contact_tag(tag_name);
         -- 主动触达「不打扰」名单（2026-11-10，用户明确）：微信通讯录里混着家人、
         -- 朋友、同事这类私人联系人，AI 主动搭话既没必要也很危险。这张表是**硬排除**，
         -- 优先级高于一切候选规则（沉默天数、冷却、破冰、只看托管都不例外），
@@ -703,6 +714,71 @@ def list_contacts(kind=None):
             params.append(kind)
         sql += " ORDER BY name"
         return [dict(r) for r in conn.execute(sql, params).fetchall()]
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 微信好友标签缓存（2026-11-23）：只读这份缓存，不碰微信界面。
+# ---------------------------------------------------------------------------
+def replace_contact_tags(mapping, now=None):
+    """全量替换标签缓存。mapping: {wxid: [tag_name, ...]}。
+
+    同步入口一次性写入：先清空再插入，单事务。传空 dict 表示「同步到 0 个标签」，
+    也是合法结果（用户把标签全删了），照常清库。
+    """
+    conn = _conn()
+    try:
+        now = int(now or time.time())
+        rows = []
+        for conv_id, tags in (mapping or {}).items():
+            cid = str(conv_id or "").strip()
+            if not cid:
+                continue
+            for t in (tags or []):
+                name = str(t or "").strip()
+                if name:
+                    rows.append((cid, name, now))
+        conn.execute("DELETE FROM contact_tag")
+        if rows:
+            conn.executemany(
+                "INSERT OR REPLACE INTO contact_tag(conv_id, tag_name, synced_at) "
+                "VALUES(?,?,?)", rows)
+        conn.commit()
+        return len(rows)
+    finally:
+        conn.close()
+
+
+def tags_map():
+    """{wxid: [tag_name, ...]}，只读缓存，供候选接口挂 tags 用。"""
+    conn = _conn()
+    try:
+        out = {}
+        for r in conn.execute(
+                "SELECT conv_id, tag_name FROM contact_tag ORDER BY tag_name"):
+            out.setdefault(r["conv_id"], []).append(r["tag_name"])
+        return out
+    finally:
+        conn.close()
+
+
+def all_tag_names():
+    """缓存里出现过的所有标签名（去重、排序），给前端筛选 chips 用。"""
+    conn = _conn()
+    try:
+        return [r[0] for r in conn.execute(
+            "SELECT DISTINCT tag_name FROM contact_tag ORDER BY tag_name")]
+    finally:
+        conn.close()
+
+
+def tags_last_sync():
+    """最近一次同步时刻（取缓存里最大的 synced_at），没同步过返回 0。"""
+    conn = _conn()
+    try:
+        r = conn.execute("SELECT MAX(synced_at) FROM contact_tag").fetchone()
+        return int(r[0] or 0)
     finally:
         conn.close()
 

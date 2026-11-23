@@ -33,6 +33,9 @@ export const api = {
   handoffConfig: () => json('/api/handoff/config'),
   campaigns: () => json('/api/campaigns'),
   outreach: () => json('/api/outreach'),
+  // 微信好友标签：tags 只读缓存；tagsSync 手动驱动微信读一次（会抢窗口）
+  tags: () => json('/api/tags'),
+  tagsSync: () => post('/api/tags/sync', {}),
 
   // ---- 主动激活（后台常驻触达）----
   outreachToggle: (enabled) => post('/api/outreach/toggle', { enabled }),

@@ -72,6 +72,7 @@ from monitor_store import (
     list_outreach_skip, set_outreach_skip,
     add_campaign, list_campaigns, cancel_campaign, send_campaign_now,
     delete_campaign,
+    tags_map, all_tag_names, tags_last_sync,
 )
 import handoff
 import outreach_core as oc
@@ -166,6 +167,22 @@ def _conv_tags(conv, contacts):
     return exact or loose or []
 
 
+def _merged_tags(conv, cfg_contacts, wx_tag_map):
+    """config.json 人工标签 + 微信原生标签缓存，去重合并（两套来源并存，互不覆盖）。
+
+    微信标签是真实来源（同步一次缓存下来），config.json 那套是历史遗留的人工备注，
+    很多人的定时任务/AI 画像还指着它——所以两边都留，不去重掉任何一边。
+    """
+    manual = _conv_tags(conv, cfg_contacts) or []
+    native = (wx_tag_map or {}).get((conv.get("conv_id") or "").strip(), []) or []
+    out = []
+    for t in list(manual) + list(native):
+        t = str(t).strip()
+        if t and t not in out:
+            out.append(t)
+    return out
+
+
 @app.route("/api/conversations")
 def api_conversations():
     # 带上自动回复全局状态：总开关(config.auto_reply.enabled)与群开关(allow_groups)，
@@ -180,8 +197,9 @@ def api_conversations():
     convs = list_conversations()
     handoffs = last_handoff_map()
     handoff_states = last_handoff_state_map()
+    wx_tag_map = tags_map()
     for c in convs:                    # 看板「+ 选择托管」按标签筛选用
-        c["tags"] = _conv_tags(c, contacts)
+        c["tags"] = _merged_tags(c, contacts, wx_tag_map)
         # 关掉托管（含人工接管）的会话仍要显示在左侧，只是开关为关。
         # switched=托管过，handoff_ts>0=最近转过人工。
         # handoff_state 区分「待人工接手」（托管其实还开着）与「已交出」，
@@ -224,6 +242,7 @@ def api_contacts():
     """
     import wechat_ui
     cfg_contacts = wechat_ui.load_config().get("contacts") or []
+    wx_tag_map = tags_map()
     convs = {c["conv_id"]: c for c in list_conversations()}
     me = get_setting("me_wxid") or ""
     out = []
@@ -244,7 +263,7 @@ def api_contacts():
             "last_ts": cv.get("last_ts") or 0,
             "auto_reply": 1 if cv.get("auto_reply") else 0,
         }
-        item["tags"] = _conv_tags(item, cfg_contacts)
+        item["tags"] = _merged_tags(item, cfg_contacts, wx_tag_map)
         if cv.get("avatar_url"):
             item["avatar_url"] = cv["avatar_url"]
         else:
@@ -780,6 +799,9 @@ def _handoff_candidates():
     _avatar_loop 同步进 avatars 表了，以前这里只返回 conv_id/name/kind，前端拿不到
     URL 就只能画首字色块 —— 看起来像「头像没同步」，其实是显示链路缺了一截。
     """
+    import wechat_ui
+    cfg_contacts = wechat_ui.load_config().get("contacts") or []
+    wx_tag_map = tags_map()
     rows = list_contacts() or []
     out = []
     for r in rows:
@@ -794,6 +816,7 @@ def _handoff_candidates():
             "conv_id": cid,
             "name": r.get("name") or cid,
             "kind": kind,
+            "tags": _merged_tags(r, cfg_contacts, wx_tag_map),
             "avatar_url": (
                 "/api/avatar/%s?v=%s" % (quote(cid, safe=""), av.get("ts") or 0)
             ) if av else "",
@@ -844,6 +867,36 @@ def api_handoff_config_save():
 @app.route("/api/handoff/log")
 def api_handoff_log():
     return jsonify({"log": list_handoff_log(50)})
+
+
+# ---------------------------------------------------------------------------
+# 微信好友标签（2026-11-23）：成员归属只能驱动微信界面读，所以做成
+# 「手动同步一次 → 缓存 → 选人时纯读缓存」。site / sync 两个接口。
+# ---------------------------------------------------------------------------
+@app.route("/api/tags")
+def api_tags():
+    """只读缓存：标签名清单 + 同步时刻（选人筛选 chips 用，绝不碰微信界面）。"""
+    return jsonify({
+        "names": all_tag_names(),
+        "synced_at": tags_last_sync(),
+        "mapping": tags_map(),
+    })
+
+
+@app.route("/api/tags/sync", methods=["POST"])
+def api_tags_sync():
+    """手动同步：在 ui_gate 内驱动微信读全量标签成员，落缓存后返回汇总。
+
+    这一步会短暂占用微信窗口（和自动回复共用 UI 门）；失败给人话，不改缓存。
+    """
+    try:
+        import tag_sync
+        result = tag_sync.sync()
+    except tag_sync.TagSyncError as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    except Exception as e:              # noqa: BLE001
+        return jsonify({"ok": False, "error": "同步失败：%s" % e}), 500
+    return jsonify(result)
 
 
 # ---------------------------------------------------------------------------
