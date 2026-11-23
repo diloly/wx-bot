@@ -41,10 +41,18 @@ class ForwardError(RuntimeError):
     """转发前置条件不满足（依赖/UI/来源消息）。"""
 
 
-def _clear_forward_search(ops):
-    """清空转发窗的搜索框——关键：上一个用搜索找到的人，会把列表过滤住，
-    下一个人翻列表一定翻不到（wechatauto 标签选人模块有同样处理，转发模块漏了）。"""
+def _clear_forward_search(ops, force=False):
+    """清空转发窗的搜索框——**只在确实搜过时清**（对齐库 labels._clear_picker_search）。
+
+    搜索词只会把行藏起来、不会凭空多出行，所以上一个人是直接翻列表点中的
+    （没用搜索框）时，搜索框本来就是空的，根本不用清。旧代码每人都强制清一次，
+    每次要 2~3 次整棵 UIA 树遍历（大列表实测 1.2~9.4s/人）——纯白花的时间。
+    force=True 给调用方在明确知道要清时使用。
+    """
+    if not force and not getattr(ops, "_searched", None):
+        return
     from wechatauto.labels import PICKER_CLEAR, SEARCH_BOX_NAME
+    ops._searched = None
     h, win = ops._forward_window()
     if win is None:
         return
@@ -58,12 +66,118 @@ def _clear_forward_search(ops):
         time.sleep(0.5)
 
 
-def _select_paced(ops, names):
-    """逐人勾选：每人之间留间隔、**选完清空搜索框**，避免残留搜索词卡住下一个人。
+def _visible_rows(ops, win=None):
+    """一次 UIA 遍历收集转发窗候选列表当前实例化的所有行 → [(显示名, 行控件)]。
 
-    转发模块 ops.select_one 不像标签模块那样清空上一次搜索词——第一个人用搜索
-    找到后搜索框残留其名字、列表被过滤，第二个人翻列表翻不到、又搜不到 → 卡住。
-    这里在每人之间清一次，返回同 ops.select 的结构。
+    虚拟列表只把可视区的行实例化，这就是「不用搜索框能直接点到」的行集合。
+    一次遍历拿全，胜过对每个人调一次 _find（_find 每次都是整棵树 DFS）。
+    """
+    from wechatauto.labels import PICKER_ROW_CLS, PICKER_SEARCH_ROW_CLS
+    if win is None:
+        _h, win = ops._forward_window()
+    out = []
+    if win is None:
+        return out
+    seen = set()
+    stack = [(win, 0)]
+    while stack:
+        el, d = stack.pop()
+        if d > 30:
+            continue
+        try:
+            kids = list(el.GetChildren())
+        except Exception:
+            continue
+        for k in kids:
+            try:
+                cn = k.ClassName or ""
+            except Exception:
+                cn = ""
+            if PICKER_ROW_CLS in cn or PICKER_SEARCH_ROW_CLS in cn:
+                try:
+                    nm = (k.Name or "").strip()
+                except Exception:
+                    nm = ""
+                if nm and nm not in seen:
+                    seen.add(nm)
+                    out.append((nm, k))
+            stack.append((k, d + 1))
+    return out
+
+
+def _select_one_fast(ops, name):
+    """勾选一人：一次遍历 + Python **精确**匹配，替代库 select_one 的多次全树查找。
+
+    库 select_one 每行都调 _find（整棵 UIA 树 DFS），全等失败还进 3s deadline
+    循环、每轮 3 次整树遍历——转发窗列表大时一个人实测 40s。这里：
+      * 可视区行一次遍历全读出，Python 精确匹配，命中就直接点；
+      * 可视区没有才用搜索框过滤，之后每轮也只读一次；
+      * 全程只用 nm == name 精确匹配，**不用包含匹配**，绝不点错人误发；
+      * 搜索框操作不了 / 始终找不到时退回库 ops.select_one 兜底，不猜人。
+    返回同库 select_one 的 dict，另带 path（visible/search/library）便于耗时日志。
+    """
+    from wechatauto.labels import _result, SEARCH_BOX_NAME
+    name = (name or "").strip()
+    if not name:
+        return _result(False, "bad-name：没给收件人", path="none")
+
+    h, win = ops._forward_window()
+    if win is None:
+        return _result(False, "no-picker：转发窗不在", path="none")
+    if name in (ops.selected(win) or []):
+        return _result(True, "already", who=name, path="visible")
+
+    # 上一次真搜过才先清词（守卫在 _clear_forward_search 里），否则列表没被过滤
+    if getattr(ops, "_searched", None):
+        _clear_forward_search(ops, force=True)
+        h, win = ops._forward_window()
+
+    rows = _visible_rows(ops, win)
+    hit = next((row for nm, row in rows if nm == name), None)
+    path = "visible"
+
+    if hit is None:
+        box = ops._find(win, (SEARCH_BOX_NAME,), contains=False)
+        if box is None or not ops.uia._set_text(box, name):
+            return _fallback_select(ops, name)      # 搜索框操作不了，交库
+        ops._searched = name
+        path = "search"
+        deadline = time.time() + 4.0
+        while time.time() < deadline:
+            _h, win2 = ops._forward_window()
+            rows = _visible_rows(ops, win2 or win)
+            hit = next((row for nm, row in rows if nm == name), None)
+            if hit is not None:
+                h = _h
+                break
+            time.sleep(0.4)
+
+    if hit is None:
+        return _fallback_select(ops, name)          # 我这边没找到，交库最后兜一次
+
+    r = ops._check_row(h, hit)
+    if not r.get("ok"):
+        r.setdefault("path", path)
+        return r
+    if name not in (ops.selected() or []):
+        # 点了但没进右栏——不重试点（再点会取消勾选！），如实报失败
+        return _result(False, "not-checked：点了但没进右侧已选栏", who=name, path=path)
+    return _result(True, "ok", who=name, path=path)
+
+
+def _fallback_select(ops, name):
+    """退回库 select_one 兜底，并补上 path 标记供日志识别。"""
+    r = ops.select_one(name)
+    if isinstance(r, dict):
+        r.setdefault("path", "library")
+    return r
+
+
+def _select_paced(ops, names):
+    """逐人勾选：每人之间留间隔、搜过才清搜索框，返回同 ops.select 的结构。
+
+    选人改用 :func:`_select_one_fast`（一次 UIA 遍历 + 精确匹配），绕开库
+    select_one 在大列表下「每人多次整树遍历」的慢路径；拿不准就退回库。
     """
     from wechatauto.labels import _result
     picked, missing = [], []
@@ -71,7 +185,7 @@ def _select_paced(ops, names):
     for idx, nm in enumerate(names):
         t0 = time.time()
         if idx:
-            # 清掉上一人的搜索词（若有），再留随机间隔
+            # 只有上一个人真搜过才清（否则搜索框本来就是空的，清一次纯浪费）
             tc = time.time()
             _clear_forward_search(ops)
             clear_ms = (time.time() - tc) * 1000
@@ -80,12 +194,12 @@ def _select_paced(ops, names):
         else:
             clear_ms = 0.0
         ts = time.time()
-        r = ops.select_one(nm)
+        r = _select_one_fast(ops, nm)
         sel_ms = (time.time() - ts) * 1000
         ok = bool(r.get("ok"))
-        print("[forward][select] %d/%d %s -> %s | 清空%.0fms 勾选%.0fms 本步%.1fs"
+        print("[forward][select] %d/%d %s -> %s | %s 清空%.0fms 勾选%.0fms 本步%.1fs"
               % (idx + 1, total, nm[:20], "OK" if ok else "失败:%s" % r.get("reason"),
-                 clear_ms, sel_ms, time.time() - t0), flush=True)
+                 r.get("path", "?"), clear_ms, sel_ms, time.time() - t0), flush=True)
         (picked if ok else missing).append(
             nm if ok else {"name": nm, "reason": r.get("reason", "")})
     _h, win = ops._forward_window()
