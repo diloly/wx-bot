@@ -243,6 +243,10 @@ def _init_schema(path=None):
                                           -- JSON [{conv_id, name, ok, reason, ts}]
             grace_minutes INTEGER DEFAULT 60,
                                           -- 过点多久内还补发；超时作废，防隔夜群发
+            kind          TEXT DEFAULT 'text',
+                                          -- text=粘贴正文+可选配图 / forward=转发已有消息卡片
+            source_chat   TEXT,           -- forward：来源会话名（在哪个会话里右键那条消息）
+            source_match  TEXT,           -- forward：按文字定位那条消息（微信「查找聊天记录」）
             created       INTEGER,
             updated       INTEGER
         );
@@ -273,6 +277,14 @@ def _init_schema(path=None):
         conn.execute("ALTER TABLE campaign ADD COLUMN image TEXT")
     except sqlite3.OperationalError:
         pass
+    # 转发型活动（2026-11-23）：kind / 来源会话 / 消息定位。老库按 text 对待。
+    for col, decl in (("kind", "TEXT DEFAULT 'text'"),
+                      ("source_chat", "TEXT"),
+                      ("source_match", "TEXT")):
+        try:
+            conn.execute("ALTER TABLE campaign ADD COLUMN %s %s" % (col, decl))
+        except sqlite3.OperationalError:
+            pass
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_hash ON messages(msg_hash)"
     )
@@ -1881,21 +1893,29 @@ def _json(s, fallback):
         return fallback
 
 
-def add_campaign(name, content, send_at, targets, grace_minutes=60, image=None):
+def add_campaign(name, content, send_at, targets, grace_minutes=60, image=None,
+                 kind="text", source_chat=None, source_match=None):
     """新建一条活动；image 存的是素材库 id（本机私有），不是路径。
 
-    看板创建时已校验过 id 有效；这里只做字符串收敛，不解析文件——真正发送时
-    由 auto_reply 再 resolve 一次（素材可能在这期间被删）。
+    kind=text：content 是正文，走粘贴发送。
+    kind=forward：转发微信里已有的一条消息卡片（如服务号文章），此时 content 忽略，
+                 用 source_chat（来源会话名）+ source_match（消息里的文字）定位那条消息。
+    看板创建时已校验过；这里只做字符串收敛，不碰文件/UI。
     """
     conn = init()
     try:
         now = int(time.time())
+        kind = "forward" if kind == "forward" else "text"
         cur = conn.execute(
             "INSERT INTO campaign(name, content, image, send_at, targets, status, result, "
-            "grace_minutes, created, updated) VALUES(?,?,?,?,?, 'scheduled', '[]', ?,?,?)",
+            "grace_minutes, kind, source_chat, source_match, created, updated) "
+            "VALUES(?,?,?,?,?, 'scheduled', '[]', ?,?,?,?,?,?)",
             (name, content, str(image or "").strip()[:64], int(send_at),
              json.dumps(targets or [], ensure_ascii=False),
-             int(grace_minutes), now, now))
+             int(grace_minutes), kind,
+             str(source_chat or "").strip()[:120] if kind == "forward" else "",
+             str(source_match or "").strip()[:200] if kind == "forward" else "",
+             now, now))
         conn.commit()
         return cur.lastrowid
     finally:

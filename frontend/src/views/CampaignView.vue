@@ -10,7 +10,7 @@ const store = inject('store')
 const toast = inject('toast')
 const refreshPage = inject('refreshPage')
 
-const form = reactive({ name: '', content: '', send_at: '', grace_minutes: 60, image: '' })
+const form = reactive({ name: '', content: '', send_at: '', grace_minutes: 60, image: '', kind: 'text', source_chat: '', source_match: '' })
 const selected = ref([])
 const creating = ref(false)
 const contacts = computed(() => store.campaigns.contacts || [])
@@ -35,6 +35,30 @@ function insertEmoji(s) {
     ta.focus()
     try { ta.setSelectionRange(pos + s.length, pos + s.length) } catch (_) { /* 忽略 */ }
   })
+}
+
+// 转发型活动：可视化选卡片
+const cardPickerOpen = ref(false)
+const cardChat = ref('文件传输助手')
+const cardList = ref([])
+const cardLoading = ref(false)
+async function loadCards() {
+  if (!cardChat.value.trim()) { toast('先填会话名', 'warning'); return }
+  cardLoading.value = true
+  try {
+    const r = await api.campaignCards(cardChat.value.trim(), 40)
+    if (r.ok === false) throw new Error(r.error || '读取失败')
+    cardList.value = r.cards || []
+    if (!cardList.value.length) toast('这个会话里没找到可转发的卡片（文章/链接/文件）', 'warning')
+  } catch (e) { toast('读卡片失败：' + e.message, 'error') }
+  finally { cardLoading.value = false }
+}
+function pickCard(c) {
+  form.source_chat = cardChat.value.trim()
+  form.source_match = c.match || c.title
+  form.name = form.name || c.title.slice(0, 40)
+  cardPickerOpen.value = false
+  toast('已选卡片：' + c.title.slice(0, 24))
 }
 
 const assetOpen = ref(false)
@@ -144,7 +168,11 @@ async function copyContent() {
 }
 
 async function create() {
-  if (!form.content.trim()) { toast('先写活动正文', 'warning'); return }
+  const isForward = form.kind === 'forward'
+  if (!isForward && !form.content.trim()) { toast('先写活动正文', 'warning'); return }
+  if (isForward && (!form.source_chat.trim() || !form.source_match.trim())) {
+    toast('转发型需填来源会话名和消息定位文字', 'warning'); return
+  }
   if (!form.send_at) { toast('先选发送时间', 'warning'); return }
   if (!selected.value.length) { toast('至少选一个发送对象', 'warning'); return }
   creating.value = true
@@ -155,7 +183,7 @@ async function create() {
     const r = await api.campaignCreate({ ...form, targets })
     if (r.ok === false) throw new Error(r.error || '创建失败')
     toast('活动已排期')
-    Object.assign(form, { name: '', content: '', send_at: '', grace_minutes: 60, image: '' })
+    Object.assign(form, { name: '', content: '', send_at: '', grace_minutes: 60, image: '', kind: 'text', source_chat: '', source_match: '' })
     selected.value = []
     await refreshPage('campaign')
   } catch (e) { toast('创建失败：' + e.message, 'error') }
@@ -194,6 +222,17 @@ async function action(c, act) {
       <div class="wb-card">
         <h3>新建活动</h3>
         <el-form label-width="90px" size="small">
+          <el-form-item label="活动类型">
+            <el-radio-group v-model="form.kind">
+              <el-radio-button value="text">文字/配图</el-radio-button>
+              <el-radio-button value="forward">转发已有消息</el-radio-button>
+            </el-radio-group>
+          </el-form-item>
+          <div v-if="form.kind === 'forward'" class="wb-hint" style="line-height:1.7; margin:-2px 0 10px">
+            转发微信里已存在的一条消息卡片（如服务号文章）。先把那条消息发到某个会话
+            （如「文件传输助手」或素材群），再填它所在的会话名 + 消息里的几个字用于定位。
+            发送时程序右键那条消息转发给下面选中的人；没有这条消息会整条失败。
+          </div>
           <el-form-item label="名称"><el-input v-model="form.name" placeholder="可留空" /></el-form-item>
           <el-form-item label="发送时间">
             <el-date-picker
@@ -203,14 +242,32 @@ async function action(c, act) {
             />
           </el-form-item>
           <el-form-item label="过点宽限(分)"><el-input-number v-model="form.grace_minutes" :min="1" :max="1440" /></el-form-item>
-          <el-form-item label="正文">
+          <template v-if="form.kind === 'forward'">
+            <el-form-item label="来源会话">
+              <div style="width:100%; display:flex; gap:8px">
+                <el-input v-model="form.source_chat" placeholder="例：文件传输助手 / A站宣传" />
+                <el-button size="small" type="primary" plain @click="cardPickerOpen = true; loadCards()">选卡片</el-button>
+              </div>
+            </el-form-item>
+            <el-form-item label="消息定位">
+              <el-input v-model="form.source_match" placeholder="点「选卡片」自动填，或手填消息里的几个字" />
+            </el-form-item>
+            <el-form-item label="附言(可选)">
+              <div style="width: 100%">
+                <el-input ref="contentInput" v-model="form.content" type="textarea" :rows="3"
+                          maxlength="2000" show-word-limit placeholder="转发时一起发的文字，会填进转发窗的留言框；留空则只转发卡片" />
+                <div class="cd-tools"><EmojiPicker @pick="insertEmoji" /></div>
+              </div>
+            </el-form-item>
+          </template>
+          <el-form-item v-else label="正文">
             <div style="width: 100%">
               <el-input ref="contentInput" v-model="form.content" type="textarea" :rows="4"
                         maxlength="2000" show-word-limit placeholder="写死要发的文案，≤2000 字" />
               <div class="cd-tools"><EmojiPicker @pick="insertEmoji" /></div>
             </div>
           </el-form-item>
-          <el-form-item label="配图">
+          <el-form-item v-if="form.kind === 'text'" label="配图">
             <div style="width: 100%">
               <div v-if="pickedAsset" class="cd-picked">
                 <img :src="pickedAsset.url" alt="配图预览"
@@ -253,7 +310,8 @@ async function action(c, act) {
         <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
           <b style="font-size: 15px">{{ c.name || '未命名活动' }}</b>
           <el-tag size="small" effect="plain" :type="statusType(c.status)">{{ CAMPAIGN_STATUS[c.status] || c.status }}</el-tag>
-          <el-tag v-if="c.image" size="small" effect="plain" type="info">含配图</el-tag>
+          <el-tag v-if="c.kind === 'forward'" size="small" effect="plain" type="success">转发卡片</el-tag>
+          <el-tag v-else-if="c.image" size="small" effect="plain" type="info">含配图</el-tag>
           <span class="wb-hint">计划 {{ fmtTime(c.send_at) }} · {{ cstat(c).total }} 个对象</span>
           <div style="margin-left: auto; display: flex; gap: 6px">
             <el-button size="small" type="primary" plain @click="openDetail(c)">详情</el-button>
@@ -262,7 +320,7 @@ async function action(c, act) {
             <el-button v-if="c.status !== 'scheduled'" size="small" type="danger" plain @click="action(c, 'del')">删除</el-button>
           </div>
         </div>
-        <div class="cd-content-clamp">{{ c.content }}</div>
+        <div class="cd-content-clamp">{{ c.kind === 'forward' ? ('转发「' + (c.source_chat || '?') + '」中含「' + (c.source_match || '?') + '」的消息' + (c.content ? ' · 附言：' + c.content : '')) : c.content }}</div>
         <div class="cd-summary">
           成功 <b class="ok">{{ cstat(c).ok }}</b> ·
           失败 <b :class="cstat(c).fail ? 'bad' : ''">{{ cstat(c).fail }}</b> ·
@@ -291,10 +349,15 @@ async function action(c, act) {
         </div>
 
         <div class="cd-section">
-          发送正文
-          <el-button link type="primary" size="small" @click="copyContent">复制正文</el-button>
+          {{ detail.kind === 'forward' ? '转发附言' : '发送正文' }}
+          <el-button link type="primary" size="small" @click="copyContent">复制{{ detail.kind === 'forward' ? '附言' : '正文' }}</el-button>
         </div>
-        <pre class="cd-content">{{ detail.content }}</pre>
+        <pre class="cd-content">{{ detail.kind === 'forward' ? (detail.content || '（无附言，只转发卡片）') : detail.content }}</pre>
+
+        <div v-if="detail.kind === 'forward'" class="cd-section">来源消息</div>
+        <div v-if="detail.kind === 'forward'" class="wb-hint">
+          转发「{{ detail.source_chat || '?' }}」里含「{{ detail.source_match || '?' }}」的一条消息。
+        </div>
 
         <div class="cd-section">活动配图</div>
         <div v-if="detail.image" class="cd-image">
@@ -354,6 +417,31 @@ async function action(c, act) {
         <el-button type="primary" @click="assetOpen = false">完成</el-button>
       </template>
     </el-dialog>
+
+    <!-- 转发型活动：可视化选一张微信会话里的卡片 -->
+    <el-dialog v-model="cardPickerOpen" title="选择要转发的消息卡片" width="640px">
+      <div style="display:flex; gap:8px; margin-bottom:10px">
+        <el-input v-model="cardChat" placeholder="会话名，如：文件传输助手 / A站宣传"
+                  @keyup.enter="loadCards" />
+        <el-button type="primary" :loading="cardLoading" @click="loadCards">读取卡片</el-button>
+      </div>
+      <div class="wb-hint" style="line-height:1.7; margin-bottom:10px">
+        从该会话最近消息里列出卡片（服务号文章/链接/文件）。纯本地读取，不占微信窗口。
+        选中后自动用标题定位那条消息；发送时程序右键它转发给活动对象。
+      </div>
+      <div v-if="cardList.length" class="card-pick-list">
+        <div v-for="c in cardList" :key="c.local_id" class="card-pick-item" @click="pickCard(c)">
+          <img v-if="c.thumb_url" :src="c.thumb_url" class="card-pick-thumb" alt="封面" />
+          <div v-else class="card-pick-thumb card-pick-noimg">无封面</div>
+          <div class="card-pick-info">
+            <b>{{ c.title }}</b>
+            <span v-if="c.descr" class="wb-hint">{{ c.descr.slice(0, 60) }}</span>
+            <span class="wb-hint">{{ c.source || c.kind }} · {{ fmtTime(c.create_time) }}</span>
+          </div>
+        </div>
+      </div>
+      <div v-else-if="!cardLoading" class="wb-empty">没找到卡片，换个会话名试试（或先把文章发到「文件传输助手」）</div>
+    </el-dialog>
   </div>
 </template>
 
@@ -404,5 +492,19 @@ async function action(c, act) {
   background: var(--wb-surface-2); border: 1px solid var(--wb-border);
   border-radius: 8px; padding: 12px 14px; max-height: 200px; overflow-y: auto;
 }
+.card-pick-list { max-height: 460px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+.card-pick-item {
+  display: flex; align-items: center; gap: 12px; padding: 8px;
+  border: 1px solid var(--wb-border); border-radius: 10px; cursor: pointer;
+  background: var(--wb-surface-2);
+}
+.card-pick-item:hover { border-color: var(--wb-accent); }
+.card-pick-thumb { width: 72px; height: 88px; object-fit: cover; border-radius: 6px; flex: none; }
+.card-pick-noimg {
+  display: flex; align-items: center; justify-content: center;
+  font-size: 12px; color: var(--wb-muted); background: var(--wb-surface); border: 1px dashed var(--wb-border);
+}
+.card-pick-info { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.card-pick-info b { font-size: 14px; line-height: 1.5; }
 @media (max-width: 720px) { .cd-meta { grid-template-columns: 1fr; } }
 </style>

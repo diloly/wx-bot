@@ -870,6 +870,82 @@ def api_handoff_log():
 
 
 # ---------------------------------------------------------------------------
+# 转发型活动：列出某会话里可转发的「消息卡片」（纯库读，零 UI 抢占）。
+# 让看板可视化点选卡片，不用手工猜消息定位文字。
+# ---------------------------------------------------------------------------
+@app.route("/api/campaign/cards")
+def api_campaign_cards():
+    """GET /api/campaign/cards?chat=<会话名>&limit=30
+
+    从微信本地库读该会话最近消息，筛出 appmsg 卡片（服务号文章/链接/文件等），
+    用 wx_recv_bridge.parse_card 解析出标题/来源/缩略图/定位文字，供前端点选。
+    chat 必须是能解析到 wxid 的会话名（好友备注/昵称、群名、filehelper 等）。
+    """
+    chat = (request.args.get("chat") or "").strip()
+    if not chat:
+        return jsonify({"ok": False, "error": "缺 chat 参数"}), 400
+    try:
+        limit = max(1, min(int(request.args.get("limit") or 30), 100))
+    except (TypeError, ValueError):
+        limit = 30
+    try:
+        import db_gate
+        import wx_recv_bridge as wrb
+        db = db_gate.get_db()
+        # 会话名 -> wxid：先查本地联系人，再让 wechatauto 兜底
+        wxid = chat
+        for c in list_contacts():
+            if (c.get("name") or c.get("nick")) == chat:
+                wxid = c.get("conv_id") or chat
+                break
+        else:
+            try:
+                got = db.username_by_nickname(chat)
+                if got:
+                    wxid = got
+            except Exception:               # noqa: BLE001
+                pass
+        msgs = db.get_messages(wxid, limit=limit * 3) or []
+        cards = []
+        for m in msgs:
+            try:
+                card = wrb.parse_card(db, wxid, m)
+            except Exception:               # noqa: BLE001
+                card = None
+            if not card or not card.get("title"):
+                continue
+            title = card["title"]
+            # 封面图下载到本地再经 /media 提供，避免前端直连微信 CDN 被拦
+            thumb_url = ""
+            if card.get("thumb"):
+                try:
+                    local = wrb.download_url(card["thumb"], "thumbs")
+                    if local:
+                        rel = os.path.relpath(local, MEDIA_DIR).replace("\\", "/")
+                        thumb_url = "/media/" + quote(rel)
+                except Exception:               # noqa: BLE001
+                    pass
+            cards.append({
+                "local_id": m.get("local_id"),
+                "create_time": m.get("create_time") or 0,
+                "title": title,
+                "descr": card.get("descr") or "",
+                "source": card.get("source") or "",
+                "kind": card.get("kind") or "link",
+                "thumb_url": thumb_url,
+                # 转发定位用标题里一段稳定的文字（去空白、取前 24 字）
+                "match": " ".join(title.split())[:24],
+            })
+            if len(cards) >= limit:
+                break
+        return jsonify({"ok": True, "chat": chat, "wxid": wxid, "cards": cards})
+    except Exception as e:                  # noqa: BLE001
+        log.warning("列卡片失败: %s", e)
+        return jsonify({"ok": False,
+                        "error": "读卡片失败：%s。需微信已登录且本地库可读。" % e}), 500
+
+
+# ---------------------------------------------------------------------------
 # 微信好友标签（2026-11-23）：成员归属只能驱动微信界面读，所以做成
 # 「手动同步一次 → 缓存 → 选人时纯读缓存」。site / sync 两个接口。
 # ---------------------------------------------------------------------------
@@ -936,14 +1012,21 @@ def api_campaign_create():
     body = request.get_json(silent=True) or {}
     content = str(body.get("content") or "").strip()
     targets = body.get("targets") or []
-    if not content:
+    kind = "forward" if body.get("kind") == "forward" else "text"
+    source_chat = str(body.get("source_chat") or "").strip()
+    source_match = str(body.get("source_match") or "").strip()
+    if kind == "forward":
+        # 转发型：content 复用为转发窗留言（附言，可空）；必须有来源会话与定位文字
+        if not source_chat or not source_match:
+            return jsonify({"ok": False,
+                            "error": "转发型活动需填来源会话和消息定位文字"}), 400
+    elif not content:
         return jsonify({"ok": False, "error": "发送内容不能为空"}), 400
     if len(content) > 2000:
         return jsonify({"ok": False, "error": "内容太长（上限 2000 字）"}), 400
     if not isinstance(targets, list) or not targets:
         return jsonify({"ok": False, "error": "至少选一个发送对象"}), 400
-    if len(targets) > 200:
-        return jsonify({"ok": False, "error": "一次最多 200 个对象"}), 400
+    # 全量不设人数上限（转发按 chunk 分批 + 批间随机间隔节流；文本按队列逐个发）。
     # 只认通讯录里真实存在的好友/群聊，防止前端传个假 conv_id 乱发
     valid = {c["conv_id"] for c in _handoff_candidates()}
     clean, seen = [], set()
@@ -974,7 +1057,8 @@ def api_campaign_create():
     if image and (not media_assets.get_asset(image) or not media_assets.resolve(image)):
         return jsonify({"ok": False, "error": "所选配图素材不存在或已被删除，请重新选图"}), 400
     cid = add_campaign(str(body.get("name") or "未命名活动")[:80], content,
-                       send_at, clean, grace, image=image)
+                       send_at, clean, grace, image=image,
+                       kind=kind, source_chat=source_chat, source_match=source_match)
     return jsonify({"ok": True, "id": cid})
 
 

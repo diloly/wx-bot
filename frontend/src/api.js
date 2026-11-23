@@ -36,6 +36,9 @@ export const api = {
   // 微信好友标签：tags 只读缓存；tagsSync 手动驱动微信读一次（会抢窗口）
   tags: () => json('/api/tags'),
   tagsSync: () => post('/api/tags/sync', {}),
+  // 转发型活动：列某会话里可转发的消息卡片（纯库读）
+  campaignCards: (chat, limit = 30) =>
+    json('/api/campaign/cards?chat=' + encodeURIComponent(chat) + '&limit=' + limit),
 
   // ---- 主动激活（后台常驻触达）----
   outreachToggle: (enabled) => post('/api/outreach/toggle', { enabled }),

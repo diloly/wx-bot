@@ -272,6 +272,9 @@ class AutoReplier:
         self.queue_max = int(ar.get("queue_max", 200))
         self._ai_q = queue.Queue(maxsize=self.queue_max)     # 待 AI 生成
         self._send_q = queue.Queue(maxsize=self.queue_max)   # 待发送（AI 已生成好）
+        # 转发型活动按批入队，和 _send_q 分开；转发 worker 每批前礼让 _send_q，
+        # 让自动回复优先，转发穿插着发（不整条活动独占 UI 门）。
+        self._forward_q = queue.Queue(maxsize=self.queue_max)
         self._stop = threading.Event()
         self._threads = []
 
@@ -1257,6 +1260,86 @@ class AutoReplier:
         except Exception as e:          # noqa: BLE001
             print("[campaign] 结果回写失败(%s): %s" % (task.name, e))
 
+    # ---------- 转发型活动 worker（每批一个任务，与自动回复穿插） ----------
+    def _forward_worker(self):
+        """消费「转发批次」队列：一批一次转发窗，批间礼让自动回复。
+
+        礼让：取到批次后先看 _send_q 有没有积压，有则每次 sleep 1s 重试，
+        累计最多 30s；30s 后不再让，直接抢 UI 门发这一批——保证活动能推进，
+        不会因回复一直不停而永远饿死。真正发送在 ui_gate 内，一批结束即放门，
+        自动回复随时能插进来。批间 3~5s 由 worker 控制（一批任务之间）。
+        """
+        import campaign_forward
+        print("[auto] 转发批次 worker 已启动（礼让回复最多 30s/批）")
+        while not self._stop.is_set():
+            try:
+                job = self._forward_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            cid = job.get("campaign_id")
+            batch = job.get("batch") or []       # [{conv_id, name}, ...]
+            try:
+                # 礼让：回复队列有积压就先让，累计最多 30s
+                waited = 0.0
+                while (not self._stop.is_set() and waited < 30.0
+                       and not self._send_q.empty()):
+                    time.sleep(1.0)
+                    waited += 1.0
+                if waited >= 1.0:
+                    print("[forward] 礼让自动回复 %.0fs 后发批次（活动 %s）"
+                          % (waited, cid))
+                if self._stop.is_set():
+                    break
+
+                src_chat = job.get("source_chat") or ""
+                src_match = job.get("source_match") or ""
+                note = job.get("note") or ""
+                name2conv = {t.get("name") or t.get("conv_id"): t.get("conv_id")
+                             for t in batch}
+                with ui_gate.hold("转发活动 %s 一批 %d 人" % (cid, len(batch))):
+                    try:
+                        res = campaign_forward.send_forward_batch(
+                            list(name2conv.keys()), src_chat, src_match, note=note)
+                    except Exception as e:      # noqa: BLE001
+                        res = {nm: (False, "转发异常：%s" % e) for nm in name2conv}
+                # 逐条回写：显示名 → conv_id
+                written = set()
+                for nm, (ok, reason) in res.items():
+                    if nm == "__dry_run__":
+                        continue
+                    conv = name2conv.get(nm, "")
+                    if not conv:
+                        continue
+                    tname = next((t.get("name") for t in batch
+                                  if t.get("conv_id") == conv), conv)
+                    monitor_store.record_campaign_result(
+                        cid, conv, tname, bool(ok), str(reason))
+                    written.add(conv)
+                # 兜底：这批里任何没被回写的人（重名/异常返回值缺项）补记失败，
+                # 否则 record_campaign_result 永远等不齐 → 活动卡在 running。
+                for t in batch:
+                    conv = (t.get("conv_id") or "").strip()
+                    if conv and conv not in written:
+                        monitor_store.record_campaign_result(
+                            cid, conv, t.get("name") or conv, False,
+                            "未列入转发结果")
+                print("[forward] 活动 %s 批次完成：%d 人" % (cid, len(batch)))
+            except Exception as e:              # noqa: BLE001 —— worker 不死
+                print("[forward] worker 异常（活动 %s）: %s" % (cid, e))
+                for t in batch:
+                    conv = (t.get("conv_id") or "").strip()
+                    if conv:
+                        try:
+                            monitor_store.record_campaign_result(
+                                cid, conv, t.get("name") or conv, False,
+                                "转发 worker 异常：%s" % e)
+                        except Exception:
+                            pass
+            finally:
+                # 批间 3~5s：任务之间拉开，给回复留插队窗口
+                if not self._stop.is_set():
+                    time.sleep(random.uniform(3.0, 5.0))
+
     def _campaign_worker(self):
         print("[auto] 活动触达线程已启动（每 20s 巡检到点的活动）")
         while not self._stop.is_set():
@@ -1284,10 +1367,19 @@ class AutoReplier:
                 targets = json.loads(c.get("targets") or "[]")
             except Exception:           # noqa: BLE001
                 targets = []
-            content = (c.get("content") or "").strip()
-            if not content or not targets:
+            if not targets:
                 monitor_store.record_campaign_result(
-                    cid, "", "", False, "内容为空或没选对象")
+                    cid, "", "", False, "没选对象")
+                continue
+            # 转发型活动：一次性整批转发微信里已有的消息卡片（服务号文章等），
+            # 不走 _send_q（那是粘贴文字/图片的链路，造不出 appmsg 卡片）。
+            if (c.get("kind") or "text") == "forward":
+                self._run_forward_campaign(c, targets)
+                continue
+            content = (c.get("content") or "").strip()
+            if not content:
+                monitor_store.record_campaign_result(
+                    cid, "", "", False, "内容为空")
                 continue
             # 配图在创建时校验过 id，但素材可能在这期间被删：整条活动只解析一次
             # 复用。缺图只记原因、正文照发，绝不把活动卡住或静默降级不告知。
@@ -1341,6 +1433,59 @@ class AutoReplier:
             except queue.Full:
                 self._task_set(task, "failed", reason="活动触达队列已满")
                 self._campaign_result(task, False, "发送队列已满")
+
+    def _run_forward_campaign(self, camp, targets):
+        """转发型活动：把名单按 9 人切批、逐批入 _forward_q，与自动回复穿插发。
+
+        这里只做派发（纯内存，不碰微信 UI）：每批一个任务，worker 逐批取、
+        每批一次转发窗、批间礼让回复并留 3~5s。结果由 worker 逐条回写；
+        record_campaign_result 在最后一批回齐后自动把活动收口成 sent/partial。
+        """
+        cid = camp["id"]
+        name = camp.get("name") or cid
+        src_chat = (camp.get("source_chat") or "").strip()
+        src_match = (camp.get("source_match") or "").strip()
+        note = (camp.get("content") or "").strip()   # 转发型 content 复用为「附言」
+        print("[campaign] 转发活动「%s」来源=%r 定位=%r 附言=%r（%d 人，拆批入队）"
+              % (name, src_chat, src_match[:30], note[:30], len(targets)))
+
+        # 收件人用显示名（搜索词只能是显示名红线）；重名不猜，直接标失败。
+        import campaign_forward
+        name2conv, conflicts = campaign_forward._display_to_conv(targets)
+        idx = {(t.get("conv_id") or "").strip(): t for t in targets}
+        # 同名冲突的人不在 name2conv 里，逐个标失败，保证结果条数=targets 条数
+        for nm in conflicts:
+            for t in targets:
+                c = (t.get("conv_id") or "").strip()
+                if c and (monitor_store.get_display_name(c)
+                          or (t.get("name") or c).strip()) == nm:
+                    monitor_store.record_campaign_result(
+                        cid, c, t.get("name") or c, False, "收件人重名，无法区分，未转发")
+
+        chunk = 9
+        queued = 0
+        names = list(name2conv.keys())
+        for i in range(0, len(names), chunk):
+            group = []
+            for nm in names[i:i + chunk]:
+                conv = name2conv[nm]
+                t = idx.get(conv) or {}
+                group.append({"conv_id": conv, "name": nm or t.get("name") or conv})
+            job = {"campaign_id": cid, "batch": group,
+                   "source_chat": src_chat, "source_match": src_match,
+                   "note": note, "campaign_name": name}
+            try:
+                self._forward_q.put_nowait(job)
+                queued += 1
+            except queue.Full:
+                # 队列满：这批的人直接标失败，活动仍能收口
+                for t in group:
+                    monitor_store.record_campaign_result(
+                        cid, t["conv_id"], t["name"], False, "转发批次队列已满")
+                print("[campaign] 转发队列满，活动 %s 有 %d 人未入队"
+                      % (name, len(group)))
+        print("[campaign] 转发活动「%s」已拆 %d 批入队（%d 人）"
+              % (name, queued, len(names)))
 
     # ---------- 加好友 worker（名单队列，发完即走） ----------
     # 关键语义：**添加好友是异步的**。点完「确定」这条就结束，worker 立刻处理
@@ -1620,14 +1765,15 @@ class AutoReplier:
                        (self._add_worker, "add-friend-worker"),
                        (self._outreach_worker, "outreach-worker"),
                        (self._campaign_worker, "campaign-worker"),
+                       (self._forward_worker, "forward-worker"),
                        (self._handoff_worker, "handoff-worker")):
             t = threading.Thread(target=self._worker_entry, args=(fn, nm),
                                  name=nm, daemon=True)
             t.start()
             self._threads.append(t)
         print("[auto] 流水线已启动：AI 生成 / 发送 / 朋友圈 / 加好友 / 主动触达 / "
-              "活动触达 / 人工接管巡检 七个线程（生成与发送互不阻塞，"
-              "朋友圈刷新也不再卡住收消息）")
+              "活动触达 / 转发批次 / 人工接管巡检 八个线程（生成与发送互不阻塞，"
+              "转发批次与回复穿插、朋友圈刷新也不再卡住收消息）")
 
     def _worker_entry(self, fn, name):
         """worker 统一入口：先给**本线程** CoInitialize（UIAutomation 前提），再跑活。
@@ -1742,9 +1888,10 @@ class AutoReplier:
                     for item in items:
                         self.collect(item)   # 只攒进合并缓冲，不建任务
                     if items:
-                        print("[auto] 本轮扫描完成，新增 %d 条（待合并 %d / 待生成 %d / 待发送 %d）"
+                        print("[auto] 本轮扫描完成，新增 %d 条（待合并 %d / 待生成 %d / 待发送 %d / 转发批 %d）"
                               % (len(items), len(self._pending),
-                                 self._ai_q.qsize(), self._send_q.qsize()))
+                                 self._ai_q.qsize(), self._send_q.qsize(),
+                                 self._forward_q.qsize()))
                 except Exception as e:
                     print("[auto] 轮询异常: %s" % e)
                 # 把轮询间隔拆成 1s 小步：合并窗口要秒级到期，不能等整个 interval
