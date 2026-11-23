@@ -1278,6 +1278,9 @@ class AutoReplier:
                 continue
             cid = job.get("campaign_id")
             batch = job.get("batch") or []       # [{conv_id, name}, ...]
+            t_job = time.time()
+            print("[forward] === 批次开始 活动%s %d人 (待发送队列 %d) ==="
+                  % (cid, len(batch), self._send_q.qsize()), flush=True)
             try:
                 # 礼让：回复队列有积压就先让，累计最多 30s
                 waited = 0.0
@@ -1296,13 +1299,20 @@ class AutoReplier:
                 note = job.get("note") or ""
                 name2conv = {t.get("name") or t.get("conv_id"): t.get("conv_id")
                              for t in batch}
+                t_gate = time.time()
                 with ui_gate.hold("转发活动 %s 一批 %d 人" % (cid, len(batch))):
+                    gate_wait = time.time() - t_gate
+                    t_send = time.time()
                     try:
                         res = campaign_forward.send_forward_batch(
                             list(name2conv.keys()), src_chat, src_match, note=note,
                             conv_map=name2conv)
                     except Exception as e:      # noqa: BLE001
                         res = {nm: (False, "转发异常：%s" % e) for nm in name2conv}
+                    send_ms = (time.time() - t_send) * 1000
+                print("[forward] === 批次完成 活动%s 礼让%.0fs 等门%.1fs 转发%.1fs 整批%.1fs ==="
+                      % (cid, waited, gate_wait, send_ms / 1000,
+                         time.time() - t_job), flush=True)
                 # 逐条回写：显示名 → conv_id
                 written = set()
                 for nm, (ok, reason) in res.items():
@@ -1337,9 +1347,11 @@ class AutoReplier:
                         except Exception:
                             pass
             finally:
-                # 批间 3~5s：任务之间拉开，给回复留插队窗口
+                # 批间 10~15s：任务之间拉开，给回复留插队窗口
                 if not self._stop.is_set():
-                    time.sleep(random.uniform(10.0, 15.0))
+                    gap = random.uniform(10.0, 15.0)
+                    print("[forward] 批间等待 %.1fs（活动 %s）" % (gap, cid), flush=True)
+                    time.sleep(gap)
 
     def _campaign_worker(self):
         print("[auto] 活动触达线程已启动（每 20s 巡检到点的活动）")

@@ -67,14 +67,27 @@ def _select_paced(ops, names):
     """
     from wechatauto.labels import _result
     picked, missing = [], []
+    total = len(names)
     for idx, nm in enumerate(names):
+        t0 = time.time()
         if idx:
             # 清掉上一人的搜索词（若有），再留随机间隔
+            tc = time.time()
             _clear_forward_search(ops)
-            time.sleep(random.uniform(SELECT_GAP_MIN, SELECT_GAP_MAX))
+            clear_ms = (time.time() - tc) * 1000
+            gap = random.uniform(SELECT_GAP_MIN, SELECT_GAP_MAX)
+            time.sleep(gap)
+        else:
+            clear_ms = 0.0
+        ts = time.time()
         r = ops.select_one(nm)
-        (picked if r.get("ok") else missing).append(
-            nm if r.get("ok") else {"name": nm, "reason": r.get("reason", "")})
+        sel_ms = (time.time() - ts) * 1000
+        ok = bool(r.get("ok"))
+        print("[forward][select] %d/%d %s -> %s | 清空%.0fms 勾选%.0fms 本步%.1fs"
+              % (idx + 1, total, nm[:20], "OK" if ok else "失败:%s" % r.get("reason"),
+                 clear_ms, sel_ms, time.time() - t0), flush=True)
+        (picked if ok else missing).append(
+            nm if ok else {"name": nm, "reason": r.get("reason", "")})
     _h, win = ops._forward_window()
     return _result(True, "ok", picked=picked, missing=missing,
                    selected=ops.selected(win) if win is not None else [])
@@ -214,6 +227,7 @@ def _open_dialog(ops, chat, match):
     抢前台，会让 Qt 进入菜单激活态、打断 UIA 控件树，导致定位不到卡片、光标不动
     （2026-11-23 实测）。右键用 _click_at 的透明穿透命中渲染层。
     """
+    t0 = time.time()
     uia = ops.uia
     ops.close_dialog()
     if chat:
@@ -221,9 +235,11 @@ def _open_dialog(ops, chat, match):
             return {"ok": False, "reason": "no-chat：打不开会话「%s」" % chat}
     elif not uia.ensure_window():
         return {"ok": False, "reason": "no-window：微信窗口没就绪"}
+    t_open = time.time()
 
     hit = uia.find_in_message_list(
         lambda cn, nm: match in (nm or ""), match_last=True, max_scrolls=30)
+    t_find = time.time()
     if hit is None:
         return {"ok": False,
                 "reason": "no-message：可视区里找不到包含「%s」的消息" % match}
@@ -243,6 +259,8 @@ def _open_dialog(ops, chat, match):
     h, win = ops._wait_window("微信发送给")
     if win is None:
         return {"ok": False, "reason": "no-picker：点了「转发...」但选择窗没出现"}
+    print("[forward][open] 开会话%.1fs 找卡片%.1fs 开窗共%.1fs (落点 %d,%d)"
+          % (t_open - t0, t_find - t_open, time.time() - t0, x, y), flush=True)
     return {"ok": True, "hwnd": h, "win": win, "point": (x, y)}
 
 
