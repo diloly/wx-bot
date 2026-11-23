@@ -1299,7 +1299,8 @@ class AutoReplier:
                 with ui_gate.hold("转发活动 %s 一批 %d 人" % (cid, len(batch))):
                     try:
                         res = campaign_forward.send_forward_batch(
-                            list(name2conv.keys()), src_chat, src_match, note=note)
+                            list(name2conv.keys()), src_chat, src_match, note=note,
+                            conv_map=name2conv)
                     except Exception as e:      # noqa: BLE001
                         res = {nm: (False, "转发异常：%s" % e) for nm in name2conv}
                 # 逐条回写：显示名 → conv_id

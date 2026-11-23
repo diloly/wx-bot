@@ -222,12 +222,53 @@ def _fill_leave_message(ops, note):
         return False
 
 
-def send_forward_batch(names, source_chat, source_match, note="", dry_run=False):
+def _latest_ts(ops, conv_id):
+    """会话里最新一条消息的 create_time（水位基线）。
+
+    返回 (有无历史, 最新ts)：读不到/没有历史 → (False, 0)，据此在回读时保守处理，
+    避免 baseline=0 时任何旧消息都被当成「新送达」。
+    """
+    try:
+        rows = ops.db.get_messages(conv_id, limit=5) or []
+        if not rows:
+            return False, 0
+        return True, max(int(r.get("create_time") or 0) for r in rows)
+    except Exception:
+        return False, 0
+
+
+def _landed_by_conv(ops, conv_id, name, baseline):
+    """回读「这条转发是否真送达」——用 conv_id 直查 + 发送前水位基线。
+
+    baseline = (有历史?, 最新create_time)。两处跨设备坑都避开：
+      1. 库的 ops._landed(name, since) 拿**显示名**做 username_by_nickname 反查，
+         别的设备备注不同/没有备注就查不到 → 明明发出去了却误报「回读未确认」。
+      2. since=int(time.time())-5 依赖系统时钟与微信 create_time 对齐，跨设备/时区
+         时钟有偏差就误判。改用发送前该会话的最新 create_time 做水位，发送后只要
+         出现更大的 create_time 就算送达，完全不依赖系统时钟。
+    发送前没读到历史（has=False）时，退回库的显示名反查兜底；都不行才判失败。
+    """
+    try:
+        if conv_id:
+            has, ts = baseline if isinstance(baseline, tuple) else (True, baseline)
+            rows = ops.db.get_messages(conv_id, limit=5) or []
+            if has:
+                return any(int(r.get("create_time") or 0) > ts for r in rows)
+            # 没历史基线：读到了新消息也算（但要求 create_time>0，避免空数据误判）
+            return any(int(r.get("create_time") or 0) > 0 for r in rows)
+    except Exception:
+        pass
+    return ops._landed(name, int(time.time()) - 5)
+
+
+def send_forward_batch(names, source_chat, source_match, note="", dry_run=False,
+                       conv_map=None):
     """转发**一批**（≤9 人）已有消息。返回 {显示名: (ok, reason)}。
 
     一批 = 一个转发窗：开窗→勾选本批→填留言→点发送→回读。
     **不持有 ui_gate、不加批间 sleep**——由调用方（worker）掌控门和节奏，
     这样每批之间能释放 UI 门给自动回复。调用方须已在 ui_gate.hold() 内。
+    conv_map：{显示名: conv_id}，用于回读（显示名只用来在转发窗搜索/勾选）。
     """
     source_chat = (source_chat or "").strip()
     source_match = (source_match or "").strip()
@@ -237,6 +278,7 @@ def send_forward_batch(names, source_chat, source_match, note="", dry_run=False)
     names = [str(n).strip() for n in (names or []) if str(n).strip()]
     if not names:
         raise ForwardError("没有可转发的有效收件人")
+    conv_map = conv_map or {}
 
     from wechatauto import WeChat
     wx = WeChat()
@@ -257,7 +299,12 @@ def send_forward_batch(names, source_chat, source_match, note="", dry_run=False)
             if note:
                 _fill_leave_message(ops, note)
             if not dry_run:
-                since = int(time.time()) - 5
+                # 发送前逐个采水位（本地库，不占 UI 门）；发送后只看有没有更新的消息。
+                # 完全不依赖系统时钟，跨设备/时区一致。
+                baseline = {}
+                for who in picked:
+                    cid = conv_map.get(who, "")
+                    baseline[who] = _latest_ts(ops, cid) if cid else (False, 0)
                 rs = ops.send(expect=len(picked))
                 if not rs["ok"]:
                     failed.extend(picked)
@@ -265,7 +312,9 @@ def send_forward_batch(names, source_chat, source_match, note="", dry_run=False)
                     time.sleep(1.5)
                     actual = rs.get("chosen") or picked
                     for who in actual:
-                        (sent if ops._landed(who, since) else failed).append(who)
+                        landed = _landed_by_conv(
+                            ops, conv_map.get(who, ""), who, baseline.get(who, 0))
+                        (sent if landed else failed).append(who)
     finally:
         ops.close_dialog()
 
@@ -312,7 +361,8 @@ def send_forward_activity(targets, source_chat, source_match, note="", dry_run=F
                 group = names[i:i + chunk]
                 all_results.update(
                     send_forward_batch(group, source_chat, source_match,
-                                       note=note, dry_run=dry_run))
+                                       note=note, dry_run=dry_run,
+                                       conv_map=name2conv))
                 if i + chunk < len(names) and not dry_run:
                     time.sleep(random.uniform(3.0, 5.0))
         except ForwardError:
