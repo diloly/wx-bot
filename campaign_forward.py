@@ -31,9 +31,29 @@
 import random
 import time
 
+# 转发窗里逐人勾选的节奏：库的 select() 一个人接一个人猛点、中间没停顿，
+# Qt 界面容易反应不过来卡住。这里每人之间随机歇一下（秒），要调节奏改这两数。
+SELECT_GAP_MIN = 0.4
+SELECT_GAP_MAX = 0.9
+
 
 class ForwardError(RuntimeError):
     """转发前置条件不满足（依赖/UI/来源消息）。"""
+
+
+def _select_paced(ops, names):
+    """逐人勾选，每人之间留随机间隔，避免连点卡住。返回同 ops.select 的结构。"""
+    picked, missing = [], []
+    for idx, nm in enumerate(names):
+        if idx:
+            time.sleep(random.uniform(SELECT_GAP_MIN, SELECT_GAP_MAX))
+        r = ops.select_one(nm)
+        (picked if r.get("ok") else missing).append(
+            nm if r.get("ok") else {"name": nm, "reason": r.get("reason", "")})
+    _h, win = ops._forward_window()
+    from wechatauto.labels import _result
+    return _result(True, "ok", picked=picked, missing=missing,
+                   selected=ops.selected(win) if win is not None else [])
 
 
 def _display_to_conv(targets):
@@ -292,7 +312,7 @@ def send_forward_batch(names, source_chat, source_match, note="", dry_run=False,
         reason = opened["reason"]
         return {nm: (False, reason) for nm in names}
     try:
-        sel = ops.select(names)
+        sel = _select_paced(ops, names)
         picked = list(sel.get("picked") or [])
         skipped.extend(sel.get("missing") or [])
         if picked:
@@ -364,7 +384,7 @@ def send_forward_activity(targets, source_chat, source_match, note="", dry_run=F
                                        note=note, dry_run=dry_run,
                                        conv_map=name2conv))
                 if i + chunk < len(names) and not dry_run:
-                    time.sleep(random.uniform(3.0, 5.0))
+                    time.sleep(random.uniform(10.0, 15.0))
         except ForwardError:
             raise
         except Exception as e:              # noqa: BLE001

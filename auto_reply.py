@@ -1339,7 +1339,7 @@ class AutoReplier:
             finally:
                 # 批间 3~5s：任务之间拉开，给回复留插队窗口
                 if not self._stop.is_set():
-                    time.sleep(random.uniform(3.0, 5.0))
+                    time.sleep(random.uniform(10.0, 15.0))
 
     def _campaign_worker(self):
         print("[auto] 活动触达线程已启动（每 20s 巡检到点的活动）")
