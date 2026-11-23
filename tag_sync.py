@@ -15,9 +15,12 @@
       看板所有选人入口只读这份缓存，不再碰微信界面。
     * **DB 写在门之外**：门只护 UI，拿完数据就放锁，再落库。
 
-对照 wechatauto.labels 的口径：成员行要 resolve_members 拿 wxid，重名/查不到的
-进 skipped 不猜人；标签行自带人数 ``count``，和读到数对不上时 complete=False——
-这里如实回报，不假装同步全了。空标签（no-list 且 count=0）算正常空结果。
+成员行 → wxid **不用 wechatauto 的 resolve_members**：那是给「安全群发」设计的，
+要求显示名精确等于微信库字段、重名一律拒绝，拿来做标签缓存会确定性漏人（昵称
+带空格、备注名≠昵称、多标签拼接、重名）。这里改用本地通讯录的 remark/name/nick
+做精确匹配（见 _local_resolve），匹配不上才 skipped、且如实列出名字不静默丢。
+标签行自带人数 ``count``，和读到数对不上时 complete=False——不假装同步全了。
+空标签（no-list 且 count=0）算正常空结果。
 
 用法::
     import tag_sync
@@ -46,7 +49,65 @@ def _labels_ops():
     return ops
 
 
-def _read_all_labels(ops, progress=None):
+def _local_resolve(members, local_contacts):
+    """成员行 → wxid，用**本地通讯录**做精确匹配（不靠 wechatauto 的猜名字）。
+
+    wechatauto 的 resolve_members 为「安全群发」设计：成员行的名字必须精确等于
+    微信库 nick_name/remark，重名一律拒绝。拿来做标签缓存太严——昵称带空格、
+    备注名≠昵称、多标签拼接都会确定性漏人（不是偶发）。
+
+    这里改用 wx_recv_bridge 已同步好的 monitor_store.contacts（conv_id/name/nick/
+    remark），对成员行的每个可用片段做**精确**匹配，优先级：
+        remark 精确 > name 精确 > nick 精确
+    精确匹配不上才算 skipped（仍然不猜——重名/模糊一律不认，避免打错标签）。
+
+    返回 (resolved=[{username,display}], skipped=[{display,reason}])。
+    """
+    # 建三个索引：值 -> [wxid]（同名多个都收着，下面按唯一性判定）
+    idx = {"remark": {}, "name": {}, "nick": {}}
+    for c in local_contacts:
+        u = (c.get("conv_id") or "").strip()
+        if not u:
+            continue
+        for field in idx:
+            v = (c.get(field) or "").strip()
+            if v:
+                idx[field].setdefault(v, set()).add(u)
+
+    resolved, skipped = [], []
+    for m in members or []:
+        raw = (m.get("raw") or "").strip()
+        # 成员行是「昵称  备注  标签」用空格拼的。先试结构化的 remark/nick/display，
+        # 再补 raw 按空格拆出的各段——精确匹配天然不会把「标签」误当名字（标签名
+        # 一般不在 exact 索引里），带空格昵称的整段也能命中。
+        cands = []
+        for key in ("remark", "nick", "display"):
+            v = (m.get(key) or "").strip()
+            if v and v not in cands:
+                cands.append(v)
+        for v in raw.split(" "):
+            v = v.strip()
+            if v and v not in cands:
+                cands.append(v)
+
+        hit = None
+        for field in ("remark", "name", "nick"):
+            for v in cands:
+                users = idx[field].get(v) or set()
+                if len(users) == 1:
+                    hit = (next(iter(users)), v)
+                    break
+            if hit:
+                break
+        if hit:
+            resolved.append({"username": hit[0], "display": hit[1]})
+        else:
+            skipped.append({"display": raw or (m.get("display") or ""),
+                            "reason": "本地通讯录无精确匹配"})
+    return resolved, skipped
+
+
+def _read_all_labels(ops, progress=None, local_contacts=None):
     """在 UI 门内：读所有标签定义 + 每个标签的成员 → {wxid: [tag_name]}。
 
     标签定义我们其实可以从 contact.db 纯库读（db.list_labels()），但为了让
@@ -77,6 +138,13 @@ def _read_all_labels(ops, progress=None):
         except Exception:               # noqa: BLE001
             names = []
 
+    if local_contacts is None:
+        try:
+            import monitor_store
+            local_contacts = monitor_store.list_contacts()
+        except Exception:               # noqa: BLE001
+            local_contacts = []
+
     mapping = {}
     details = []
     for idx, name in enumerate(names):
@@ -90,33 +158,26 @@ def _read_all_labels(ops, progress=None):
         reason = r.get("reason") or ""
         count = int(r.get("count") or 0)
         members = r.get("members") or []
-        # no-list 且界面人数=0 → 空标签，正常；其他失败如实记
-        if not ok and not (reason == "no-list" and count == 0):
+        # 空标签（界面人数=0）的各种表现都算正常：no-list / not-selected（右侧没
+        # 切过去，往往就是因为没人）。其余失败才如实记。
+        if not ok and not (count == 0 and reason in ("no-list", "not-selected")):
             details.append({"label": name, "ok": False, "reason": reason,
                             "members": 0, "count": count})
             continue
-        resolved = []
-        skipped = []
-        if members:
-            try:
-                rr = ops.resolve_members(members)
-                resolved = rr.get("recipients") or []
-                skipped = rr.get("skipped") or []
-            except Exception as e:      # noqa: BLE001
-                details.append({"label": name, "ok": False,
-                                "reason": "解析成员失败：%s" % e,
-                                "members": len(members)})
-                continue
+        resolved, skipped = _local_resolve(members, local_contacts)
         for x in resolved:
             u = (x.get("username") or "").strip()
             if u:
-                mapping.setdefault(u, []).append(name)
+                buckets = mapping.setdefault(u, [])
+                if name not in buckets:     # 同一标签去重（多次同步不重复堆）
+                    buckets.append(name)
         details.append({
             "label": name,
             "ok": True,
             "count": count,
             "members": len(resolved),
             "skipped": len(skipped),
+            "skipped_names": [x.get("display") for x in skipped],
             "complete": bool(r.get("complete", True)),
             "reason": reason,
         })
@@ -135,9 +196,13 @@ def sync(progress=None):
     import monitor_store
 
     ops = _labels_ops()
+    import monitor_store
+    local_contacts = monitor_store.list_contacts()   # UI 门之外读本地通讯录
+
     with ui_gate.hold("同步微信好友标签"):
         try:
-            mapping, details, names = _read_all_labels(ops, progress=progress)
+            mapping, details, names = _read_all_labels(
+                ops, progress=progress, local_contacts=local_contacts)
         finally:
             try:
                 ops.back_to_chat()
