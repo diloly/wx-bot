@@ -12,8 +12,10 @@
 本脚本按**真实证据**回刷，不靠猜：
     用 conv_id 直查微信库，在「这条结果自己记录时间的前后窗口」里找
     **我发出的**、内容含卡片标题的消息：
-      有   -> ok=True  「已转发（回刷）」
-      没有 -> ok=False 「已发出但回读未确认（回刷）」（不谎报成功）
+      有且 server_id>0 -> ok=True  「已转发（回刷）」
+      有但 server_id=0 -> ok=False 「未送达（红色叹号/对方已删除或拒收）」
+      有但读不到回执   -> ok=False 「无法确认送达」
+      没有             -> ok=False 「已发出但回读未确认」（不谎报成功）
     再重算活动 status（全成功 sent / 否则 partial）。
 
 用法
@@ -22,6 +24,7 @@
     python repair_campaign_results.py --apply          # 写回 result/status
     python repair_campaign_results.py --ids 23,25 --apply
     python repair_campaign_results.py --apply --include-ok   # 连正常的也重算一遍
+    python repair_campaign_results.py --debug               # 打印命中消息的 server_id 证据
 
 注意
 ----
@@ -56,25 +59,44 @@ def _is_bad(reason):
     return any(m in r for m in BAD_MARKS)
 
 
-def _landed(db, conv_id, since_ts, match, until_ts=0, me=""):
-    """[since_ts, until_ts] 区间内该会话有没有「我发的、带标题」的消息。
+def _server_id_of(db, conv_id, row):
+    """get_messages 不带 server_id；回原始行读。>0=送达，0=红色叹号，None=读不到。"""
+    try:
+        raw = db.get_message_row(conv_id, int(row["local_id"]), None,
+                                 row.get("shard"))
+        if not raw:
+            return None
+        return int(raw.get("server_id") or 0)
+    except Exception:
+        return None
 
-    返回 True / False / None(读不到)。
 
-    * ``me`` 有值时只认我发的消息——别人转发同一条卡片进来不算我发出去了。
+def _landed(db, conv_id, since_ts, match, until_ts=0, me="", detail=None):
+    """[since_ts, until_ts] 内找「我发的、带标题」的消息，并判它是否真送达。
+
+    返回 delivered / undelivered / unknown / not-found / unreadable。
+
+    * 只看「本地有没有这条消息」不够：对方把我删了时，微信**仍会留一条消息**
+      （卡片也在）但 server_id=0，界面是红色叹号，实际没送达（2026-11-24 实测）。
+    * ``me`` 有值时只认我发的——别人转发同一条卡片进来不算我发出去了。
     * ``until_ts`` 有值时不再往后看，避免「同一张卡片后来又发了一次」冒充本次。
     * get_messages 只支持 limit/offset、没有时间条件，所以分页往回翻：
       翻到「本页最老一条早于 since_ts」就停，避免活跃群消息多时把活动那条
       挤出最近一页、误判成没发到。
     """
+    if detail is not None:
+        detail.clear()
     if not conv_id:
-        return None
+        return "unreadable"
+    hit = None
     for page in range(READ_MAX_PAGES):
         try:
             rows = db.get_messages(conv_id, limit=READ_LIMIT,
                                    offset=page * READ_LIMIT) or []
         except Exception:
-            return None if page == 0 else False
+            if hit is None:
+                return "unreadable"
+            break
         if not rows:
             break
         oldest = None            # 本页最早一条的时间（只看 ts>0 的）
@@ -93,10 +115,26 @@ def _landed(db, conv_id, since_ts, match, until_ts=0, me=""):
                 continue
             txt = r.get("content") or ""
             if not match or match in txt:
-                return True
+                hit = r           # get_messages 按时间倒序：首条命中就是最新那条
+                break
+        if hit is not None:
+            break
         if oldest is not None and oldest < since_ts:
             break                # 已翻到活动开始之前，再往前只会更早
-    return False
+    if hit is None:
+        return "not-found"
+    sid = _server_id_of(db, conv_id, hit)
+    if detail is not None:
+        detail.update({
+            "create_time": hit.get("create_time"),
+            "sender": hit.get("sender_username") or "",
+            "local_id": hit.get("local_id"),
+            "shard": hit.get("shard") or "",
+            "server_id": sid,
+        })
+    if sid is None:
+        return "unknown"
+    return "delivered" if sid > 0 else "undelivered"
 
 
 def _parse_result(raw):
@@ -115,6 +153,8 @@ def main():
     ap.add_argument("--ids", default="", help="只处理指定活动 id，逗号分隔")
     ap.add_argument("--include-ok", action="store_true",
                     help="连非异常的条目也重新回读一遍（默认只动异常条目）")
+    ap.add_argument("--debug", action="store_true",
+                    help="打印每条命中消息的 server_id/时间，便于跨设备核对判据")
     args = ap.parse_args()
 
     want = set()
@@ -180,19 +220,29 @@ def main():
                 until = ets + TS_TOLERANCE * 5
             else:
                 since, until = base_since, 0
+            detail = {}
             got = _landed(db, x.get("conv_id"), since, match,
-                          until_ts=until, me=me)
+                          until_ts=until, me=me, detail=detail)
+            if args.debug:
+                print("    证据: %s" % (detail or "窗口内无匹配的我发消息"))
             y = dict(x)
-            if got is True:
+            if got == "delivered":
                 y["ok"] = True
-                y["reason"] = "已转发（回刷：活动后有对应卡片）"
-            elif got is False:
+                y["reason"] = "已转发（回刷：我发出的消息已获服务器确认）"
+            elif got == "undelivered":
+                y["ok"] = False
+                y["reason"] = ("未送达（回刷：本地有卡片但 server_id=0，"
+                               "微信红色叹号/对方已删除或拒收）")
+            elif got == "unknown":
+                y["ok"] = False
+                y["reason"] = "无法确认送达（回刷：消息在，但读不到服务器回执）"
+            elif got == "unreadable":
+                y["ok"] = False
+                y["reason"] = "无法回读（回刷：微信库读不到该会话）"
+            else:
                 y["ok"] = False
                 y["reason"] = ("已发出但回读未确认（回刷：活动后无对应卡片，"
                                "可能被删/未送达/已撤回）")
-            else:
-                y["ok"] = False
-                y["reason"] = "无法回读（回刷：微信库读不到该会话）"
             y["ts"] = int(time.time())
             new_results.append(y)
             total_fix += 1

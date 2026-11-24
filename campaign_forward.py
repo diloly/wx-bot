@@ -554,28 +554,75 @@ def _latest_ts(ops, conv_id):
         return False, 0
 
 
-def _landed_by_conv(ops, conv_id, name, baseline):
-    """回读「这条转发是否真送达」——用 conv_id 直查 + 发送前水位基线。
+def _server_id_of(db, conv_id, row):
+    """这条消息的 server_id：>0=服务器已确认送达，0=红色叹号未送达，None=读不到。
 
-    baseline = (有历史?, 最新create_time)。两处跨设备坑都避开：
-      1. 库的 ops._landed(name, since) 拿**显示名**做 username_by_nickname 反查，
-         别的设备备注不同/没有备注就查不到 → 明明发出去了却误报「回读未确认」。
-      2. since=int(time.time())-5 依赖系统时钟与微信 create_time 对齐，跨设备/时区
-         时钟有偏差就误判。改用发送前该会话的最新 create_time 做水位，发送后只要
-         出现更大的 create_time 就算送达，完全不依赖系统时钟。
-    发送前没读到历史（has=False）时，退回库的显示名反查兜底；都不行才判失败。
+    微信 4.x 的 ``get_message_row`` 能拿到原始 ``server_id``（get_messages 不带）。
+    实测发出去的消息 server_id 是正整数；对方已删除/拒收时本地**仍会留一条消息**
+    （卡片也在），但 server_id=0，界面就是红色叹号。只看「有没有新消息」会把
+    这种未送达误判成成功——2026-11-24 用户实测。
     """
     try:
-        if conv_id:
+        raw = db.get_message_row(conv_id, int(row["local_id"]), None,
+                                 row.get("shard"))
+        if not raw:
+            return None
+        return int(raw.get("server_id") or 0)
+    except Exception:
+        return None
+
+
+def _delivery_state(ops, conv_id, name, baseline):
+    """三态：delivered / undelivered / unknown。
+
+    * delivered：窗口内有我发出的新消息，且 server_id>0（服务器确认送达）。
+    * undelivered：有新消息（卡片/正文都在）但 server_id=0 —— 红色叹号，
+      通常是对方把我删了或拒收；本地有记录不等于送到。
+    * unknown：读不到回执、或压根没查到新消息，保守记失败但不冤枉成「被删」。
+    """
+    if conv_id:
+        try:
             has, ts = baseline if isinstance(baseline, tuple) else (True, baseline)
-            rows = ops.db.get_messages(conv_id, limit=5) or []
-            if has:
-                return any(int(r.get("create_time") or 0) > ts for r in rows)
-            # 没历史基线：读到了新消息也算（但要求 create_time>0，避免空数据误判）
-            return any(int(r.get("create_time") or 0) > 0 for r in rows)
+
+            def fresh():
+                rows = ops.db.get_messages(conv_id, limit=5) or []
+                out = []
+                for r in rows:
+                    try:
+                        t = int(r.get("create_time") or 0)
+                    except Exception:
+                        continue
+                    if (t > ts) if has else (t > 0):
+                        out.append(r)
+                return out
+
+            got = fresh()
+            if got:
+                sid = _server_id_of(ops.db, conv_id, got[0])
+                if sid is None or sid == 0:
+                    # 服务器回执可能晚到几秒；别把「刚发还没确认」误判成红色叹号
+                    time.sleep(2.0)
+                    got = fresh()
+                    if got:
+                        sid = _server_id_of(ops.db, conv_id, got[0])
+                if sid is not None:
+                    return "delivered" if sid > 0 else "undelivered"
+                return "unknown"
+            return "unknown"
+        except Exception:
+            pass
+    # 没 conv_id / 读库异常：退回库的显示名反查兜底（拿不到 server_id，只能二态）
+    try:
+        if ops._landed(name, int(time.time()) - 5):
+            return "delivered"
     except Exception:
         pass
-    return ops._landed(name, int(time.time()) - 5)
+    return "unknown"
+
+
+def _landed_by_conv(ops, conv_id, name, baseline):
+    """兼容旧布尔调用；新代码请用 _delivery_state 区分「未送达」。"""
+    return _delivery_state(ops, conv_id, name, baseline) == "delivered"
 
 
 def send_forward_batch(names, source_chat, source_match, note="", dry_run=False,
@@ -603,7 +650,7 @@ def send_forward_batch(names, source_chat, source_match, note="", dry_run=False,
     if ops is None:
         raise ForwardError("wechatauto UIA 驱动不可用，无法转发")
 
-    sent, failed, skipped = [], [], []
+    sent, undelivered, failed, skipped = [], [], [], []
     opened = _open_dialog(ops, source_chat, source_match)
     if not opened["ok"]:
         reason = opened["reason"]
@@ -647,9 +694,16 @@ def send_forward_batch(names, source_chat, source_match, note="", dry_run=False,
                     # 「未列入转发结果」。按钮人数已校验 == len(picked)，直接按勾选名单回读。
                     actual = picked
                     for who in actual:
-                        landed = _landed_by_conv(
+                        st = _delivery_state(
                             ops, conv_map.get(who, ""), who, baseline.get(who, 0))
-                        (sent if landed else failed).append(who)
+                        if st == "delivered":
+                            sent.append(who)
+                        elif st == "undelivered":
+                            # 本地有新消息但 server_id=0（红色叹号）：卡片的确实
+                            # 发出去了，但没送到对方——单独记，别混进「已转发」。
+                            undelivered.append(who)
+                        else:
+                            failed.append(who)
     finally:
         ops.close_dialog()
 
@@ -665,12 +719,15 @@ def send_forward_batch(names, source_chat, source_match, note="", dry_run=False,
         return out
 
     sent_s = set(_only_names(sent))
+    undelivered_s = set(_only_names(undelivered))
     failed_s = set(_only_names(failed))
     skipped_s = set(_only_names(skipped))
     results = {}
     for nm in names:
         if nm in sent_s:
             results[nm] = (True, "已转发")
+        elif nm in undelivered_s:
+            results[nm] = (False, "未送达（微信红色叹号：对方已删除/拒收，本地有卡片但服务器未确认）")
         elif nm in failed_s:
             results[nm] = (False, "已发出但回读未确认（对方可能已删/未登录）")
         elif nm in skipped_s:
