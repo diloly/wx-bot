@@ -41,6 +41,99 @@ class ForwardError(RuntimeError):
     """转发前置条件不满足（依赖/UI/来源消息）。"""
 
 
+# ---------------------------------------------------------------------------
+# 转发窗 UIA 树的遍历策略（2026-11-24 实测定位「第三人开始卡死」根因）
+#
+# 事实（本机多次实测）：
+#   干净窗口 52 节点、整树遍历 0.01s，候选行在 depth 4~8；
+#   选过人之后，微信 Qt 的 accessibility 树在 depth 13+ 开始**指数膨胀**
+#   （depth 12→16 的节点数是 27→54→27→81→162，约每层 ×3），
+#   到 depth 30 能到 5 万+节点，整树遍历 17~18 秒。
+#   选人时反复整树遍历（旧 _visible_rows / 库 _rows / 库 _find / 库 send）
+#   等于每选一个人烧掉好几个 18 秒 —— 第 3、4 个人必卡，与选谁无关。
+#   纯遍历不点不搜不会膨胀，是「选人动作 + 深遍历」叠加放大。
+#
+# 对策：候选行/已选行/搜索框都在浅层，只做 BFS 浅层遍历 + 节点预算，
+# 绝不进入膨胀区。所有需要「整树找控件」的地方都换成 _walk/_find_limited。
+# ---------------------------------------------------------------------------
+WALK_MAX_DEPTH = 14          # 候选行实测在 4~8，留足余量
+WALK_MAX_NODES = 1200        # 节点预算：正常 52，异常也封顶，防单次遍历失控
+
+
+def _walk(root, max_depth=WALK_MAX_DEPTH, max_nodes=WALK_MAX_NODES):
+    """层序（BFS）遍历转发窗子树，只走到浅层且受节点预算约束。
+
+    返回 [(depth, ctrl)]。用 BFS 而非 DFS：DFS 会一头扎进 depth 13+ 的膨胀
+    分支（几万节点），BFS 先把浅层的行扫完就触发预算停止。
+    """
+    if root is None:
+        return []
+    from collections import deque
+    out = []
+    q = deque([(root, 0)])
+    n = 0
+    while q and n < max_nodes:
+        el, d = q.popleft()
+        if d > max_depth:
+            continue
+        out.append((d, el))
+        n += 1
+        try:
+            kids = el.GetChildren()
+        except Exception:
+            continue
+        for k in kids:
+            q.append((k, d + 1))
+    return out
+
+
+def _find_limited(win, name=None, cls=None, aid=None):
+    """在浅层子树里找第一个匹配控件（替代库 _find / _find_by_aid 的深遍历）。"""
+    if win is None or (name is None and cls is None and aid is None):
+        return None
+    for _d, el in _walk(win):
+        try:
+            if aid is not None:
+                if (getattr(el, "AutomationId", "") or "") == aid:
+                    return el
+                continue
+            if cls is not None and cls not in (el.ClassName or ""):
+                continue
+            if name is not None and (el.Name or "").strip() != name:
+                continue
+            return el
+        except Exception:
+            continue
+    return None
+
+
+def _selected_fast(ops, win=None):
+    """右侧已选栏里的收件人（Name=「移除<显示名>」），自己走浅层。
+
+    不用库的 ops.selected()——它内部 _rows 是 max_depth=30 的整树 DFS，
+    选过人后会撞进膨胀区（一次 18 秒）。
+    """
+    from wechatauto.forward import CHOSEN_ROW_CLS
+    if win is None:
+        _h, win = ops._forward_window()
+    if win is None:
+        return []
+    out = []
+    for _d, el in _walk(win):
+        try:
+            cn = el.ClassName or ""
+            nm = (el.Name or "").strip()
+        except Exception:
+            continue
+        if CHOSEN_ROW_CLS not in cn:
+            continue
+        if nm.startswith("移除"):
+            who = nm[len("移除"):].strip()
+            if who and who not in out:
+                out.append(who)
+    return out
+
+
 def _clear_forward_search(ops, force=False):
     """清空转发窗的搜索框——**只在确实搜过时清**（对齐库 labels._clear_picker_search）。
 
@@ -56,52 +149,39 @@ def _clear_forward_search(ops, force=False):
     h, win = ops._forward_window()
     if win is None:
         return
-    btn = ops._find(win, (PICKER_CLEAR,), contains=False)
+    btn = _find_limited(win, name=PICKER_CLEAR)
     if btn is not None:
         ops._click(h, btn, raise_it=False)
         return
-    box = ops._find(win, (SEARCH_BOX_NAME,), contains=False)
+    box = _find_limited(win, name=SEARCH_BOX_NAME)
     if box is not None:
         ops.uia._set_text(box, "")
         time.sleep(0.5)
 
 
 def _visible_rows(ops, win=None):
-    """一次 UIA 遍历收集转发窗候选列表当前实例化的所有行 → [(显示名, 行控件)]。
+    """浅层 BFS 一次收集转发窗候选行 → [(显示名, 行控件)]。
 
-    虚拟列表只把可视区的行实例化，这就是「不用搜索框能直接点到」的行集合。
-    一次遍历拿全，胜过对每个人调一次 _find（_find 每次都是整棵树 DFS）。
+    候选行实测在 depth 4~8；用 _walk 只走浅层、不进 depth 13+ 的膨胀区，
+    单次 0.01~0.05s（旧版整树 DFS 在选过人后要 18s）。
     """
     from wechatauto.labels import PICKER_ROW_CLS, PICKER_SEARCH_ROW_CLS
     if win is None:
         _h, win = ops._forward_window()
-    out = []
     if win is None:
-        return out
-    seen = set()
-    stack = [(win, 0)]
-    while stack:
-        el, d = stack.pop()
-        if d > 30:
-            continue
+        return []
+    out, seen = [], set()
+    for _d, el in _walk(win):
         try:
-            kids = list(el.GetChildren())
+            cn = el.ClassName or ""
+            nm = (el.Name or "").strip()
         except Exception:
             continue
-        for k in kids:
-            try:
-                cn = k.ClassName or ""
-            except Exception:
-                cn = ""
-            if PICKER_ROW_CLS in cn or PICKER_SEARCH_ROW_CLS in cn:
-                try:
-                    nm = (k.Name or "").strip()
-                except Exception:
-                    nm = ""
-                if nm and nm not in seen:
-                    seen.add(nm)
-                    out.append((nm, k))
-            stack.append((k, d + 1))
+        if not (PICKER_ROW_CLS in cn or PICKER_SEARCH_ROW_CLS in cn):
+            continue
+        if nm and nm not in seen:
+            seen.add(nm)
+            out.append((nm, el))
     return out
 
 
@@ -124,7 +204,7 @@ def _select_one_fast(ops, name):
     h, win = ops._forward_window()
     if win is None:
         return _result(False, "no-picker：转发窗不在", path="none")
-    if name in (ops.selected(win) or []):
+    if name in _selected_fast(ops, win):
         return _result(True, "already", who=name, path="visible")
 
     # 上一次真搜过才先清词（守卫在 _clear_forward_search 里），否则列表没被过滤
@@ -137,7 +217,7 @@ def _select_one_fast(ops, name):
     path = "visible"
 
     if hit is None:
-        box = ops._find(win, (SEARCH_BOX_NAME,), contains=False)
+        box = _find_limited(win, name=SEARCH_BOX_NAME)
         if box is None or not ops.uia._set_text(box, name):
             return _fallback_select(ops, name)      # 搜索框操作不了，交库
         ops._searched = name
@@ -159,7 +239,7 @@ def _select_one_fast(ops, name):
     if not r.get("ok"):
         r.setdefault("path", path)
         return r
-    if name not in (ops.selected() or []):
+    if name not in _selected_fast(ops):
         # 点了但没进右栏——不重试点（再点会取消勾选！），如实报失败
         return _result(False, "not-checked：点了但没进右侧已选栏", who=name, path=path)
     return _result(True, "ok", who=name, path=path)
@@ -204,7 +284,7 @@ def _select_paced(ops, names):
             nm if ok else {"name": nm, "reason": r.get("reason", "")})
     _h, win = ops._forward_window()
     return _result(True, "ok", picked=picked, missing=missing,
-                   selected=ops.selected(win) if win is not None else [])
+                   selected=_selected_fast(ops, win) if win is not None else [])
 
 
 def _display_to_conv(targets):
@@ -385,7 +465,7 @@ def _fill_leave_message(ops, note):
     _h, win = ops._forward_window()
     if win is None:
         return False
-    box = ops._find_by_aid(win, LEAVE_INPUT_AID)
+    box = _find_limited(win, aid=LEAVE_INPUT_AID)
     if box is None:
         return False
     # 留言框不靠回车发送（发送靠点按钮），ValuePattern 写入即可；失败再退回粘贴。
@@ -396,6 +476,41 @@ def _fill_leave_message(ops, note):
         return True
     except Exception:
         return False
+
+
+def _send_fast(ops, expect):
+    """点「发送」：自己校验人数 + 点按钮，绕开库 send() 的整树遍历。
+
+    库 ops.send() 里 selected()/_find_by_aid() 都是 max_depth=30 的深遍历，
+    选过人后单次要 18s，这里换成浅层的 _selected_fast/_find_limited。
+    两个人的读数（按钮上的「分别发送(N)」和右侧已选栏人头）仍必须和预期一致，
+    否则不点——这一步点下去就是真发，没有后悔药。
+    """
+    from wechatauto.forward import AID_CONFIRM, parse_send_button
+    h, win = ops._forward_window()
+    if win is None:
+        return {"ok": False, "reason": "no-picker：转发窗不在"}
+    chosen = _selected_fast(ops, win)
+    btn = _find_limited(win, aid=AID_CONFIRM)
+    if btn is None:
+        return {"ok": False, "reason": "no-send-btn：找不到发送按钮"}
+    ok, n = parse_send_button(btn.Name or "")
+    if not ok:
+        return {"ok": False, "reason": "no-send-btn：按钮不可点（写 %r）" % n}
+    if expect == 0:
+        return {"ok": False, "reason": "no-recipient：右侧一个人都没选，不点发送"}
+    if n != expect or len(chosen) != expect:
+        return {"ok": False,
+                "reason": "count-mismatch：按钮 %s 人 / 已选栏 %s 人 / 预期 %s 人，先不点"
+                          % (n, len(chosen), expect),
+                "on_button": n, "chosen": chosen}
+    r = ops._click(h, btn)
+    if not r.get("ok"):
+        return r
+    time.sleep(2.0)
+    if ops._forward_window()[1] is not None:
+        return {"ok": False, "reason": "still-open：点了发送但窗口没关（没发出去？）"}
+    return {"ok": True, "on_button": n, "chosen": chosen}
 
 
 def _latest_ts(ops, conv_id):
@@ -481,7 +596,7 @@ def send_forward_batch(names, source_chat, source_match, note="", dry_run=False,
                 for who in picked:
                     cid = conv_map.get(who, "")
                     baseline[who] = _latest_ts(ops, cid) if cid else (False, 0)
-                rs = ops.send(expect=len(picked))
+                rs = _send_fast(ops, len(picked))
                 if not rs["ok"]:
                     failed.extend(picked)
                 else:
