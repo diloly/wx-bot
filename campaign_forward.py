@@ -611,7 +611,18 @@ def send_forward_batch(names, source_chat, source_match, note="", dry_run=False,
     try:
         sel = _select_paced(ops, names)
         picked = list(sel.get("picked") or [])
-        skipped.extend(sel.get("missing") or [])
+        # sel["missing"] 的元素是 {name, reason} 字典（见 _select_paced）。旧代码直接
+        # extend 进 skipped，后面 set(skipped) 就抛「unhashable type: 'dict'」，
+        # 整批被记成「转发异常」——而消息其实已经发出去了（2026-11-24 用户实测）。
+        skip_reason = {}
+        skipped = []
+        for m in (sel.get("missing") or []):
+            nm_ = m.get("name") if isinstance(m, dict) else m
+            if not nm_:
+                continue
+            skipped.append(nm_)
+            if isinstance(m, dict):
+                skip_reason[nm_] = (m.get("reason") or "").strip()
         if picked:
             if note:
                 _fill_leave_message(ops, note)
@@ -631,7 +642,10 @@ def send_forward_batch(names, source_chat, source_match, note="", dry_run=False,
                     failed.extend(picked)
                 else:
                     time.sleep(1.5)
-                    actual = rs.get("chosen") or picked
+                    # 已选栏是虚拟列表、只实例化可视区几行（勾 9 人只读得到 4 行），
+                    # 拿 rs["chosen"] 当「实际发送名单」会把其余人落到
+                    # 「未列入转发结果」。按钮人数已校验 == len(picked)，直接按勾选名单回读。
+                    actual = picked
                     for who in actual:
                         landed = _landed_by_conv(
                             ops, conv_map.get(who, ""), who, baseline.get(who, 0))
@@ -641,15 +655,27 @@ def send_forward_batch(names, source_chat, source_match, note="", dry_run=False,
 
     if dry_run:
         return {"__dry_run__": (True, "预演完成，未发送（勾选 %d 人）" % len(picked))}
-    sent_s, failed_s, skipped_s = set(sent), set(failed), set(skipped)
+    def _only_names(xs):
+        """把 sent/failed/skipped 里的元素统一成名字字符串（防御性过滤字典）。"""
+        out = []
+        for x in xs:
+            n = x.get("name") if isinstance(x, dict) else x
+            if isinstance(n, str) and n:
+                out.append(n)
+        return out
+
+    sent_s = set(_only_names(sent))
+    failed_s = set(_only_names(failed))
+    skipped_s = set(_only_names(skipped))
     results = {}
     for nm in names:
         if nm in sent_s:
             results[nm] = (True, "已转发")
         elif nm in failed_s:
-            results[nm] = (False, "转发后回读未确认")
+            results[nm] = (False, "已发出但回读未确认（对方可能已删/未登录）")
         elif nm in skipped_s:
-            results[nm] = (False, "通讯录里找不到该收件人")
+            why = skip_reason.get(nm, "")
+            results[nm] = (False, ("转发窗没选上：%s" % why) if why else "转发窗没选上")
         else:
             results[nm] = (False, "未列入转发结果")
     return results
